@@ -1,0 +1,14 @@
+pub mod avatar;
+pub mod clock_panel;
+pub mod create_dashboard_dialog;
+pub mod chart_panel;
+pub mod dashboard_manager;
+pub mod delete_dashboard_dialog;
+pub mod newsfeed_panel;
+pub mod orderbook_panel;
+pub mod pane_grid;
+pub mod sidebar;
+pub mod ticker_panel;
+pub mod title_bar;
+pub mod fear_greed_panel;
+pub mod update_banner;

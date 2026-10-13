@@ -1,0 +1,367 @@
+use crate::data::error::CoinWatchError;
+use crate::data::update_checker;
+use crate::data::update_downloader::{self, DownloadProgress};
+use crate::data::version::{APP_VERSION, UpdateState, VersionInfo, backup_dir};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// Manages the full update lifecycle: check → download → verify → prompt → install.
+///
+/// This struct is designed to be held as a global or per-window singleton.
+/// UI code polls `state()` to drive notifications and dialogs.
+pub struct UpdateManager {
+    state: Arc<Mutex<UpdateState>>,
+    download_progress: Arc<Mutex<DownloadProgress>>,
+}
+
+impl Default for UpdateManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UpdateManager {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(UpdateState::Idle)),
+            download_progress: Arc::new(Mutex::new(DownloadProgress::default())),
+        }
+    }
+
+    /// Get the current update state (for UI polling).
+    pub fn state(&self) -> UpdateState {
+        let state = self.state.lock().unwrap().clone();
+        if let UpdateState::Downloading { version, .. } = state {
+            UpdateState::Downloading { version, progress: self.download_progress.lock().unwrap().fraction }
+        } else {
+            state
+        }
+    }
+
+    /// Get download progress (for progress bar rendering).
+    pub fn download_progress(&self) -> DownloadProgress {
+        self.download_progress.lock().unwrap().clone()
+    }
+
+    /// Perform a version check if enough time has elapsed.
+    /// Returns `Some(VersionInfo)` if an update is available.
+    ///
+    /// Blocking — call from a background thread.
+    pub fn check_for_update(&self) -> Option<VersionInfo> {
+        if !update_checker::should_check_now() {
+            tracing::debug!("update_manager: skipping check (too recent)");
+            return None;
+        }
+
+        {
+            let mut s = self.state.lock().unwrap();
+            *s = UpdateState::Checking;
+        }
+
+        match update_checker::check_for_update() {
+            Ok(Some(info)) => {
+                update_checker::record_check_time();
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Available(Box::new(info.clone()));
+                tracing::info!(
+                    "update_manager: update available: {} -> {}",
+                    APP_VERSION,
+                    info.version
+                );
+                Some(info)
+            }
+            Ok(None) => {
+                update_checker::record_check_time();
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Idle;
+                None
+            }
+            Err(e) => {
+                tracing::warn!("update_manager: check failed: {}", e);
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Failed(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Force a version check regardless of timing.
+    ///
+    /// Blocking — call from a background thread.
+    pub fn force_check(&self) -> Option<VersionInfo> {
+        {
+            let mut s = self.state.lock().unwrap();
+            *s = UpdateState::Checking;
+        }
+
+        match update_checker::check_for_update() {
+            Ok(Some(info)) => {
+                update_checker::record_check_time();
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Available(Box::new(info.clone()));
+                Some(info)
+            }
+            Ok(None) => {
+                update_checker::record_check_time();
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Idle;
+                None
+            }
+            Err(e) => {
+                tracing::warn!("update_manager: force check failed: {}", e);
+                let mut s = self.state.lock().unwrap();
+                *s = UpdateState::Failed(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Download the available update in the background.
+    ///
+    /// Blocking — call from a background thread.
+    pub fn download_update(&self, version_info: &VersionInfo) -> Result<PathBuf, CoinWatchError> {
+        {
+            let mut s = self.state.lock().unwrap();
+            *s = UpdateState::Downloading {
+                version: version_info.version.clone(),
+                progress: 0.0,
+            };
+        }
+
+        // Reset progress
+        {
+            let mut p = self.download_progress.lock().unwrap();
+            *p = DownloadProgress::default();
+        }
+
+        let progress = self.download_progress.clone();
+        let state = self.state.clone();
+        let version = version_info.version.clone();
+
+        match update_downloader::download_update(version_info, progress) {
+            Ok(path) => {
+                let mut s = state.lock().unwrap();
+                *s = UpdateState::ReadyToInstall {
+                    version: version.clone(),
+                    path: path.to_string_lossy().into_owned(),
+                };
+                tracing::info!(
+                    "update_manager: download complete, ready to install v{}",
+                    version
+                );
+
+                // Clean up old updates (keep last 2)
+                update_downloader::cleanup_old_updates(2);
+
+                Ok(path)
+            }
+            Err(e) => {
+                let mut s = state.lock().unwrap();
+                *s = UpdateState::Failed(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    /// Create a backup of the current binary before installing an update.
+    pub fn backup_current_binary() -> Result<PathBuf, CoinWatchError> {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| CoinWatchError::Io(format!("Cannot find current executable: {e}")))?;
+
+        let backup = backup_dir().join(format!("v{}", APP_VERSION));
+        std::fs::create_dir_all(&backup)
+            .map_err(|e| CoinWatchError::Io(format!("Cannot create backup dir: {e}")))?;
+
+        let backup_path = backup.join(
+            current_exe
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("finter")),
+        );
+
+        std::fs::copy(&current_exe, &backup_path)
+            .map_err(|e| CoinWatchError::Io(format!("Backup failed: {e}")))?;
+
+        tracing::info!(
+            "update_manager: backed up current binary to {}",
+            backup_path.display()
+        );
+
+        Ok(backup_path)
+    }
+
+    /// Replace running executable with the updated binary.
+    pub fn install_update(update_path: &std::path::Path) -> Result<(), CoinWatchError> {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| CoinWatchError::Io(format!("Cannot find current executable: {e}")))?;
+        let expected = update_downloader::checksum_path(update_path);
+        let checksum = std::fs::read_to_string(&expected)
+            .map_err(|e| CoinWatchError::UpdateDownload(format!("Missing verified checksum: {e}")))?;
+        update_downloader::verify_checksum(update_path, checksum.trim())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(update_path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(update_path, perms);
+            }
+        }
+
+        let backup = Self::backup_current_binary()?;
+        if let Err(error) = self_replace::self_replace(update_path) {
+            let _ = std::fs::copy(&backup, &current_exe);
+            return Err(CoinWatchError::Io(format!("Executable replacement failed; backup restored: {error}")));
+        }
+        Ok(())
+    }
+
+    /// Restart the application with the current command line arguments.
+    pub fn restart_app() -> Result<(), CoinWatchError> {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| CoinWatchError::Io(format!("Cannot find current executable: {e}")))?;
+        let mut cmd = std::process::Command::new(&current_exe);
+        cmd.args(std::env::args().skip(1));
+        cmd.spawn()
+            .map_err(|e| CoinWatchError::Io(format!("Failed to restart application: {e}")))?;
+        Ok(())
+    }
+
+    /// Mark the update as installed, transitioning to RestartRequired state.
+    pub fn mark_installed(&self, version: &str) {
+        let mut s = self.state.lock().unwrap();
+        *s = UpdateState::RestartRequired {
+            version: version.to_string(),
+        };
+    }
+
+    /// Check if a crash happened during a previous update (lock file exists).
+    /// Returns the version to rollback to, if applicable.
+    pub fn check_crash_rollback() -> Option<String> {
+        let crash_marker = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("finter")
+            .join("update_in_progress");
+
+        if crash_marker.exists() {
+            tracing::warn!(
+                "update_manager: crash marker detected, previous update may have failed"
+            );
+            // Read the version that was being updated to
+            let version = std::fs::read_to_string(&crash_marker).ok();
+            // Clean up the marker
+            std::fs::remove_file(&crash_marker).ok();
+            return version;
+        }
+        None
+    }
+
+    /// Write a marker file indicating an update is in progress.
+    /// If the app crashes during update, this marker will persist.
+    pub fn mark_update_in_progress(version: &str) {
+        let marker = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("finter")
+            .join("update_in_progress");
+
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&marker, version).ok();
+    }
+
+    /// Remove the update-in-progress marker (update succeeded).
+    pub fn clear_update_marker() {
+        let marker = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("finter")
+            .join("update_in_progress");
+        std::fs::remove_file(&marker).ok();
+    }
+
+    /// List available rollback versions from the backup directory.
+    pub fn available_rollback_versions() -> Vec<String> {
+        let dir = backup_dir();
+        let mut versions: Vec<String> = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix('v'))
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        versions.sort();
+        versions.reverse();
+        versions
+    }
+
+    pub fn fail(&self, message: String) {
+        *self.state.lock().unwrap() = UpdateState::Failed(message);
+    }
+
+    /// Reset state to idle (dismiss notification).
+    pub fn dismiss(&self) {
+        let mut s = self.state.lock().unwrap();
+        *s = UpdateState::Idle;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::version::UpdateState;
+
+    #[test]
+    fn test_update_manager_default_state() {
+        let mgr = UpdateManager::new();
+        assert_eq!(mgr.state(), UpdateState::Idle);
+    }
+
+    #[test]
+    fn test_update_manager_dismiss() {
+        let mgr = UpdateManager::new();
+        {
+            let mut s = mgr.state.lock().unwrap();
+            *s = UpdateState::Failed("test error".into());
+        }
+        assert!(matches!(mgr.state(), UpdateState::Failed(_)));
+        mgr.dismiss();
+        assert_eq!(mgr.state(), UpdateState::Idle);
+    }
+
+    #[test]
+    fn test_crash_marker_lifecycle() {
+        // Clean up any existing marker
+        UpdateManager::clear_update_marker();
+        assert!(UpdateManager::check_crash_rollback().is_none());
+
+        // Set marker
+        UpdateManager::mark_update_in_progress("0.1.1");
+        let version = UpdateManager::check_crash_rollback();
+        assert_eq!(version, Some("0.1.1".to_string()));
+
+        // Marker should be cleaned up after check
+        assert!(UpdateManager::check_crash_rollback().is_none());
+    }
+
+    #[test]
+    fn test_available_rollback_versions_empty() {
+        // Should not panic even if backup dir is empty
+        let versions = UpdateManager::available_rollback_versions();
+        // May or may not be empty depending on test environment
+        let _ = versions;
+    }
+
+    #[test]
+    fn test_download_progress_default() {
+        let mgr = UpdateManager::new();
+        let p = mgr.download_progress();
+        assert_eq!(p.downloaded, 0);
+        assert!(!p.complete);
+    }
+}
