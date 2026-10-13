@@ -1175,6 +1175,11 @@ impl MainView {
                 div()
                     .id("secondary-sidebar-header")
                     .window_control_area(WindowControlArea::Drag)
+                    .when(cfg!(target_os = "linux"), |this| {
+                        this.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                            window.start_window_move();
+                        })
+                    })
                     .h(crate::components::ui::title_bar::TITLE_BAR_HEIGHT)
                     .flex()
                     .items_center()

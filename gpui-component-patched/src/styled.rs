@@ -352,9 +352,9 @@ impl Size {
         match self {
             Size::Large => px(10.),
             Size::Medium => px(8.),
-            Size::Small => px(2.),
-            Size::XSmall => px(0.),
-            _ => px(2.),
+            Size::Small => px(4.),
+            Size::XSmall => px(2.),
+            _ => px(4.),
         }
     }
 }

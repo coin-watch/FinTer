@@ -1070,12 +1070,22 @@ impl PopupMenu {
         !self.accordion_groups || self.open_accordion_labels.contains(&ix)
     }
 
-    fn toggle_accordion_label(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn toggle_accordion_label(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_accordion_labels.contains(&ix) {
             self.open_accordion_labels.remove(&ix);
         } else {
             self.open_accordion_labels.clear();
             self.open_accordion_labels.insert(ix);
+            // Focus the newly opened group's search field on the next frame.
+            // The input is rendered conditionally, so focusing immediately would
+            // happen before its hitbox/focus handle exists.
+            if self.searchable_accordion {
+                if let Some(input) = self.accordion_search_inputs.get(&ix).cloned() {
+                    cx.on_next_frame(window, move |_, window, cx| {
+                        input.update(cx, |state, cx| state.focus(window, cx));
+                    });
+                }
+            }
         }
         cx.notify();
     }
@@ -1309,8 +1319,8 @@ impl PopupMenu {
                 let open = self.is_accordion_label_open(ix);
                 this.cursor_default()
                     .when(self.accordion_groups, |this| {
-                        this.on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_accordion_label(ix, cx)
+                        this.on_click(cx.listener(move |this, _, window, cx| {
+                            this.toggle_accordion_label(ix, window, cx)
                         }))
                     })
                     .when(!self.accordion_groups, |this| this.disabled(true))

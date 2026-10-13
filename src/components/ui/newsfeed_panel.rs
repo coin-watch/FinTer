@@ -18,16 +18,26 @@ use crate::data::client::tokio_runtime;
 
 const LIMIT: usize = 50;
 
-fn articles_url() -> Option<String> {
-    let base = std::env::var("FINTER_NEWS_API_URL").ok()?;
-    let base = base.trim_end_matches('/');
-    (!base.is_empty()).then(|| format!("{base}/api/newsfeed/articles?limit={LIMIT}"))
+fn articles_url() -> String {
+    if let Ok(base) = std::env::var("FINTER_NEWS_API_URL") {
+        let base = base.trim_end_matches('/');
+        if !base.is_empty() {
+            if base.contains("newsfeed.coinwat.ch") {
+                return format!("{base}/api/articles?limit={LIMIT}");
+            } else {
+                return format!("{base}/api/newsfeed/articles?limit={LIMIT}");
+            }
+        }
+    }
+    let base = crate::data::client::service_base_url();
+    format!("{base}/api/newsfeed/articles?limit={LIMIT}")
 }
 
-fn news_ws_url() -> Option<String> {
+fn news_ws_url() -> String {
     std::env::var("FINTER_NEWS_WS_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| "wss://newsfeed.coinwat.ch/ws".to_string())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -174,15 +184,12 @@ impl NewsfeedPanel {
 }
 
 async fn run_feed(tx: mpsc::Sender<FeedEvent>, priority: String, filter: String) {
-    let Some(articles_url) = articles_url() else {
-        let _ = tx.send(FeedEvent::Error).await;
-        return;
-    };
+    let url = articles_url();
     let client = reqwest::Client::builder()
         .user_agent("FinTer Native")
         .build()
         .expect("reqwest client");
-    let mut request = client.get(articles_url);
+    let mut request = client.get(&url).header("X-API-Key", "secret");
     if priority != "latest" {
         request = request.query(&[("category", priority.as_str())]);
     }
@@ -195,22 +202,63 @@ async fn run_feed(tx: mpsc::Sender<FeedEvent>, priority: String, filter: String)
                 Ok(payload) => {
                     let _ = tx.send(FeedEvent::Loaded(payload.articles)).await;
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!("Failed to parse newsfeed articles JSON: {e}");
                     let _ = tx.send(FeedEvent::Error).await;
                 }
             },
-            Err(_) => {
-                let _ = tx.send(FeedEvent::Error).await;
+            Err(e) => {
+                tracing::warn!("Failed to fetch newsfeed from primary endpoint: {e}");
+                // Fallback attempt: try direct upstream newsfeed.coinwat.ch with secret API key
+                let fallback_url = format!("https://newsfeed.coinwat.ch/api/articles?limit={LIMIT}");
+                let mut fb_req = client.get(&fallback_url).header("X-API-Key", "secret");
+                if priority != "latest" {
+                    fb_req = fb_req.query(&[("category", priority.as_str())]);
+                }
+                if !filter.is_empty() {
+                    fb_req = fb_req.query(&[("query", filter.as_str())]);
+                }
+                let mut loaded = false;
+                if let Ok(resp) = fb_req.send().await {
+                    if let Ok(resp) = resp.error_for_status() {
+                        if let Ok(payload) = resp.json::<ArticlesResponse>().await {
+                            let _ = tx.send(FeedEvent::Loaded(payload.articles)).await;
+                            loaded = true;
+                        }
+                    }
+                }
+                if !loaded {
+                    let _ = tx.send(FeedEvent::Error).await;
+                }
             }
         },
-        Err(_) => {
-            let _ = tx.send(FeedEvent::Error).await;
+        Err(e) => {
+            tracing::warn!("Failed to connect to newsfeed endpoint: {e}");
+            // Fallback attempt
+            let fallback_url = format!("https://newsfeed.coinwat.ch/api/articles?limit={LIMIT}");
+            let mut fb_req = client.get(&fallback_url).header("X-API-Key", "secret");
+            if priority != "latest" {
+                fb_req = fb_req.query(&[("category", priority.as_str())]);
+            }
+            if !filter.is_empty() {
+                fb_req = fb_req.query(&[("query", filter.as_str())]);
+            }
+            let mut loaded = false;
+            if let Ok(resp) = fb_req.send().await {
+                if let Ok(resp) = resp.error_for_status() {
+                    if let Ok(payload) = resp.json::<ArticlesResponse>().await {
+                        let _ = tx.send(FeedEvent::Loaded(payload.articles)).await;
+                        loaded = true;
+                    }
+                }
+            }
+            if !loaded {
+                let _ = tx.send(FeedEvent::Error).await;
+            }
         }
     }
 
-    let Some(ws_url) = news_ws_url() else {
-        return;
-    };
+    let ws_url = news_ws_url();
     loop {
         match connect_async(&ws_url).await {
             Ok((socket, _)) => {

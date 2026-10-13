@@ -2,11 +2,12 @@ use crate::data::client::ApiClient;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::Icon;
 
 /// The login page -- displayed when the user is not authenticated.
-/// Features a centered card with email/password fields and login/signup buttons.
+/// Features a fully responsive, clean, user-friendly full-screen layout.
 pub struct LoginPage {
     api_client: ApiClient,
     email: Option<Entity<InputState>>,
@@ -34,13 +35,13 @@ impl LoginPage {
     /// Lazily initializes the input state entities on first render.
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.email.is_none() {
-            let email = cx.new(|cx| InputState::new(window, cx).placeholder("Email address"));
+            let email = cx.new(|cx| InputState::new(window, cx).placeholder("name@example.com"));
             self.email = Some(email);
         }
         if self.password.is_none() {
             let password = cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Password")
+                    .placeholder("••••••••••••")
                     .masked(true)
             });
             // Submit on Enter in password field -> trigger login
@@ -71,7 +72,7 @@ impl LoginPage {
             .unwrap_or_default();
 
         if email.is_empty() || password.is_empty() {
-            self.error_message = Some("Please enter email and password".into());
+            self.error_message = Some("Please enter both email and password.".into());
             cx.notify();
             return;
         }
@@ -88,7 +89,7 @@ impl LoginPage {
                 this.is_loading = false;
                 match result {
                     Ok(_session) => {
-                        this.info_message = Some("Login successful!".into());
+                        this.info_message = Some("Signed in successfully!".into());
                         cx.emit(AuthEvent::LoggedIn);
                     }
                     Err(e) => {
@@ -108,7 +109,7 @@ impl LoginPage {
 
         self.is_loading = true;
         self.error_message = None;
-        self.info_message = Some("Opening signup page...".into());
+        self.info_message = Some("Opening registration in your browser...".into());
         cx.notify();
 
         let client = self.api_client.clone();
@@ -118,10 +119,10 @@ impl LoginPage {
                 this.is_loading = false;
                 match result {
                     Ok(_) => {
-                        this.info_message = Some("Signup page opened in browser.".into());
+                        this.info_message = Some("Registration page opened in browser.".into());
                     }
                     Err(e) => {
-                        this.error_message = Some(format!("Failed to open signup page: {}", e));
+                        this.error_message = Some(format!("Could not open browser: {}", e));
                     }
                 }
                 cx.notify();
@@ -137,7 +138,7 @@ impl LoginPage {
 
         self.is_loading = true;
         self.error_message = None;
-        self.info_message = Some("Opening browser for Google login...".into());
+        self.info_message = Some("Connecting to Google in browser...".into());
         cx.notify();
 
         let client = self.api_client.clone();
@@ -147,11 +148,11 @@ impl LoginPage {
                 this.is_loading = false;
                 match result {
                     Ok(_session) => {
-                        this.info_message = Some("Login successful!".into());
+                        this.info_message = Some("Signed in with Google!".into());
                         cx.emit(AuthEvent::LoggedIn);
                     }
                     Err(e) => {
-                        this.error_message = Some(format!("Google login failed: {}", e));
+                        this.error_message = Some(format!("Google sign in failed: {}", e));
                         this.info_message = None;
                     }
                 }
@@ -196,20 +197,23 @@ impl Render for LoginPage {
         let bearish = colors.bearish;
         let bullish = colors.bullish;
 
-        let is_desktop = window.viewport_size().width >= px(840.0);
+        let viewport = window.viewport_size();
+        let is_desktop = viewport.width >= px(860.0);
+        let is_compact_height = viewport.height < px(700.0);
+        let is_wide = viewport.width >= px(1120.0);
 
-        // Feature highlight row in the left hero panel
-        let feature_row = |icon_path: &'static str, title: &'static str, desc: &'static str| {
+        // Friendly feature highlight row
+        let feature_item = |icon_path: &'static str, title: &'static str, desc: &'static str| {
             div()
                 .flex()
                 .items_start()
-                .gap(px(12.0))
+                .gap(px(14.0))
                 .child(
                     div()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .rounded(px(8.0))
-                        .bg(colors.muted.opacity(0.2))
+                        .w(px(38.0))
+                        .h(px(38.0))
+                        .rounded(px(10.0))
+                        .bg(colors.muted.opacity(0.18))
                         .border_1()
                         .border_color(border.opacity(0.6))
                         .flex()
@@ -222,7 +226,7 @@ impl Render for LoginPage {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
+                        .gap(px(3.0))
                         .child(
                             div()
                                 .text_sm()
@@ -242,448 +246,493 @@ impl Render for LoginPage {
 
         // Left brand hero panel (desktop)
         let left_hero = div()
-            .w(px(380.0))
-            .p(px(36.0))
-            .flex()
-            .flex_col()
-            .justify_between()
+            .flex_1()
+            .h_full()
+            .overflow_y_scrollbar()
             .border_r_1()
             .border_color(border.opacity(0.6))
             .bg(colors.muted.opacity(0.08))
             .child(
                 div()
+                    .min_h_full()
                     .flex()
                     .flex_col()
-                    .gap(px(16.0))
+                    .justify_between()
+                    .p(if is_wide { px(56.0) } else { px(36.0) })
+                    .gap(px(32.0))
+                    // Top: Brand & Welcoming message
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap(px(12.0))
+                            .flex_col()
+                            .gap(px(24.0))
                             .child(
                                 div()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
-                                    .rounded(px(8.0))
-                                    .bg(primary)
                                     .flex()
                                     .items_center()
-                                    .justify_center()
+                                    .gap(px(12.0))
                                     .child(
-                                        Icon::default()
-                                            .path("icons/bull-mark.svg")
-                                            .size_5()
-                                            .text_color(primary_fg),
+                                        div()
+                                            .w(px(40.0))
+                                            .h(px(40.0))
+                                            .rounded(px(10.0))
+                                            .bg(primary)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .shadow_md()
+                                            .child(
+                                                Icon::default()
+                                                    .path("icons/bull-mark.svg")
+                                                    .size_6()
+                                                    .text_color(primary_fg),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_2xl()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(fg)
+                                            .child("FinTer"),
                                     ),
                             )
                             .child(
                                 div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(fg)
-                                    .child("FinTer"),
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .text_3xl()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(fg)
+                                            .line_height(gpui::relative(1.2))
+                                            .child("All your markets in one clean view"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .line_height(gpui::relative(1.5))
+                                            .child("Follow live cryptocurrency prices, explore multi-timeframe charts, and organize your favorite trading pairs."),
+                                    ),
                             ),
                     )
+                    // Middle: Simple everyday user benefits (no technical jargon)
                     .child(
                         div()
-                            .text_2xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(fg)
-                            .line_height(gpui::relative(1.2))
-                            .child("GPU-accelerated trading terminal"),
+                            .flex()
+                            .flex_col()
+                            .gap(px(20.0))
+                            .child(feature_item(
+                                "icons/chart-candlestick.svg",
+                                "Live Market Charts",
+                                "Track price action with clean candlestick charts and customizable visual indicators.",
+                            ))
+                            .child(feature_item(
+                                "icons/globe.svg",
+                                "Multiple Exchanges",
+                                "Follow trading pairs seamlessly across Binance, OKX, Bybit, Kraken, and more.",
+                            ))
+                            .child(feature_item(
+                                "icons/layout-dashboard.svg",
+                                "Customizable Layouts",
+                                "Split your screens, organize watchlists, and build the perfect trading workspace.",
+                            )),
                     )
+                    // Bottom: Simple friendly note
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(muted)
-                            .line_height(gpui::relative(1.5))
-                            .child("Real-time orderbook depth, native multi-series charts, and local-first workspace persistence."),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(18.0))
-                    .my(px(24.0))
-                    .child(feature_row(
-                        "icons/cpu.svg",
-                        "60 FPS GPU Rendering",
-                        "Sub-millisecond candlestick charts & technical indicators with zero viewport lag.",
-                    ))
-                    .child(feature_row(
-                        "icons/hard-drive.svg",
-                        "Local-First Vault",
-                        "Workspaces, layouts, and API keys stored locally with client-side security.",
-                    ))
-                    .child(feature_row(
-                        "icons/network.svg",
-                        "Unified Exchange Streams",
-                        "Direct streaming WebSockets across Binance, OKX, Bybit, and Coinbase.",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded_full()
-                            .bg(gpui::rgba(0x2ebd85ff)),
-                    )
-                    .child("High-performance workstation active"),
-            );
-
-        // Right authentication card / form
-        let auth_form = div()
-            .flex_1()
-            .p(if is_desktop { px(36.0) } else { px(24.0) })
-            .flex()
-            .flex_col()
-            .justify_center()
-            .gap(px(16.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(fg)
-                            .child("Sign in"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("Sync your layouts across workstations, or continue in offline mode."),
-                    ),
-            )
-            .when(error_message.is_some(), |this| {
-                this.child(
-                    div()
-                        .w_full()
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .rounded(px(8.0))
-                        .bg(bearish.opacity(0.12))
-                        .border_1()
-                        .border_color(bearish.opacity(0.35))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            Icon::default()
-                                .path("icons/triangle-alert.svg")
-                                .size_3()
-                                .text_color(bearish),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(bearish)
-                                .child(error_message.unwrap_or_default()),
-                        ),
-                )
-            })
-            .when(info_message.is_some(), |this| {
-                this.child(
-                    div()
-                        .w_full()
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .rounded(px(8.0))
-                        .bg(bullish.opacity(0.12))
-                        .border_1()
-                        .border_color(bullish.opacity(0.35))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            Icon::default()
-                                .path("icons/circle-check.svg")
-                                .size_3()
-                                .text_color(bullish),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(bullish)
-                                .child(info_message.unwrap_or_default()),
-                        ),
-                )
-            })
-            // Google OAuth button
-            .child(
-                div()
-                    .id("google-login-btn")
-                    .w_full()
-                    .h(px(40.0))
-                    .rounded(px(8.0))
-                    .bg(colors.muted.opacity(0.2))
-                    .hover(|s| s.bg(colors.muted.opacity(0.35)))
-                    .active(|s| s.bg(colors.muted.opacity(0.45)))
-                    .border_1()
-                    .border_color(border)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.0))
-                    .cursor_pointer()
-                    .child(
-                        Icon::default()
-                            .path("icons/globe.svg")
-                            .size_4()
-                            .text_color(fg),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child("Continue with Google"),
-                    )
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.do_google_login(cx);
-                    })),
-            )
-            // Divider
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .my(px(4.0))
-                    .child(div().flex_1().h(px(1.0)).bg(border.opacity(0.6)))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(muted)
-                            .child("or with email"),
-                    )
-                    .child(div().flex_1().h(px(1.0)).bg(border.opacity(0.6))),
-            )
-            // Email Input
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child("Email address"),
-                    )
-                    .child(Input::new(&email_input)),
-            )
-            // Password Input
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child("Password"),
-                    )
-                    .child(Input::new(&password_input).mask_toggle()),
-            )
-            // Action Buttons
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .mt(px(4.0))
-                    .child(
-                        div()
-                            .id("login-btn")
-                            .w_full()
-                            .h(px(40.0))
-                            .rounded(px(8.0))
-                            .bg(primary)
-                            .hover(|s| s.bg(primary.opacity(0.85)))
-                            .active(|s| s.bg(primary.opacity(0.7)))
                             .flex()
                             .items_center()
-                            .justify_center()
                             .gap(px(8.0))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(primary_fg)
-                                    .child(if is_loading {
-                                        "Signing in..."
-                                    } else {
-                                        "Sign in"
-                                    }),
-                            )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.do_login(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("signup-btn")
-                            .w_full()
-                            .h(px(36.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(border)
-                            .bg(colors.muted.opacity(0.08))
-                            .hover(|s| s.bg(colors.muted.opacity(0.2)).border_color(fg.opacity(0.4)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(fg)
-                                    .child("Create an account"),
-                            )
-                            .child(
-                                Icon::default()
-                                    .path("icons/external-link.svg")
-                                    .size_3()
-                                    .text_color(muted),
-                            )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.do_signup(cx);
-                            })),
-                    ),
-            )
-            // Guest access divider & button
-            .child(
-                div()
-                    .pt(px(8.0))
-                    .border_t_1()
-                    .border_color(border.opacity(0.4))
-                    .child(
-                        div()
-                            .id("guest-btn")
-                            .w_full()
-                            .h(px(36.0))
+                            .px(px(12.0))
+                            .py(px(8.0))
                             .rounded(px(8.0))
                             .bg(colors.muted.opacity(0.12))
-                            .hover(|s| s.bg(colors.muted.opacity(0.25)))
                             .border_1()
-                            .border_color(border.opacity(0.6))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
-                            .cursor_pointer()
+                            .border_color(border.opacity(0.4))
                             .child(
-                                Icon::default()
-                                    .path("icons/circle-user.svg")
-                                    .size_3()
-                                    .text_color(primary),
+                                div()
+                                    .w(px(7.0))
+                                    .h(px(7.0))
+                                    .rounded_full()
+                                    .bg(bullish),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(fg)
-                                    .child("Continue as guest"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
                                     .text_color(muted)
-                                    .child("(Offline mode)"),
-                            )
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(AuthEvent::ContinueAsGuest);
-                            })),
+                                    .child("Free to use • Your settings stay saved on your device"),
+                            ),
                     ),
             );
 
-        div()
-            .id("login_page_container")
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .size_full()
+        // Right authentication card / form (fully responsive with vertical scrolling)
+        let auth_form = div()
+            .when(is_desktop, |this| {
+                if is_wide {
+                    this.w(px(520.0)).flex_shrink_0()
+                } else {
+                    this.w(px(460.0)).flex_shrink_0()
+                }
+            })
+            .when(!is_desktop, |this| this.flex_1())
+            .h_full()
+            .overflow_y_scrollbar()
             .bg(bg)
-            .p(px(16.0))
             .child(
                 div()
+                    .min_h_full()
                     .flex()
-                    .when(is_desktop, |this| this.flex_row().w(px(820.0)))
-                    .when(!is_desktop, |this| this.flex_col().w(px(400.0)))
-                    .max_w_full()
-                    .bg(colors.muted.opacity(0.12))
-                    .rounded(px(16.0))
-                    .border_1()
-                    .border_color(border)
-                    .shadow_xl()
-                    .overflow_hidden()
-                    .when(is_desktop, |this| this.child(left_hero))
-                    .when(!is_desktop, |this| {
-                        this.child(
-                            div()
-                                .p(px(20.0))
-                                .pb(px(0.0))
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(
+                    .flex_col()
+                    .justify_center()
+                    .items_center()
+                    .p(if is_compact_height { px(24.0) } else { px(36.0) })
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(380.0))
+                            .flex()
+                            .flex_col()
+                            .gap(if is_compact_height { px(16.0) } else { px(20.0) })
+                            // Mobile brand header (shown only when left hero is hidden)
+                            .when(!is_desktop, |this| {
+                                this.child(
                                     div()
-                                        .w(px(32.0))
-                                        .h(px(32.0))
-                                        .rounded(px(8.0))
-                                        .bg(primary)
                                         .flex()
                                         .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::default()
-                                                .path("icons/bull-mark.svg")
-                                                .size_4()
-                                                .text_color(primary_fg),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
+                                        .gap(px(10.0))
+                                        .mb(px(4.0))
                                         .child(
                                             div()
-                                                .text_base()
+                                                .w(px(36.0))
+                                                .h(px(36.0))
+                                                .rounded(px(8.0))
+                                                .bg(primary)
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    Icon::default()
+                                                        .path("icons/bull-mark.svg")
+                                                        .size_5()
+                                                        .text_color(primary_fg),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xl()
                                                 .font_weight(gpui::FontWeight::BOLD)
                                                 .text_color(fg)
                                                 .child("FinTer"),
+                                        ),
+                                )
+                            })
+                            // Form Title & Subtitle
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_2xl()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(fg)
+                                            .child("Sign in"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(muted)
+                                            .child("Sign in to sync your workspaces across devices."),
+                                    ),
+                            )
+                            // Feedback messages
+                            .when(error_message.is_some(), |this| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .px(px(12.0))
+                                        .py(px(8.0))
+                                        .rounded(px(8.0))
+                                        .bg(bearish.opacity(0.1))
+                                        .border_1()
+                                        .border_color(bearish.opacity(0.35))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            Icon::default()
+                                                .path("icons/triangle-alert.svg")
+                                                .size_4()
+                                                .text_color(bearish),
                                         )
                                         .child(
                                             div()
                                                 .text_xs()
-                                                .text_color(muted)
-                                                .child("GPU Trading Terminal"),
+                                                .text_color(bearish)
+                                                .child(error_message.unwrap_or_default()),
                                         ),
-                                ),
-                        )
-                    })
-                    .child(auth_form),
-            )
+                                )
+                            })
+                            .when(info_message.is_some(), |this| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .px(px(12.0))
+                                        .py(px(8.0))
+                                        .rounded(px(8.0))
+                                        .bg(bullish.opacity(0.1))
+                                        .border_1()
+                                        .border_color(bullish.opacity(0.35))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            Icon::default()
+                                                .path("icons/circle-check.svg")
+                                                .size_4()
+                                                .text_color(bullish),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(bullish)
+                                                .child(info_message.unwrap_or_default()),
+                                        ),
+                                )
+                            })
+                            // Google Login Button
+                            .child(
+                                div()
+                                    .id("google-login-btn")
+                                    .w_full()
+                                    .h(px(42.0))
+                                    .min_h(px(42.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(8.0))
+                                    .bg(colors.muted.opacity(0.14))
+                                    .hover(|s| s.bg(colors.muted.opacity(0.24)))
+                                    .active(|s| s.bg(colors.muted.opacity(0.34)))
+                                    .border_1()
+                                    .border_color(border)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(10.0))
+                                    .cursor_pointer()
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/globe.svg")
+                                            .size_4()
+                                            .text_color(fg),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(fg)
+                                            .child("Continue with Google"),
+                                    )
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.do_google_login(cx);
+                                    })),
+                            )
+                            // Divider
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .my(px(2.0))
+                                    .child(div().flex_1().h(px(1.0)).bg(border.opacity(0.5)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child("or with email"),
+                                    )
+                                    .child(div().flex_1().h(px(1.0)).bg(border.opacity(0.5))),
+                            )
+                            // Email & Password Fields
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(14.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(fg)
+                                                    .child("Email"),
+                                            )
+                                            .child(Input::new(&email_input).h(px(42.0))),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(fg)
+                                                    .child("Password"),
+                                            )
+                                            .child(Input::new(&password_input).h(px(42.0)).mask_toggle()),
+                                    ),
+                            )
+                            // Sign In Button & Registration Link
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(12.0))
+                                    .child(
+                                        div()
+                                            .id("login-btn")
+                                            .w_full()
+                                            .h(px(42.0))
+                                            .min_h(px(42.0))
+                                            .flex_shrink_0()
+                                            .rounded(px(8.0))
+                                            .bg(primary)
+                                            .hover(|s| s.bg(primary.opacity(0.88)))
+                                            .active(|s| s.bg(primary.opacity(0.75)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap(px(8.0))
+                                            .cursor_pointer()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(primary_fg)
+                                                    .child(if is_loading {
+                                                        "Signing in..."
+                                                    } else {
+                                                        "Sign in"
+                                                    }),
+                                            )
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                this.do_login(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap(px(4.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child("Don't have an account?"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("signup-btn")
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(3.0))
+                                                    .cursor_pointer()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                            .text_color(primary)
+                                                            .hover(|s| s.underline())
+                                                            .child("Create one"),
+                                                    )
+                                                    .child(
+                                                        Icon::default()
+                                                            .path("icons/external-link.svg")
+                                                            .size_3()
+                                                            .text_color(primary),
+                                                    )
+                                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                                        this.do_signup(cx);
+                                                    })),
+                                            ),
+                                    ),
+                            )
+                            // Guest Option
+                            .child(
+                                div()
+                                    .pt(px(14.0))
+                                    .border_t_1()
+                                    .border_color(border.opacity(0.4))
+                                    .child(
+                                        div()
+                                            .id("guest-btn")
+                                            .w_full()
+                                            .h(px(42.0))
+                                            .min_h(px(42.0))
+                                            .flex_shrink_0()
+                                            .rounded(px(8.0))
+                                            .bg(colors.muted.opacity(0.1))
+                                            .hover(|s| s.bg(colors.muted.opacity(0.2)))
+                                            .active(|s| s.bg(colors.muted.opacity(0.3)))
+                                            .border_1()
+                                            .border_color(border.opacity(0.5))
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .px(px(14.0))
+                                            .cursor_pointer()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(
+                                                        Icon::default()
+                                                            .path("icons/circle-user.svg")
+                                                            .size_4()
+                                                            .text_color(primary),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(fg)
+                                                            .child("Continue as guest"),
+                                                    ),
+                                            )
+                                            .child(
+                                                Icon::default()
+                                                    .path("icons/arrow-right.svg")
+                                                    .size_3()
+                                                    .text_color(muted),
+                                            )
+                                            .on_click(cx.listener(|_this, _event, _window, cx| {
+                                                cx.emit(AuthEvent::ContinueAsGuest);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            );
+
+        div()
+            .id("login_page_fullscreen")
+            .size_full()
+            .flex()
+            .flex_row()
+            .bg(bg)
+            .overflow_hidden()
+            .when(is_desktop, |this| this.child(left_hero))
+            .child(auth_form)
     }
 }
 

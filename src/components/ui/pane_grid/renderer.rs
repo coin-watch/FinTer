@@ -3,6 +3,7 @@ use gpui::InteractiveElement;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Selectable, Sizable};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::theme::ActiveTheme;
 use gpui_component::popover::Popover;
@@ -480,10 +481,18 @@ impl PaneGridRenderer {
                             )
                             .child(
                                 gpui_component::h_flex()
-                                    .gap(px(6.0))
+                                    .w_full()
+                                    .min_w_0()
+                                    .gap(px(4.0))
                                     .items_center()
+                                    .overflow_hidden()
                                     .child(
-                                        div().text_sm().font_weight(FontWeight::BOLD).child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_shrink_0()
+                                            .text_sm()
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(
                                             if is_empty {
                                                 "Select Module".to_string()
                                             } else if module_type.to_lowercase() == "time" || module_type.to_lowercase() == "clock" {
@@ -500,7 +509,10 @@ impl PaneGridRenderer {
                                         ];
                                         let current_timeframe = chart_timeframe.clone();
                                         let pane_id = pane_id.clone();
-                                        let mut controls = gpui_component::h_flex().gap(px(2.0)).items_center();
+                                        let mut controls = gpui_component::h_flex()
+                                            .flex_shrink_0()
+                                            .gap(px(1.0))
+                                            .items_center();
 
                                         for timeframe in common_timeframes {
                                             let pane_id = pane_id.clone();
@@ -563,7 +575,11 @@ impl PaneGridRenderer {
                                         };
                                         let current_timeframe = current_timeframe.clone();
                                         this.child(
-                                            controls.child(
+                                            div()
+                                                .min_w_0()
+                                                .flex_shrink_0()
+                                                .overflow_x_scrollbar()
+                                                .child(controls.child(
                                                 Button::new(ElementId::Name(
                                                     format!("timeframe-more-{pane_id}").into(),
                                                 ))
@@ -625,7 +641,7 @@ impl PaneGridRenderer {
                                                 },
                                             ),
                                         )
-                                            )
+                                        ))
                                     }),
                             )
                             // Toolbar

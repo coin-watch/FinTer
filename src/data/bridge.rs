@@ -1,9 +1,10 @@
 /// CoinWatch WebSocket gateway client.
 ///
-/// Connects to `wss://coinwat.ch/api/v1/ws` and subscribes to three channels:
+/// Connects to `wss://ws.coinwat.ch/ws` and subscribes to market channels:
 ///
-/// - `trades`    → [`UnifiedTick`] stream (server pushes ~every 2 s)
-/// - `orderbook` → [`OrderBook`] snapshot stream (server pushes ~every 2 s)
+/// - `ticker`    → [`UnifiedTick`] stream (real-time price updates)
+/// - `trades`    → [`UnifiedTick`] stream
+/// - `orderbook` → [`OrderBook`] snapshot stream
 /// - `kline`     → [`OhlcvCandle`] stream (server pushes ~every 2 s)
 ///
 /// OHLCV history (200 candles) is fetched once via REST at startup so the
@@ -85,12 +86,14 @@ impl BridgeConfig {
     pub fn ws_url(&self) -> String {
         std::env::var("FINTER_WS_URL").unwrap_or_else(|_| {
             let base = self.rest_base_url.trim_end_matches('/');
-            if let Some(origin) = base.strip_prefix("https://") {
-                format!("wss://{origin}/api/v1/ws")
+            if base.contains("coinwat.ch") {
+                "wss://ws.coinwat.ch/ws".to_string()
+            } else if let Some(origin) = base.strip_prefix("https://") {
+                format!("wss://{origin}/ws")
             } else if let Some(origin) = base.strip_prefix("http://") {
-                format!("ws://{origin}/api/v1/ws")
+                format!("ws://{origin}/ws")
             } else {
-                String::new()
+                "wss://ws.coinwat.ch/ws".to_string()
             }
         })
     }
@@ -397,19 +400,31 @@ async fn connect_and_stream(
             symbol: &ws_symbol,
             timeframe: Some(&config.timeframe),
         },
+        SubscribeMsg {
+            action: "subscribe",
+            channel: "orderbook",
+            exchange: &config.exchange,
+            symbol: &ws_symbol,
+            timeframe: None,
+        },
     ] {
         write.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         loop {
             match read.next().await {
                 Some(Ok(Message::Text(text))) => {
                     let ack: serde_json::Value = serde_json::from_str(&text)?;
-                    match ack.get("type").and_then(serde_json::Value::as_str) {
-                        Some("info") => break,
-                        Some("error") => anyhow::bail!(
-                            "gateway subscription failed: {}",
-                            ack.get("message").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
-                        ),
-                        _ => {}
+                    let is_info = ack.get("type").and_then(serde_json::Value::as_str) == Some("info");
+                    let is_sub = ack.get("action").and_then(serde_json::Value::as_str) == Some("subscribed");
+                    let is_ok = ack.get("status").and_then(serde_json::Value::as_str) == Some("ok");
+                    if is_info || is_sub || is_ok {
+                        break;
+                    }
+                    if ack.get("type").and_then(serde_json::Value::as_str) == Some("error") || ack.get("error").is_some() {
+                        let err_msg = ack.get("message")
+                            .or_else(|| ack.get("error"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown error");
+                        anyhow::bail!("gateway subscription failed: {}", err_msg);
                     }
                 }
                 Some(Ok(_)) => {}
@@ -418,11 +433,30 @@ async fn connect_and_stream(
             }
         }
     }
-    debug!("gateway: subscriptions acknowledged (ticker, kline/{})", config.timeframe);
+    debug!("gateway: subscriptions acknowledged (ticker, kline/{}, orderbook)", config.timeframe);
+
+    // Heartbeat ticker to keep the connection alive (matching CoinWatch client interval).
+    let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+    heartbeat_interval.tick().await; // consume immediate first tick
 
     // Message loop.
     loop {
         tokio::select! {
+            _ = heartbeat_interval.tick() => {
+                let heartbeat = SubscribeMsg {
+                    action: "subscribe",
+                    channel: "ticker",
+                    exchange: &config.exchange,
+                    symbol: &ws_symbol,
+                    timeframe: None,
+                };
+                if let Ok(json) = serde_json::to_string(&heartbeat) {
+                    if let Err(e) = write.send(Message::Text(json)).await {
+                        warn!("gateway: failed to send heartbeat: {e}");
+                        break;
+                    }
+                }
+            }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -476,7 +510,7 @@ fn handle_message(
     // Server error or info message
     if msg.msg_type.as_deref() == Some("info") {
         if let Some(m) = &msg.message {
-            info!("gateway: info message: {m}");
+            debug!("gateway: info message: {m}");
         }
         return;
     }
@@ -756,14 +790,14 @@ mod tests {
 
     #[test]
     fn ws_url_derives_from_rest_base() {
-        assert_eq!(base_cfg().ws_url(), "wss://coinwat.ch/api/v1/ws");
+        assert_eq!(base_cfg().ws_url(), "wss://ws.coinwat.ch/ws");
     }
 
     #[test]
     fn ws_url_works_with_http_scheme() {
         let mut cfg = base_cfg();
         cfg.rest_base_url = "http://localhost:3000".to_string();
-        assert_eq!(cfg.ws_url(), "ws://localhost:3000/api/v1/ws");
+        assert_eq!(cfg.ws_url(), "ws://localhost:3000/ws");
     }
 
     #[test]

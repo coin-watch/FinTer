@@ -360,10 +360,8 @@ impl RenderOnce for Input {
             .input_text_size(self.size)
             .cursor_text()
             .items_center()
-            .when(state.mode.is_multi_line(), |this| {
-                this.h_auto()
-                    .when_some(self.height, |this, height| this.h(height))
-            })
+            .when_some(self.height, |this, height| this.h(height))
+            .when(state.mode.is_multi_line(), |this| this.h_auto())
             .when(self.appearance, |this| {
                 this.bg(bg)
                     .rounded(cx.theme().radius)

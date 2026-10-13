@@ -8,10 +8,8 @@ use gpui::{
 
 use crate::ActiveTheme;
 
-#[cfg(not(target_os = "linux"))]
 const SHADOW_SIZE: Pixels = px(0.0);
-#[cfg(target_os = "linux")]
-const SHADOW_SIZE: Pixels = px(12.0);
+const RESIZE_BORDER: Pixels = px(4.0);
 const BORDER_SIZE: Pixels = px(1.0);
 pub(crate) const BORDER_RADIUS: Pixels = px(0.0);
 
@@ -38,22 +36,7 @@ impl WindowBorder {
 pub fn window_paddings(window: &Window) -> Edges<Pixels> {
     match window.window_decorations() {
         Decorations::Server => Edges::all(px(0.0)),
-        Decorations::Client { tiling } => {
-            let mut paddings = Edges::all(SHADOW_SIZE);
-            if tiling.top {
-                paddings.top = px(0.0);
-            }
-            if tiling.bottom {
-                paddings.bottom = px(0.0);
-            }
-            if tiling.left {
-                paddings.left = px(0.0);
-            }
-            if tiling.right {
-                paddings.right = px(0.0);
-            }
-            paddings
-        }
+        Decorations::Client { .. } => Edges::all(px(0.0)),
     }
 }
 
@@ -89,7 +72,7 @@ impl RenderOnce for WindowBorder {
                             move |_bounds, hitbox, window, _| {
                                 let mouse = window.mouse_position();
                                 let size = window.window_bounds().get_bounds().size;
-                                let Some(edge) = resize_edge(mouse, SHADOW_SIZE, size) else {
+                                let Some(edge) = resize_edge(mouse, size) else {
                                     return;
                                 };
                                 window.set_cursor_style(
@@ -120,18 +103,13 @@ impl RenderOnce for WindowBorder {
                     .when(!(tiling.top || tiling.left), |div| {
                         div.rounded_tl(BORDER_RADIUS)
                     })
-                    .when(!tiling.top, |div| div.pt(SHADOW_SIZE))
-                    .when(!tiling.bottom, |div| div.pb(SHADOW_SIZE))
-                    .when(!tiling.left, |div| div.pl(SHADOW_SIZE))
-                    .when(!tiling.right, |div| div.pr(SHADOW_SIZE))
                     .on_mouse_down(MouseButton::Left, move |_, window, _| {
                         let size = window.window_bounds().get_bounds().size;
                         let pos = window.mouse_position();
 
-                        match resize_edge(pos, SHADOW_SIZE, size) {
-                            Some(edge) => window.start_window_resize(edge),
-                            None => {}
-                        };
+                        if let Some(edge) = resize_edge(pos, size) {
+                            window.start_window_resize(edge);
+                        }
                     }),
             })
             .size_full()
@@ -150,20 +128,7 @@ impl RenderOnce for WindowBorder {
                             .when(!tiling.top, |div| div.border_t(BORDER_SIZE))
                             .when(!tiling.bottom, |div| div.border_b(BORDER_SIZE))
                             .when(!tiling.left, |div| div.border_l(BORDER_SIZE))
-                            .when(!tiling.right, |div| div.border_r(BORDER_SIZE))
-                            .when(!tiling.is_tiled(), |div| {
-                                div.shadow(vec![gpui::BoxShadow {
-                                    color: Hsla {
-                                        h: 0.,
-                                        s: 0.,
-                                        l: 0.,
-                                        a: 0.3,
-                                    },
-                                    blur_radius: SHADOW_SIZE / 2.,
-                                    spread_radius: px(0.),
-                                    offset: point(px(0.0), px(0.0)),
-                                }])
-                            }),
+                            .when(!tiling.right, |div| div.border_r(BORDER_SIZE)),
                     })
                     .on_mouse_move(|_e, _, cx| {
                         cx.stop_propagation();
@@ -175,22 +140,23 @@ impl RenderOnce for WindowBorder {
     }
 }
 
-fn resize_edge(pos: Point<Pixels>, shadow_size: Pixels, size: Size<Pixels>) -> Option<ResizeEdge> {
-    let edge = if pos.y < shadow_size && pos.x < shadow_size {
+fn resize_edge(pos: Point<Pixels>, size: Size<Pixels>) -> Option<ResizeEdge> {
+    let edge_size = RESIZE_BORDER;
+    let edge = if pos.y < edge_size && pos.x < edge_size {
         ResizeEdge::TopLeft
-    } else if pos.y < shadow_size && pos.x > size.width - shadow_size {
+    } else if pos.y < edge_size && pos.x > size.width - edge_size {
         ResizeEdge::TopRight
-    } else if pos.y < shadow_size {
+    } else if pos.y < edge_size {
         ResizeEdge::Top
-    } else if pos.y > size.height - shadow_size && pos.x < shadow_size {
+    } else if pos.y > size.height - edge_size && pos.x < edge_size {
         ResizeEdge::BottomLeft
-    } else if pos.y > size.height - shadow_size && pos.x > size.width - shadow_size {
+    } else if pos.y > size.height - edge_size && pos.x > size.width - edge_size {
         ResizeEdge::BottomRight
-    } else if pos.y > size.height - shadow_size {
+    } else if pos.y > size.height - edge_size {
         ResizeEdge::Bottom
-    } else if pos.x < shadow_size {
+    } else if pos.x < edge_size {
         ResizeEdge::Left
-    } else if pos.x > size.width - shadow_size {
+    } else if pos.x > size.width - edge_size {
         ResizeEdge::Right
     } else {
         return None;

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=FinTer
+GenericName=Financial Terminal
+Comment=Real-time crypto and financial market data terminal
+Exec=finter %u
+Icon=finter
+Terminal=false
+Categories=Finance;Office;Network;
+StartupWMClass=finter
+Keywords=crypto;trading;finance;terminal;bitcoin;

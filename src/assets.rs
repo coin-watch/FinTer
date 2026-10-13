@@ -8,6 +8,7 @@ use std::borrow::Cow;
 #[folder = "./assets"] // This points to your asset directory
 #[include = "icons/**/*.svg"] // This specifies which files to embed
 #[include = "icons/**/*.png"] // This specifies which files to embed
+#[include = "*.png"] // Root png files like app-icon.png
 #[include = "JetBrainsMono/**/*.ttf"] // JetBrains fonts
 pub struct CustomAssets;
 

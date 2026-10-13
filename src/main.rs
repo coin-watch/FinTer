@@ -28,8 +28,11 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     unsafe {
-        std::env::remove_var("WAYLAND_DISPLAY")
-    };
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
+    #[cfg(target_os = "linux")]
+    install_linux_desktop_entry();
 
     let app = Application::new()
         .with_assets(CombinedAssets::new())
@@ -48,6 +51,7 @@ fn main() {
                     #[cfg(not(target_os = "linux"))]
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
+                    app_id: Some("finter".to_string()),
                     ..Default::default()
                 },
                 |window, cx| {
@@ -64,4 +68,60 @@ fn main() {
         })
         .detach();
     });
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_desktop_entry() {
+    let Some(data_dir) = dirs::data_local_dir() else { return; };
+
+    // 1. Install icons
+    let icon_data = crate::assets::CustomAssets::get("app-icon.png")
+        .or_else(|| crate::assets::CustomAssets::get("icons/app-icon.png"));
+
+    if let Some(icon) = icon_data {
+        // ~/.local/share/icons/hicolor/512x512/apps/finter.png
+        let icon_hicolor = data_dir.join("icons/hicolor/512x512/apps/finter.png");
+        if !icon_hicolor.exists() {
+            if let Some(parent) = icon_hicolor.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&icon_hicolor, &icon.data);
+        }
+
+        // ~/.local/share/pixmaps/finter.png
+        let pixmap = data_dir.join("pixmaps/finter.png");
+        if !pixmap.exists() {
+            if let Some(parent) = pixmap.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&pixmap, &icon.data);
+        }
+    }
+
+    // 2. Install desktop entry ~/.local/share/applications/finter.desktop
+    let desktop_path = data_dir.join("applications/finter.desktop");
+    let current_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "finter".to_string());
+
+    let desktop_content = format!(
+        "[Desktop Entry]\n\
+        Version=1.0\n\
+        Type=Application\n\
+        Name=FinTer\n\
+        GenericName=Financial Terminal\n\
+        Comment=Real-time crypto and financial market data terminal\n\
+        Exec=\"{}\"\n\
+        Icon=finter\n\
+        Terminal=false\n\
+        Categories=Finance;Office;Network;\n\
+        StartupWMClass=finter\n\
+        Keywords=crypto;trading;finance;terminal;bitcoin;\n",
+        current_exe
+    );
+
+    if let Some(parent) = desktop_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&desktop_path, desktop_content);
 }

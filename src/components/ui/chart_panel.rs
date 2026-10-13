@@ -36,7 +36,7 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::{Selectable, Sizable};
+use gpui_component::Selectable;
 use gpui_component::chart::{CandleType, CandlestickChart, ChartState, IndicatorStyle, PaneTarget};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
@@ -2085,8 +2085,6 @@ impl Render for ChartPanel {
 impl ChartPanel {
     fn render_chart_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
-        let is_live = !self.feed.snapshot().is_empty();
-
         let w = if self.last_chart_width > 0.0 {
             self.last_chart_width
         } else {
@@ -2109,9 +2107,9 @@ impl ChartPanel {
         let toolbar_button = |id: &'static str, path: &'static str, label: &'static str| {
             Button::new(id)
                 .icon(icon(path))
-                .when(is_wide, |button| button.label(label))
                 .compact()
                 .ghost()
+                .tooltip(label)
         };
 
         let drawing_button = |tool: Option<DrawingTool>, id: &'static str, path: &'static str, label: &'static str| {
@@ -2119,7 +2117,6 @@ impl ChartPanel {
             toolbar_button(id, path, label)
                 .selected(active)
                 .when(active, |button| button.bg(active_bg).text_color(active_fg))
-                .tooltip(label)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.set_active_drawing_tool(tool);
                     cx.notify();
@@ -2175,7 +2172,6 @@ impl ChartPanel {
 
         let color_trigger = Button::new("toolbar_drawing_color")
             .icon(icon("icons/palette.svg"))
-            .when(is_wide, |button| button.label("Color"))
             .compact()
             .ghost()
             .tooltip(format!("Drawing Color ({})", self.drawing_color))
@@ -2342,32 +2338,6 @@ impl ChartPanel {
                 cx.notify();
             }));
 
-        let status = div()
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .px(if is_ultra_compact { px(3.0) } else { px(7.0) })
-            .py(px(3.0))
-            .rounded_full()
-            .bg(if is_live {
-                gpui::Fill::Color(gpui::rgba(0x2ebd8522).into())
-            } else {
-                gpui::Fill::Color(gpui::rgba(0xf4a26122).into())
-            })
-            .text_color(if is_live {
-                gpui::Hsla::from(gpui::rgba(0x2ebd85ff))
-            } else {
-                gpui::Hsla::from(gpui::rgba(0xf4a261ff))
-            })
-            .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(if is_live {
-                gpui::Fill::Color(gpui::rgba(0x2ebd85ff).into())
-            } else {
-                gpui::Fill::Color(gpui::rgba(0xf4a261ff).into())
-            }))
-            .when(!is_ultra_compact, |this| {
-                this.child(if is_live { "LIVE" } else { "STALE" })
-            });
-
         div()
             .h(px(38.0))
             .w_full()
@@ -2419,7 +2389,6 @@ impl ChartPanel {
                     .child(grid)
                     .child(clear),
             )
-            .child(status)
     }
 
     fn render_indicator_library(&self, cx: &Context<Self>) -> AnyElement {

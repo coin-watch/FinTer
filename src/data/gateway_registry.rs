@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{error, info};
 
 use crate::data::client::{service_base_url, tokio_runtime};
+use crate::data::session_store;
 
 // ---------------------------------------------------------------------------
 // Defaults — shown while the API fetch is in flight
@@ -203,7 +204,17 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>) {
     let url = format!("{}/api/v1/exchanges", gateway_base());
     info!("GatewayRegistry: fetching exchanges from {url}");
 
-    match reqwest::get(&url).await {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("Origin", gateway_base())
+        .header("Referer", format!("{}/", gateway_base()));
+    if let Ok(Some(session)) = session_store::load_session() {
+        request = request.bearer_auth(session.access_token);
+    }
+
+    match request.send().await {
         Ok(resp) if resp.status().is_success() => match resp.json::<Vec<ExchangeEntry>>().await {
             Ok(entries) => {
                 let ids: Vec<String> = entries.into_iter().map(|e| e.id()).collect();
@@ -240,7 +251,17 @@ async fn fetch_symbols(inner: Arc<Mutex<RegistryInner>>, exchange: &str) {
     );
     info!("GatewayRegistry: fetching symbols for {exchange}");
 
-    match reqwest::get(&url).await {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("Origin", gateway_base())
+        .header("Referer", format!("{}/", gateway_base()));
+    if let Ok(Some(session)) = session_store::load_session() {
+        request = request.bearer_auth(session.access_token);
+    }
+
+    match request.send().await {
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<Vec<SymbolEntry>>().await {
                 Ok(entries) => {

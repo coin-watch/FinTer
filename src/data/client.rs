@@ -277,9 +277,14 @@ pub async fn parse_api_response<T: serde::de::DeserializeOwned>(
             // (some endpoints return raw arrays, e.g. GET /api/modules)
             serde_json::from_str::<T>(&body).map_err(|e| {
                 if status >= 400 {
+                    let msg = if body.trim_start().starts_with("<!doctype") || body.trim_start().starts_with("<html") {
+                        format!("HTTP {status}")
+                    } else {
+                        body
+                    };
                     CoinWatchError::Api {
                         status,
-                        message: body,
+                        message: msg,
                     }
                 } else {
                     CoinWatchError::Deserialization(format!("{}: {}", e, body))

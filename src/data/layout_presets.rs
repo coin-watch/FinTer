@@ -18,12 +18,24 @@ impl ApiClient {
         rt.block_on(async {
             let resp = req.send().await?;
             let status = resp.status();
+
+            // 404 means the endpoint is not available/deployed yet on this server; treat as empty
+            if status == reqwest::StatusCode::NOT_FOUND {
+                tracing::debug!("list_layout_presets: endpoint returned 404, returning empty list");
+                return Ok(vec![]);
+            }
+
             let body = resp.text().await?;
 
             if !status.is_success() {
+                let msg = if body.trim_start().starts_with("<!doctype") || body.trim_start().starts_with("<html") {
+                    format!("HTTP {status}")
+                } else {
+                    body
+                };
                 return Err(crate::data::error::CoinWatchError::Api {
                     status: status.as_u16(),
-                    message: body,
+                    message: msg,
                 });
             }
 

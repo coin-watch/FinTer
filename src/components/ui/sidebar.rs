@@ -1,9 +1,9 @@
 use crate::components::mainview::{MainView, Page, SecondarySidebar};
 use crate::components::ui::title_bar::TITLE_BAR_HEIGHT;
 use gpui::{
-    App, AppContext, ClickEvent, Context, Corner, Hsla, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage, WeakEntity,
-    Window, WindowControlArea, div, img, px,
+    prelude::FluentBuilder as _, App, AppContext, ClickEvent, Context, Corner, Hsla,
+    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    StyleRefinement, Styled, StyledImage, WeakEntity, Window, WindowControlArea, div, img, px,
 };
 use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants};
@@ -245,6 +245,11 @@ fn build_icon_sidebar(
                 div()
                     .id("sidebar-logo-header")
                     .window_control_area(WindowControlArea::Drag)
+                    .when(cfg!(target_os = "linux"), |this| {
+                        this.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                            window.start_window_move();
+                        })
+                    })
                     .w_full()
                     .h(TITLE_BAR_HEIGHT)
                     .flex()
@@ -313,7 +318,7 @@ fn build_user_button(
     main_view_entity: WeakEntity<MainView>,
     user_info: SidebarUserInfo,
     sidebar_accent: Hsla,
-    sidebar_fg: Hsla,
+    _sidebar_fg: Hsla,
     sidebar_primary: Hsla,
     sidebar_primary_fg: Hsla,
 ) -> impl IntoElement {
