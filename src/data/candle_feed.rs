@@ -221,11 +221,32 @@ fn get_interval_ms(timeframe: &str) -> i64 {
     }
 }
 
-fn align_timestamp(ts: i64, interval_ms: i64) -> i64 {
+fn align_timestamp(ts: i64, interval_ms: i64, timeframe: &str) -> i64 {
     if interval_ms <= 0 {
         return ts;
     }
-    (ts / interval_ms) * interval_ms
+    match timeframe {
+        "1w" => {
+            // Unix epoch 1970-01-01 was a Thursday.
+            // Crypto weekly candles (Binance, OKX, Bybit, etc.) start on Monday 00:00:00 UTC.
+            // Monday Jan 5 1970 00:00:00 UTC is 4 days = 345_600_000 ms after epoch.
+            const MONDAY_OFFSET: i64 = 4 * 86_400_000;
+            ((ts - MONDAY_OFFSET).div_euclid(interval_ms)) * interval_ms + MONDAY_OFFSET
+        }
+        "1M" => {
+            // Calendar month: align to 1st of the month at 00:00:00 UTC
+            if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(ts / 1000, 0) {
+                use chrono::Datelike;
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1) {
+                    if let Some(dt_start) = date.and_hms_opt(0, 0, 0) {
+                        return dt_start.and_utc().timestamp_millis();
+                    }
+                }
+            }
+            (ts / interval_ms) * interval_ms
+        }
+        _ => (ts / interval_ms) * interval_ms,
+    }
 }
 
 async fn drain_loop(
@@ -279,7 +300,7 @@ async fn drain_loop(
                         
                         // Use tick's timestamp instead of local wall clock!
                         let tick_ms = tick.timestamp_ms;
-                        let current_bucket_ts = align_timestamp(tick_ms, interval_ms);
+                        let current_bucket_ts = align_timestamp(tick_ms, interval_ms, &timeframe);
 
                         let mut changed = false;
                         if let Some(last) = inner.candles.last_mut() {
@@ -292,29 +313,38 @@ async fn drain_loop(
                                     last.high = high;
                                     last.low = low;
                                 }
-                            } else if current_bucket_ts > last.timestamp {
-                                let new_candle = OhlcvCandle {
-                                    timestamp: current_bucket_ts,
-                                    open: last.close,
-                                    high: last.close.max(price),
-                                    low: last.close.min(price),
-                                    close: price,
-                                    volume: 0.0,
-                                };
-                                inner.candles.push(new_candle);
-                                if inner.candles.len() > MAX_CANDLES {
-                                    inner.candles.remove(0);
-                                }
-                                changed = true;
                             } else {
-                                // Older buckets update the forming last candle so ticker price stays visible.
-                                let high = last.high.max(price);
-                                let low = last.low.min(price);
-                                changed = last.close != price || last.high != high || last.low != low;
-                                if changed {
-                                    last.close = price;
-                                    last.high = high;
-                                    last.low = low;
+                                let is_new_period = if timeframe == "1M" {
+                                    current_bucket_ts > last.timestamp
+                                } else {
+                                    current_bucket_ts > last.timestamp && tick_ms >= last.timestamp + interval_ms
+                                };
+
+                                if is_new_period {
+                                    let new_candle = OhlcvCandle {
+                                        timestamp: current_bucket_ts,
+                                        open: last.close,
+                                        high: last.close.max(price),
+                                        low: last.close.min(price),
+                                        close: price,
+                                        volume: 0.0,
+                                    };
+                                    inner.candles.push(new_candle);
+                                    if inner.candles.len() > MAX_CANDLES {
+                                        inner.candles.remove(0);
+                                    }
+                                    changed = true;
+                                } else {
+                                    // Tick is within current candle duration or from older bucket;
+                                    // update the forming last candle so ticker price stays visible.
+                                    let high = last.high.max(price);
+                                    let low = last.low.min(price);
+                                    changed = last.close != price || last.high != high || last.low != low;
+                                    if changed {
+                                        last.close = price;
+                                        last.high = high;
+                                        last.low = low;
+                                    }
                                 }
                             }
                         }
@@ -454,5 +484,41 @@ mod tests {
         // Prepend another candle -> version increments
         feed.prepend_history(&[candle(500, 8.0)]);
         assert_eq!(feed.version(), 3);
+    }
+
+    #[test]
+    fn test_align_timestamp_weekly_monday() {
+        // Test Monday-alignment: 1970-01-05 00:00:00 UTC was Monday (ts = 345_600_000)
+        let interval_ms = get_interval_ms("1w");
+        assert_eq!(interval_ms, 604_800_000);
+
+        // Monday 2026-10-12 00:00:00 UTC = 1791763200000
+        let mon = 1791763200000;
+        assert_eq!(align_timestamp(mon, interval_ms, "1w"), mon);
+
+        // Wednesday 2026-10-14 08:24:12 UTC = 1791935853249
+        let wed = 1791935853249;
+        assert_eq!(align_timestamp(wed, interval_ms, "1w"), mon);
+
+        // Sunday 2026-10-18 23:59:59 UTC = mon + 604_800_000 - 1000
+        let sun = mon + 604_800_000 - 1000;
+        assert_eq!(align_timestamp(sun, interval_ms, "1w"), mon);
+
+        // Next Monday 2026-10-19 00:00:00 UTC = mon + 604_800_000
+        let next_mon = mon + 604_800_000;
+        assert_eq!(align_timestamp(next_mon, interval_ms, "1w"), next_mon);
+    }
+
+    #[test]
+    fn test_align_timestamp_monthly() {
+        let interval_ms = get_interval_ms("1M");
+        // 2026-10-14 08:24:12 UTC
+        let mid_oct = 1791935853249;
+        let oct_1 = align_timestamp(mid_oct, interval_ms, "1M");
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(oct_1 / 1000, 0).unwrap();
+        use chrono::Datelike;
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 10);
+        assert_eq!(dt.day(), 1);
     }
 }

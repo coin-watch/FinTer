@@ -40,6 +40,7 @@ use gpui_component::Selectable;
 use gpui_component::chart::{CandleType, CandlestickChart, ChartState, IndicatorStyle, PaneTarget};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::v_flex;
 
@@ -79,6 +80,12 @@ enum LegendSettingsTarget {
     Main,
     Indicator(usize), // index in indicators list
     Volume,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorPickerDrag {
+    Square,
+    Hue,
 }
 
 pub type TechnicalIndicatorKind = IndicatorKind;
@@ -157,6 +164,10 @@ pub struct ChartPanel {
     pub drawing_color: String,
     pub snap_to_candle: bool,
     drawing_cursor_point: Option<DrawingPoint>,
+    color_picker_drag: Option<ColorPickerDrag>,
+    color_picker_hue: f32,
+    color_picker_square_bounds: gpui::Bounds<Pixels>,
+    color_picker_hue_bounds: gpui::Bounds<Pixels>,
 
     // Persistence & Debounce
     layout_dirty: bool,
@@ -264,6 +275,10 @@ impl ChartPanel {
             drawing_color: "#C4E855".to_string(),
             snap_to_candle: true,
             drawing_cursor_point: None,
+            color_picker_drag: None,
+            color_picker_hue: 0.205,
+            color_picker_square_bounds: gpui::Bounds::default(),
+            color_picker_hue_bounds: gpui::Bounds::default(),
 
             // Persistence
             layout_dirty: false,
@@ -492,6 +507,87 @@ impl ChartPanel {
             Some(gpui::rgba((r as u32) << 24 | (g as u32) << 16 | (b as u32) << 8 | 0xff).into())
         } else {
             None
+        }
+    }
+
+    fn drawing_color_hsv(&self) -> (f32, f32, f32) {
+        let color = Self::parse_hex_color(&self.drawing_color)
+            .unwrap_or_else(|| gpui::Hsla::from(gpui::rgba(0xc4e855ff)));
+        let rgb = color.to_rgb();
+        let max = rgb.r.max(rgb.g.max(rgb.b));
+        let min = rgb.r.min(rgb.g.min(rgb.b));
+        let delta = max - min;
+        let hue = if delta <= f32::EPSILON {
+            self.color_picker_hue
+        } else if max == rgb.r {
+            ((rgb.g - rgb.b) / delta).rem_euclid(6.0) / 6.0
+        } else if max == rgb.g {
+            (((rgb.b - rgb.r) / delta) + 2.0) / 6.0
+        } else {
+            (((rgb.r - rgb.g) / delta) + 4.0) / 6.0
+        };
+        let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+        (hue, saturation, max)
+    }
+
+    fn hsv_color(hue: f32, saturation: f32, value: f32) -> gpui::Hsla {
+        let hue = hue.rem_euclid(1.0);
+        let saturation = saturation.clamp(0.0, 1.0);
+        let value = value.clamp(0.0, 1.0);
+        let chroma = value * saturation;
+        let sector = hue * 6.0;
+        let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+        let (r, g, b) = match sector.floor() as i32 {
+            0 => (chroma, x, 0.0),
+            1 => (x, chroma, 0.0),
+            2 => (0.0, chroma, x),
+            3 => (0.0, x, chroma),
+            4 => (x, 0.0, chroma),
+            _ => (chroma, 0.0, x),
+        };
+        let m = value - chroma;
+        gpui::Hsla::from(gpui::Rgba {
+            r: r + m,
+            g: g + m,
+            b: b + m,
+            a: 1.0,
+        })
+    }
+
+    fn set_drawing_color_hsv(&mut self, hue: f32, saturation: f32, value: f32) {
+        self.color_picker_hue = hue.clamp(0.0, 1.0);
+        let rgb = Self::hsv_color(hue, saturation, value).to_rgb();
+        self.drawing_color = format!(
+            "#{:02X}{:02X}{:02X}",
+            (rgb.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgb.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgb.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        );
+    }
+
+    fn update_color_picker(&mut self, position: Point<Pixels>, target: ColorPickerDrag) {
+        let (hue, saturation, value) = self.drawing_color_hsv();
+        match target {
+            ColorPickerDrag::Square => {
+                let bounds = &self.color_picker_square_bounds;
+                if bounds.size.width.as_f32() <= 0.0 || bounds.size.height.as_f32() <= 0.0 {
+                    return;
+                }
+                let x = ((position.x - bounds.origin.x).as_f32() / bounds.size.width.as_f32())
+                    .clamp(0.0, 1.0);
+                let y = ((position.y - bounds.origin.y).as_f32() / bounds.size.height.as_f32())
+                    .clamp(0.0, 1.0);
+                self.set_drawing_color_hsv(hue, x, 1.0 - y);
+            }
+            ColorPickerDrag::Hue => {
+                let bounds = &self.color_picker_hue_bounds;
+                if bounds.size.width.as_f32() <= 0.0 {
+                    return;
+                }
+                let x = ((position.x - bounds.origin.x).as_f32() / bounds.size.width.as_f32())
+                    .clamp(0.0, 1.0);
+                self.set_drawing_color_hsv(x, saturation, value);
+            }
         }
     }
 
@@ -2167,140 +2263,375 @@ impl ChartPanel {
             }));
 
         let current_hex = self.drawing_color.clone();
-        let parsed_color = Self::parse_hex_color(&self.drawing_color).unwrap_or(gpui::rgba(0xc4e855ff).into());
+        let current_hsv = self.drawing_color_hsv();
+        let parsed_color = Self::parse_hex_color(&current_hex)
+            .unwrap_or(gpui::rgba(0xc4e855ff).into());
         let color_view = cx.entity().downgrade();
 
         let color_trigger = Button::new("toolbar_drawing_color")
             .icon(icon("icons/palette.svg"))
             .compact()
             .ghost()
-            .tooltip(format!("Drawing Color ({})", self.drawing_color))
+            .tooltip(format!("Drawing color ({})", self.drawing_color))
             .child(
                 div()
-                    .w(px(8.0))
-                    .h(px(8.0))
+                    .w(px(10.0))
+                    .h(px(10.0))
                     .rounded_full()
                     .bg(parsed_color)
                     .border_1()
-                    .border_color(colors.border),
+                    .border_color(colors.foreground.opacity(0.7)),
             );
 
         let color_picker = Popover::new(ElementId::Name("toolbar-color-popover".into()))
             .anchor(Corner::TopLeft)
             .trigger(color_trigger)
-            .content(move |_state, _window, cx| {
+            .content(move |_state, window, cx| {
                 let view = color_view.clone();
                 let selected_hex = current_hex.clone();
+                let theme = &cx.theme().colors;
+                let selected_color = ChartPanel::parse_hex_color(&selected_hex)
+                    .unwrap_or(gpui::rgba(0xc4e855ff).into());
+                let (selected_hue, selected_saturation, selected_value) = current_hsv;
+                let square_marker_x = selected_saturation * 204.0;
+                let square_marker_y = (1.0 - selected_value) * 154.0;
+                let hue_marker_x = selected_hue * 204.0;
+                let square_drag_view = view.clone();
+                let hue_drag_view = view.clone();
                 let palettes: &[(&str, &[&str])] = &[
-                    ("PRESETS", &["#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF"]),
-                    ("GREENS", &["#00E676", "#2EBD85", "#C4E855", "#AEEA00", "#76FF03"]),
-                    ("CYANS & BLUES", &["#00F0FF", "#00B0FF", "#2979FF", "#651FFF", "#3D5AFE"]),
-                    ("WARM & ACCENT", &["#FFEA00", "#FFD600", "#FF9100", "#FF6D00", "#FF3D00"]),
-                    ("PINKS & REDS", &["#FF0055", "#F6465D", "#FF1744", "#F50057", "#D500F9"]),
-                    ("MONOCHROME", &["#FFFFFF", "#ECEFF1", "#90A4AE", "#546E7A", "#263238"]),
+                    ("Quick picks", &["#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF"]),
+                    ("Greens", &["#00E676", "#2EBD85", "#C4E855", "#AEEA00", "#76FF03"]),
+                    ("Blues & violet", &["#00F0FF", "#00B0FF", "#2979FF", "#651FFF", "#3D5AFE"]),
+                    ("Warm accents", &["#FFEA00", "#FFD600", "#FF9100", "#FF6D00", "#FF3D00"]),
+                    ("Pink & red", &["#FF0055", "#F6465D", "#FF1744", "#F50057", "#D500F9"]),
+                    ("Neutral", &["#FFFFFF", "#ECEFF1", "#90A4AE", "#546E7A", "#263238"]),
                 ];
 
                 div()
-                    .p(px(10.0))
-                    .w(px(190.0))
-                    .bg(cx.theme().colors.popover)
-                    .border_1()
-                    .border_color(cx.theme().colors.border)
-                    .rounded(px(8.0))
-                    .shadow_lg()
+                    .w(px(238.0))
+                    .max_h((window.viewport_size().height - px(64.0)).max(px(80.0)))
+                    .overflow_y_scrollbar()
                     .flex()
                     .flex_col()
-                    .gap(px(6.0))
+                    .gap(px(10.0))
                     .text_xs()
+                    .on_mouse_move({
+                        let view = view.clone();
+                        move |event: &MouseMoveEvent, _window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                if let Some(target) = this.color_picker_drag {
+                                    cx.stop_propagation();
+                                    this.update_color_picker(event.position, target);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .on_mouse_up(MouseButton::Left, {
+                        let view = view.clone();
+                        move |_event, _window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                if this.color_picker_drag.is_some() {
+                                    cx.stop_propagation();
+                                    this.color_picker_drag = None;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .pb(px(4.0))
+                            .gap(px(10.0))
+                            .pb(px(10.0))
                             .border_b_1()
-                            .border_color(cx.theme().colors.border.opacity(0.4))
+                            .border_color(theme.border.opacity(0.55))
                             .child(
                                 div()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child("COLOR PICKER"),
+                                    .w(px(38.0))
+                                    .h(px(38.0))
+                                    .flex_shrink_0()
+                                    .rounded(px(10.0))
+                                    .bg(selected_color)
+                                    .border_1()
+                                    .border_color(theme.foreground.opacity(0.45)),
                             )
                             .child(
                                 div()
                                     .flex()
-                                    .items_center()
-                                    .gap(px(4.0))
+                                    .flex_col()
+                                    .gap(px(2.0))
                                     .child(
                                         div()
-                                            .w(px(10.0))
-                                            .h(px(10.0))
-                                            .rounded_full()
-                                            .bg(ChartPanel::parse_hex_color(&selected_hex).unwrap_or(gpui::rgba(0xc4e855ff).into())),
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Drawing color"),
                                     )
                                     .child(
                                         div()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(cx.theme().colors.foreground)
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(theme.primary)
                                             .child(selected_hex.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child("Used for new drawings"),
                                     ),
                             ),
                     )
-                    .children(palettes.iter().map(|(section_name, colors_list)| {
-                        let view = view.clone();
-                        let selected_hex = selected_hex.clone();
+                    .child({
+                        let hue_color = ChartPanel::hsv_color(selected_hue, 1.0, 1.0);
+                        let marker_x = square_marker_x - 6.0;
+                        let marker_y = square_marker_y - 6.0;
+                        let field_view = view.clone();
+                        div()
+                            .id("drawing-color-square")
+                            .relative()
+                            .w(px(204.0))
+                            .h(px(154.0))
+                            .rounded(px(8.0))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme.border)
+                            .cursor_crosshair()
+                            .on_mouse_down(MouseButton::Left, {
+                                let view = square_drag_view.clone();
+                                move |event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.color_picker_drag = Some(ColorPickerDrag::Square);
+                                        this.update_color_picker(event.position, ColorPickerDrag::Square);
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .on_mouse_move({
+                                let view = square_drag_view.clone();
+                                move |event: &MouseMoveEvent, _window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.color_picker_drag == Some(ColorPickerDrag::Square) {
+                                            cx.stop_propagation();
+                                            this.update_color_picker(event.position, ColorPickerDrag::Square);
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .on_mouse_up(MouseButton::Left, {
+                                let view = square_drag_view.clone();
+                                move |_event, _window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.color_picker_drag == Some(ColorPickerDrag::Square) {
+                                            cx.stop_propagation();
+                                            this.color_picker_drag = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .child(
+                                gpui::canvas(
+                                    move |bounds, _, cx| {
+                                        let _ = field_view.update(cx, |this, _| {
+                                            this.color_picker_square_bounds = bounds;
+                                        });
+                                    },
+                                    move |bounds, _, window, cx| {
+                                        const COLUMNS: usize = 34;
+                                        const ROWS: usize = 26;
+                                        for row in 0..ROWS {
+                                            for column in 0..COLUMNS {
+                                                let saturation = column as f32 / (COLUMNS - 1) as f32;
+                                                let value = 1.0 - row as f32 / (ROWS - 1) as f32;
+                                                let color = ChartPanel::hsv_color(selected_hue, saturation, value);
+                                                let x0 = bounds.origin.x + bounds.size.width * (column as f32 / COLUMNS as f32);
+                                                let y0 = bounds.origin.y + bounds.size.height * (row as f32 / ROWS as f32);
+                                                let x1 = bounds.origin.x + bounds.size.width * ((column + 1) as f32 / COLUMNS as f32);
+                                                let y1 = bounds.origin.y + bounds.size.height * ((row + 1) as f32 / ROWS as f32);
+                                                window.paint_quad(gpui::fill(
+                                                    gpui::Bounds::from_corners(
+                                                        gpui::point(x0, y0),
+                                                        gpui::point(x1, y1),
+                                                    ),
+                                                    color,
+                                                ));
+                                            }
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(marker_x))
+                                    .top(px(marker_y))
+                                    .w(px(12.0))
+                                    .h(px(12.0))
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(gpui::Hsla::white())
+                                    .bg(hue_color.opacity(0.2))
+                                    .shadow_sm(),
+                            )
+                    })
+                    .child({
+                        let hue_view = view.clone();
+                        div()
+                            .id("drawing-color-hue")
+                            .relative()
+                            .w(px(204.0))
+                            .h(px(16.0))
+                            .rounded(px(5.0))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme.border)
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, {
+                                let view = hue_drag_view.clone();
+                                move |event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.color_picker_drag = Some(ColorPickerDrag::Hue);
+                                        this.update_color_picker(event.position, ColorPickerDrag::Hue);
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .on_mouse_move({
+                                let view = hue_drag_view.clone();
+                                move |event: &MouseMoveEvent, _window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.color_picker_drag == Some(ColorPickerDrag::Hue) {
+                                            cx.stop_propagation();
+                                            this.update_color_picker(event.position, ColorPickerDrag::Hue);
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .on_mouse_up(MouseButton::Left, {
+                                let view = hue_drag_view.clone();
+                                move |_event, _window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.color_picker_drag == Some(ColorPickerDrag::Hue) {
+                                            cx.stop_propagation();
+                                            this.color_picker_drag = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            })
+                            .child(
+                                gpui::canvas(
+                                    move |bounds, _, cx| {
+                                        let _ = hue_view.update(cx, |this, _| {
+                                            this.color_picker_hue_bounds = bounds;
+                                        });
+                                    },
+                                    move |bounds, _, window, cx| {
+                                        const STEPS: usize = 36;
+                                        for step in 0..STEPS {
+                                            let hue = step as f32 / STEPS as f32;
+                                            let x0 = bounds.origin.x + bounds.size.width * hue;
+                                            let x1 = bounds.origin.x + bounds.size.width * ((step + 1) as f32 / STEPS as f32);
+                                            window.paint_quad(gpui::fill(
+                                                gpui::Bounds::from_corners(
+                                                    gpui::point(x0, bounds.origin.y),
+                                                    gpui::point(x1, bounds.origin.y + bounds.size.height),
+                                                ),
+                                                ChartPanel::hsv_color(hue, 1.0, 1.0),
+                                            ));
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(hue_marker_x - 2.0))
+                                    .top(px(1.0))
+                                    .w(px(4.0))
+                                    .h(px(14.0))
+                                    .rounded(px(2.0))
+                                    .border_1()
+                                    .border_color(gpui::Hsla::white())
+                                    .bg(gpui::Hsla::transparent_black()),
+                            )
+                    })
+                    .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap(px(3.0))
+                            .items_center()
+                            .gap(px(6.0))
+                            .pt(px(2.0))
                             .child(
                                 div()
-                                    .text_size(px(10.0))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(*section_name),
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.muted_foreground)
+                                    .child("Quick picks"),
                             )
-                            .child(
+                            .children(palettes[0].1.iter().enumerate().map(|(index, &hex)| {
+                                let view = view.clone();
+                                let hex_str = hex.to_string();
+                                let is_active = selected_hex.eq_ignore_ascii_case(hex);
+                                let swatch_color = ChartPanel::parse_hex_color(hex)
+                                    .unwrap_or(gpui::rgba(0xffffffff).into());
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.0))
-                                    .children(colors_list.iter().map(|&hex| {
-                                        let view = view.clone();
-                                        let hex_str = hex.to_string();
-                                        let is_active = selected_hex.eq_ignore_ascii_case(hex);
-                                        let swatch_color = ChartPanel::parse_hex_color(hex).unwrap_or(gpui::rgba(0xffffffff).into());
+                                    .id(ElementId::Name(
+                                        format!("drawing-color-quick-{}", index).into(),
+                                    ))
+                                    .cursor_pointer()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded(px(6.0))
+                                    .bg(swatch_color)
+                                    .border_1()
+                                    .border_color(if is_active {
+                                        theme.foreground
+                                    } else {
+                                        theme.border.opacity(0.65)
+                                    })
+                                    .when(is_active, |this| this.border_2())
+                                    .child(
                                         div()
-                                            .cursor_pointer()
-                                            .w(px(22.0))
-                                            .h(px(22.0))
-                                            .rounded(px(4.0))
-                                            .bg(swatch_color)
-                                            .border_1()
-                                            .border_color(if is_active {
-                                                cx.theme().colors.foreground
-                                            } else {
-                                                swatch_color
-                                            })
-                                            .when(is_active, |this| this.border_2())
-                                            .hover(|s| s.border_2().border_color(cx.theme().colors.foreground))
-                                            .on_mouse_down(
-                                                gpui::MouseButton::Left,
-                                                move |_, window, cx| {
-                                                    let view = view.clone();
-                                                    let hex_str = hex_str.clone();
-                                                    window.defer(cx, move |window, cx| {
-                                                        let _ = view.update(cx, |this, cx| {
-                                                            this.drawing_color = hex_str;
-                                                            window.focus(&this.focus_handle);
-                                                            cx.notify();
-                                                        });
-                                                    });
-                                                },
-                                            )
-                                    })),
-                            )
-                    }))
+                                            .w_full()
+                                            .h_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(is_active, |this| {
+                                                this.child(
+                                                    gpui_component::Icon::default()
+                                                        .path("icons/check.svg")
+                                                        .size(px(12.0))
+                                                        .text_color(if hex == "#FFFFFF" {
+                                                            gpui::Hsla::from(gpui::rgba(0x263238ff))
+                                                        } else {
+                                                            gpui::Hsla::from(gpui::rgba(0xffffffff))
+                                                        }),
+                                                )
+                                            }),
+                                    )
+                                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                        let view = view.clone();
+                                        let hex_str = hex_str.clone();
+                                        window.defer(cx, move |window, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                this.drawing_color = hex_str;
+                                                this.color_picker_drag = None;
+                                                window.focus(&this.focus_handle);
+                                                cx.notify();
+                                            });
+                                        });
+                                    })
+                            })),
+                    )
                     .into_any_element()
             });
 

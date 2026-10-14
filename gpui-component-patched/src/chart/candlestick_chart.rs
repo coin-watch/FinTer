@@ -1008,21 +1008,19 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let next_open_for_width = if last_ts_for_width > now_ms_for_width {
-            // Backend data timestamp is ahead of local wall clock! Compute countdown relative to the data's latest candle.
-            last_ts_for_width + interval_ms
+        let next_open_for_width = if interval_ms > 0 && last_ts_for_width > 0 {
+            if now_ms_for_width < last_ts_for_width + interval_ms {
+                last_ts_for_width + interval_ms
+            } else {
+                let elapsed = now_ms_for_width - last_ts_for_width;
+                last_ts_for_width + ((elapsed / interval_ms) + 1) * interval_ms
+            }
         } else if interval_ms > 0 {
             ((now_ms_for_width / interval_ms) + 1) * interval_ms
         } else {
             last_ts_for_width + interval_ms
         };
-        let ref_now = if last_ts_for_width > now_ms_for_width {
-            // Keep countdown running by taking current time modulo interval
-            last_ts_for_width + (now_ms_for_width % interval_ms)
-        } else {
-            now_ms_for_width
-        };
-        let remaining_ms_for_width = (next_open_for_width - ref_now).max(0);
+        let remaining_ms_for_width = (next_open_for_width.saturating_sub(now_ms_for_width)).max(0);
         let countdown_label_for_width: SharedString =
             format_countdown_duration(remaining_ms_for_width / 1000).into();
         let shared_live_badge_w = self
