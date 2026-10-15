@@ -133,35 +133,97 @@ impl PaneNode {
         }
     }
 
-    pub fn swap_data(&mut self, id_a: &str, id_b: &str) -> bool {
-        let mut data_a = None;
-        self.modify_node(id_a, &mut |node| {
-            if let PaneNode::Pane { data, .. } = node {
-                data_a = Some(data.clone());
+    pub fn swap_panes(&mut self, id_a: &str, id_b: &str) -> bool {
+        if id_a == id_b {
+            return false;
+        }
+
+        let mut node_a = None;
+        self.find_node(id_a, &mut |n| {
+            if let PaneNode::Pane { .. } = n {
+                node_a = Some(n.clone());
             }
         });
 
-        let mut data_b = None;
-        self.modify_node(id_b, &mut |node| {
-            if let PaneNode::Pane { data, .. } = node {
-                data_b = Some(data.clone());
+        let mut node_b = None;
+        self.find_node(id_b, &mut |n| {
+            if let PaneNode::Pane { .. } = n {
+                node_b = Some(n.clone());
             }
         });
 
-        if let (Some(a), Some(b)) = (data_a, data_b) {
-            self.modify_node(id_a, &mut |node| {
-                if let PaneNode::Pane { data, .. } = node {
-                    *data = b.clone();
-                }
-            });
-            self.modify_node(id_b, &mut |node| {
-                if let PaneNode::Pane { data, .. } = node {
-                    *data = a.clone();
-                }
-            });
+        if let (Some(a), Some(b)) = (node_a, node_b) {
+            Self::swap_nodes_recursive(self, id_a, id_b, &a, &b);
             true
         } else {
             false
+        }
+    }
+
+    fn swap_nodes_recursive(node: &mut PaneNode, id_a: &str, id_b: &str, node_a: &PaneNode, node_b: &PaneNode) {
+        match node {
+            PaneNode::Pane { id, .. } => {
+                if id == id_a {
+                    *node = node_b.clone();
+                } else if id == id_b {
+                    *node = node_a.clone();
+                }
+            }
+            PaneNode::Split { a, b, .. } => {
+                Self::swap_nodes_recursive(a, id_a, id_b, node_a, node_b);
+                Self::swap_nodes_recursive(b, id_a, id_b, node_a, node_b);
+            }
+        }
+    }
+
+    pub fn swap_data(&mut self, id_a: &str, id_b: &str) -> bool {
+        self.swap_panes(id_a, id_b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::pane_tree::{Axis, ModuleData, PaneNode};
+
+    #[test]
+    fn test_swap_panes() {
+        let mut tree = PaneNode::Split {
+            id: "split-1".to_string(),
+            axis: Axis::Horizontal,
+            ratio: 0.5,
+            a: Box::new(PaneNode::Pane {
+                id: "pane-1".to_string(),
+                data: ModuleData {
+                    module_type: Some("chart".to_string()),
+                    config: serde_json::json!({ "symbol": "BTC/USDT" }),
+                },
+            }),
+            b: Box::new(PaneNode::Pane {
+                id: "pane-2".to_string(),
+                data: ModuleData {
+                    module_type: Some("ticker".to_string()),
+                    config: serde_json::json!({ "symbol": "ETH/USDT" }),
+                },
+            }),
+        };
+
+        assert!(tree.swap_panes("pane-1", "pane-2"));
+
+        if let PaneNode::Split { a, b, .. } = tree {
+            if let PaneNode::Pane { id, data } = *a {
+                assert_eq!(id, "pane-2");
+                assert_eq!(data.module_type.as_deref(), Some("ticker"));
+            } else {
+                panic!("expected pane a");
+            }
+
+            if let PaneNode::Pane { id, data } = *b {
+                assert_eq!(id, "pane-1");
+                assert_eq!(data.module_type.as_deref(), Some("chart"));
+            } else {
+                panic!("expected pane b");
+            }
         }
     }
 }

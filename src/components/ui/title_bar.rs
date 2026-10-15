@@ -84,23 +84,11 @@ impl ParentElement for FinTerTitleBar {
     }
 }
 
-struct TitleBarState {
-    should_move: bool,
-}
-
-impl Render for TitleBarState {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
-}
-
 impl RenderOnce for FinTerTitleBar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let is_client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
-
-        let state = window.use_state(cx, |_, _| TitleBarState { should_move: false });
 
         let title_bar_bg = cx.theme().title_bar;
         let title_bar_border = cx.theme().title_bar_border;
@@ -122,29 +110,6 @@ impl RenderOnce for FinTerTitleBar {
                 })
                 .when(is_macos, |this| {
                     this.on_double_click(|_, window, _| window.titlebar_double_click())
-                })
-                .when(is_linux, |this| {
-                    this.on_mouse_down_out(window.listener_for(&state, |state, _, _, _| {
-                        state.should_move = false;
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        window.listener_for(&state, |state, _, _, _| {
-                            state.should_move = true;
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        window.listener_for(&state, |state, _, _, _| {
-                            state.should_move = false;
-                        }),
-                    )
-                    .on_mouse_move(window.listener_for(&state, |state, _, window, _| {
-                        if state.should_move {
-                            state.should_move = false;
-                            window.start_window_move();
-                        }
-                    }))
                 })
                 .child(
                     h_flex()
@@ -170,9 +135,6 @@ impl RenderOnce for FinTerTitleBar {
                                     .absolute()
                                     .size_full()
                                     .h_full()
-                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        window.start_window_move();
-                                    })
                                     .on_mouse_down(MouseButton::Right, move |ev, window, _| {
                                         window.show_window_menu(ev.position)
                                     }),

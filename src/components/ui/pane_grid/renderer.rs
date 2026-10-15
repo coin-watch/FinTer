@@ -2,6 +2,7 @@ use crate::data::pane_tree::{Axis, PaneNode};
 use gpui::InteractiveElement;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui::StyledImage;
 use gpui_component::{Selectable, Sizable};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::button::{Button, ButtonVariants};
@@ -263,6 +264,203 @@ fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
     }
 }
 
+fn canonical_exchange(exchange: &str) -> String {
+    let ex = exchange.to_lowercase();
+    if ex.contains("binance") {
+        "binance".to_string()
+    } else if ex.contains("huobi") || ex.contains("htx") {
+        "htx".to_string()
+    } else if ex.contains("okx") {
+        "okx".to_string()
+    } else if ex.contains("bybit") {
+        "bybit".to_string()
+    } else if ex.contains("kraken") {
+        "kraken".to_string()
+    } else if ex.contains("coinbase") {
+        "coinbase".to_string()
+    } else if ex.contains("kucoin") {
+        "kucoin".to_string()
+    } else if ex.contains("gateio") || ex.contains("gate") {
+        "gateio".to_string()
+    } else {
+        ex
+    }
+}
+
+fn exchange_icon_url(exchange: &str) -> String {
+    let canonical = canonical_exchange(exchange);
+    format!("https://raw.githubusercontent.com/0xa3k5/web3icons/main/packages/core/src/svgs/exchanges/background/{canonical}.svg")
+}
+
+fn parse_symbol_parts(symbol: &str) -> (String, Option<String>) {
+    let cleaned = symbol.split(':').next().unwrap_or(symbol);
+    let parts: Vec<&str> = cleaned.split(|c| c == '/' || c == '_' || c == '-').collect();
+    if parts.len() >= 2 {
+        (parts[0].to_lowercase(), Some(parts[1].to_lowercase()))
+    } else {
+        (cleaned.to_lowercase(), None)
+    }
+}
+
+fn crypto_icon_url(asset: &str) -> String {
+    format!(
+        "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/svg/color/{}.svg",
+        asset.to_lowercase()
+    )
+}
+
+fn exchange_badge_color(exchange: &str) -> gpui::Hsla {
+    match exchange.to_lowercase().as_str() {
+        "binance" => gpui::Hsla::from(gpui::rgba(0xf3ba2fff)),
+        "bybit" => gpui::Hsla::from(gpui::rgba(0xf7a600ff)),
+        "okx" => gpui::Hsla::from(gpui::rgba(0x2d60ffff)),
+        "kraken" => gpui::Hsla::from(gpui::rgba(0x5741d9ff)),
+        "coinbase" => gpui::Hsla::from(gpui::rgba(0x0052ffff)),
+        "kucoin" => gpui::Hsla::from(gpui::rgba(0x24ae8fff)),
+        "gateio" | "gate" => gpui::Hsla::from(gpui::rgba(0x2354e6ff)),
+        _ => gpui::Hsla::from(gpui::rgba(0x888888ff)),
+    }
+}
+
+fn asset_badge_color(asset: &str) -> gpui::Hsla {
+    match asset.to_uppercase().as_str() {
+        "BTC" => gpui::Hsla::from(gpui::rgba(0xf7931aff)),
+        "ETH" => gpui::Hsla::from(gpui::rgba(0x627eeaff)),
+        "SOL" => gpui::Hsla::from(gpui::rgba(0x14f195ff)),
+        "BNB" => gpui::Hsla::from(gpui::rgba(0xf3ba2fff)),
+        "XRP" => gpui::Hsla::from(gpui::rgba(0x23292fff)),
+        "DOGE" => gpui::Hsla::from(gpui::rgba(0xc2a633ff)),
+        "ADA" => gpui::Hsla::from(gpui::rgba(0x0033adff)),
+        "AVAX" => gpui::Hsla::from(gpui::rgba(0xe84142ff)),
+        "DOT" => gpui::Hsla::from(gpui::rgba(0xe6007aff)),
+        "LINK" => gpui::Hsla::from(gpui::rgba(0x375bd2ff)),
+        "MATIC" | "POL" => gpui::Hsla::from(gpui::rgba(0x8247e5ff)),
+        "NEAR" => gpui::Hsla::from(gpui::rgba(0x000000ff)),
+        "SUI" => gpui::Hsla::from(gpui::rgba(0x4ca2ffff)),
+        "APT" => gpui::Hsla::from(gpui::rgba(0x2ed8a7ff)),
+        _ => gpui::Hsla::from(gpui::rgba(0x6366f1ff)),
+    }
+}
+
+pub(crate) fn render_coinwatch_icons(pane_id: &str, exchange: &str, symbol: &str) -> impl IntoElement {
+    let ex_url = exchange_icon_url(exchange);
+    let ex_color = exchange_badge_color(exchange);
+    let ex_initial = exchange.chars().next().unwrap_or('E').to_uppercase().to_string();
+
+    let (base, quote_opt) = parse_symbol_parts(symbol);
+    let base_url = crypto_icon_url(&base);
+    let base_color = asset_badge_color(&base);
+    let base_initial = base.chars().next().unwrap_or('•').to_uppercase().to_string();
+
+    let make_badge = |bg: gpui::Hsla, text: String| {
+        div()
+            .size_full()
+            .rounded_full()
+            .bg(bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(10.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(gpui::white())
+            .child(text)
+            .into_any_element()
+    };
+
+    let ex_id = ElementId::Name(format!("ex-icon-{pane_id}").into());
+    let ex_fallback_color = ex_color;
+    let ex_fallback_text = ex_initial.clone();
+    let ex_loading_color = ex_color;
+    let ex_loading_text = ex_initial;
+
+    let ex_disc = div()
+        .absolute()
+        .top_0()
+        .left(px(0.0))
+        .w(px(20.0))
+        .h(px(20.0))
+        .rounded_full()
+        .overflow_hidden()
+        .shadow_xs()
+        .child(
+            img(ex_url)
+                .id(ex_id)
+                .size_full()
+                .rounded_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .with_loading(move || make_badge(ex_loading_color, ex_loading_text.clone()))
+                .with_fallback(move || make_badge(ex_fallback_color, ex_fallback_text.clone())),
+        );
+
+    let base_id = ElementId::Name(format!("base-icon-{pane_id}").into());
+    let base_fallback_color = base_color;
+    let base_fallback_text = base_initial.clone();
+    let base_loading_color = base_color;
+    let base_loading_text = base_initial;
+
+    let base_disc = div()
+        .absolute()
+        .top_0()
+        .left(px(12.0))
+        .w(px(20.0))
+        .h(px(20.0))
+        .rounded_full()
+        .overflow_hidden()
+        .shadow_xs()
+        .child(
+            img(base_url)
+                .id(base_id)
+                .size_full()
+                .rounded_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .with_loading(move || make_badge(base_loading_color, base_loading_text.clone()))
+                .with_fallback(move || make_badge(base_fallback_color, base_fallback_text.clone())),
+        );
+
+    let has_quote = quote_opt.is_some();
+    let quote_disc = quote_opt.map(|quote| {
+        let quote_url = crypto_icon_url(&quote);
+        let quote_color = asset_badge_color(&quote);
+        let quote_initial = quote.chars().next().unwrap_or('•').to_uppercase().to_string();
+
+        let quote_id = ElementId::Name(format!("quote-icon-{pane_id}").into());
+        let quote_fallback_color = quote_color;
+        let quote_fallback_text = quote_initial.clone();
+        let quote_loading_color = quote_color;
+        let quote_loading_text = quote_initial;
+
+        div()
+            .absolute()
+            .top_0()
+            .left(px(24.0))
+            .w(px(20.0))
+            .h(px(20.0))
+            .rounded_full()
+            .overflow_hidden()
+            .shadow_xs()
+            .child(
+                img(quote_url)
+                    .id(quote_id)
+                    .size_full()
+                    .rounded_full()
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .with_loading(move || make_badge(quote_loading_color, quote_loading_text.clone()))
+                    .with_fallback(move || make_badge(quote_fallback_color, quote_fallback_text.clone())),
+            )
+    });
+
+    let cluster_width = if has_quote { px(44.0) } else { px(32.0) };
+
+    div()
+        .w(cluster_width)
+        .h(px(20.0))
+        .flex_shrink_0()
+        .relative()
+        .child(ex_disc)
+        .child(base_disc)
+        .children(quote_disc)
+}
+
 
 use std::sync::mpsc::{Sender, Receiver};
 
@@ -397,6 +595,16 @@ impl PaneGridRenderer {
                     theme.colors.muted_foreground
                 };
 
+                let is_market_module = matches!(
+                    module_type.to_lowercase().as_str(),
+                    "chart" | "ticker" | "orderbook" | "depth"
+                );
+                let suffix = match module_type.to_lowercase().as_str() {
+                    "orderbook" => Some("OB"),
+                    "depth" => Some("DEPTH"),
+                    _ => None,
+                };
+
                 div()
                     .id(ElementId::Name(format!("pane-wrapper-{pane_id}").into()))
                     .size_full()
@@ -437,13 +645,27 @@ impl PaneGridRenderer {
                         div()
                             .id(ElementId::Name(format!("titlebar-{pane_id}").into()))
                             .w_full()
-                            .h(px(32.0))
+                            .h(px(33.0))
                             .px(px(8.0))
                             .flex()
                             .items_center()
                             .justify_between()
                             .bg(title_bg)
                             .text_color(title_fg)
+                            .border_b_1()
+                            .border_color(theme.colors.border)
+                            .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x4ade8055)))
+                            .on_drop({
+                                let target_id = pane_id.clone();
+                                cx.listener(move |_this, drag_pane: &DragPane, _window, cx| {
+                                    if drag_pane.0 != target_id {
+                                        cx.emit(PaneGridEvent::SwapPanes {
+                                            id_a: drag_pane.0.clone(),
+                                            id_b: target_id.clone(),
+                                        });
+                                    }
+                                })
+                            })
                             .on_drag(
                                 DragPane(pane_id.clone()),
                                 {
@@ -461,14 +683,22 @@ impl PaneGridRenderer {
                                     let h = current_size.height;
                                     let dragged_pane_ref = self.dragged_pane.clone();
                                     let pane_id_clone = pane_id.clone();
+                                    let ex_clone = current_exchange.clone();
+                                    let sym_clone = current_symbol.clone();
+                                    let tf_clone = chart_timeframe.clone();
+                                    let tz_clone = current_timezone.clone();
                                     move |_drag_pane, _offset, window, app| {
                                         *dragged_pane_ref.borrow_mut() = Some(pane_id_clone.clone());
                                         window.refresh();
-                                        
+
                                         let drop_ref = dragged_pane_ref.clone();
                                         let content_clone = drag_content.clone();
                                         app.new(|_cx| DragView {
                                             module_type: mod_type.clone(),
+                                            exchange: ex_clone.clone(),
+                                            symbol: sym_clone.clone(),
+                                            timeframe: tf_clone.clone(),
+                                            timezone: tz_clone.clone(),
                                             content: content_clone,
                                             width: w,
                                             height: h,
@@ -481,28 +711,61 @@ impl PaneGridRenderer {
                             )
                             .child(
                                 gpui_component::h_flex()
-                                    .w_full()
+                                    .flex_1()
                                     .min_w_0()
-                                    .gap(px(4.0))
+                                    .gap(px(6.0))
                                     .items_center()
                                     .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_shrink_0()
-                                            .text_sm()
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(
-                                            if is_empty {
-                                                "Select Module".to_string()
-                                            } else if module_type.to_lowercase() == "time" || module_type.to_lowercase() == "clock" {
-                                                current_timezone.replace('/', ", ").replace('_', " ")
-                                            } else {
-                                                module_type.to_string()
-                                            },
-                                        ),
-                                    )
+                                    .when(is_market_module, |this| {
+                                        this.child(render_coinwatch_icons(&pane_id, &current_exchange, &current_symbol))
+                                            .when_some(suffix, |this, s| {
+                                                this.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .px(px(4.0))
+                                                        .py(px(1.0))
+                                                        .rounded(px(3.0))
+                                                        .bg(theme.colors.muted.opacity(0.5))
+                                                        .border_1()
+                                                        .border_color(theme.colors.border.opacity(0.4))
+                                                        .text_size(px(10.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(title_fg.opacity(0.85))
+                                                        .child(s),
+                                                )
+                                            })
+                                    })
+                                    .when(!is_market_module, |this| {
+                                        this.child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(
+                                                    if is_empty {
+                                                        "Select Module".to_string()
+                                                    } else if module_type.to_lowercase() == "time" || module_type.to_lowercase() == "clock" {
+                                                        current_timezone.replace('/', ", ").replace('_', " ")
+                                                    } else if module_type.to_lowercase() == "marketcap" {
+                                                        "Market Cap".to_string()
+                                                    } else if module_type.to_lowercase() == "feargreed" {
+                                                        "Fear & Greed Index".to_string()
+                                                    } else {
+                                                        module_type.to_string()
+                                                    },
+                                                ),
+                                        )
+                                    })
                                     .when(module_type.to_lowercase() == "chart", |this| {
+                                        let this = this.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .w(px(1.0))
+                                                .h(px(14.0))
+                                                .bg(theme.colors.border.opacity(0.6))
+                                                .mx(px(2.0)),
+                                        );
                                         let common_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"];
                                         let extra_timeframes = [
                                             "1s", "3m", "30m", "2h", "6h", "8h", "12h", "1w", "1M",
@@ -576,9 +839,7 @@ impl PaneGridRenderer {
                                         let current_timeframe = current_timeframe.clone();
                                         this.child(
                                             div()
-                                                .min_w_0()
                                                 .flex_shrink_0()
-                                                .overflow_x_scrollbar()
                                                 .child(controls.child(
                                                 Button::new(ElementId::Name(
                                                     format!("timeframe-more-{pane_id}").into(),
@@ -1237,20 +1498,27 @@ impl PaneGridRenderer {
                                 let t3 = pane_id.clone();
                                 let t4 = pane_id.clone();
                                 this
+                                    .occlude()
                                 // Center (Swap)
                                 .child(
                                     div()
                                         .absolute()
-                                        .inset(relative(0.2))
+                                        .top(relative(0.2))
+                                        .left(relative(0.2))
+                                        .w(relative(0.6))
+                                        .h(relative(0.6))
                                         .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x4ade8033))) // Green highlight
-                                        .on_drop(cx.listener(
+                                                .on_drop(cx.listener(
                                             move |_this, drag_pane: &DragPane, _window, cx| {
-                                                cx.emit(PaneGridEvent::SwapPanes {
-                                                    id_a: drag_pane.0.clone(),
-                                                    id_b: c_id.clone(),
-                                                });
+                                                if drag_pane.0 != c_id {
+                                                    cx.emit(PaneGridEvent::SwapPanes {
+                                                        id_a: drag_pane.0.clone(),
+                                                        id_b: c_id.clone(),
+                                                    });
+                                                }
                                             },
-                                        )),
+                                        ))
+                                        .occlude(),
                                 )
                                 // Top
                                 .child(
@@ -1263,11 +1531,13 @@ impl PaneGridRenderer {
                                         .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x3b82f633))) // Blue highlight
                                         .on_drop(cx.listener(
                                             move |_this, drag_pane: &DragPane, _window, cx| {
-                                                cx.emit(PaneGridEvent::DropSplit {
-                                                    target_pane_id: t1.clone(),
-                                                    dragged_pane_id: drag_pane.0.clone(),
-                                                    region: "top".to_string(),
-                                                });
+                                                if drag_pane.0 != t1 {
+                                                    cx.emit(PaneGridEvent::DropSplit {
+                                                        target_pane_id: t1.clone(),
+                                                        dragged_pane_id: drag_pane.0.clone(),
+                                                        region: "top".to_string(),
+                                                    });
+                                                }
                                             },
                                         )),
                                 )
@@ -1282,11 +1552,13 @@ impl PaneGridRenderer {
                                         .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x3b82f633)))
                                         .on_drop(cx.listener(
                                             move |_this, drag_pane: &DragPane, _window, cx| {
-                                                cx.emit(PaneGridEvent::DropSplit {
-                                                    target_pane_id: t2.clone(),
-                                                    dragged_pane_id: drag_pane.0.clone(),
-                                                    region: "bottom".to_string(),
-                                                });
+                                                if drag_pane.0 != t2 {
+                                                    cx.emit(PaneGridEvent::DropSplit {
+                                                        target_pane_id: t2.clone(),
+                                                        dragged_pane_id: drag_pane.0.clone(),
+                                                        region: "bottom".to_string(),
+                                                    });
+                                                }
                                             },
                                         )),
                                 )
@@ -1295,17 +1567,19 @@ impl PaneGridRenderer {
                                     div()
                                         .absolute()
                                         .top(relative(0.2))
-                                        .bottom(relative(0.2))
                                         .left_0()
                                         .w(relative(0.2))
+                                        .h(relative(0.6))
                                         .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x3b82f633)))
                                         .on_drop(cx.listener(
                                             move |_this, drag_pane: &DragPane, _window, cx| {
-                                                cx.emit(PaneGridEvent::DropSplit {
-                                                    target_pane_id: t3.clone(),
-                                                    dragged_pane_id: drag_pane.0.clone(),
-                                                    region: "left".to_string(),
-                                                });
+                                                if drag_pane.0 != t3 {
+                                                    cx.emit(PaneGridEvent::DropSplit {
+                                                        target_pane_id: t3.clone(),
+                                                        dragged_pane_id: drag_pane.0.clone(),
+                                                        region: "left".to_string(),
+                                                    });
+                                                }
                                             },
                                         )),
                                 )
@@ -1314,17 +1588,19 @@ impl PaneGridRenderer {
                                     div()
                                         .absolute()
                                         .top(relative(0.2))
-                                        .bottom(relative(0.2))
                                         .right_0()
                                         .w(relative(0.2))
+                                        .h(relative(0.6))
                                         .drag_over::<DragPane>(|style, _drag, _win, _cx| style.bg(gpui::rgba(0x3b82f633)))
                                         .on_drop(cx.listener(
                                             move |_this, drag_pane: &DragPane, _window, cx| {
-                                                cx.emit(PaneGridEvent::DropSplit {
-                                                    target_pane_id: t4.clone(),
-                                                    dragged_pane_id: drag_pane.0.clone(),
-                                                    region: "right".to_string(),
-                                                });
+                                                if drag_pane.0 != t4 {
+                                                    cx.emit(PaneGridEvent::DropSplit {
+                                                        target_pane_id: t4.clone(),
+                                                        dragged_pane_id: drag_pane.0.clone(),
+                                                        region: "right".to_string(),
+                                                    });
+                                                }
                                             },
                                         )),
                                 )

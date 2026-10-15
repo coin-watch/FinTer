@@ -2438,7 +2438,7 @@ impl ChartPanel {
                                             this.color_picker_square_bounds = bounds;
                                         });
                                     },
-                                    move |bounds, _, window, cx| {
+                                    move |bounds, _, window, _cx| {
                                         const COLUMNS: usize = 34;
                                         const ROWS: usize = 26;
                                         for row in 0..ROWS {
@@ -2532,7 +2532,7 @@ impl ChartPanel {
                                             this.color_picker_hue_bounds = bounds;
                                         });
                                     },
-                                    move |bounds, _, window, cx| {
+                                    move |bounds, _, window, _cx| {
                                         const STEPS: usize = 36;
                                         for step in 0..STEPS {
                                             let hue = step as f32 / STEPS as f32;
