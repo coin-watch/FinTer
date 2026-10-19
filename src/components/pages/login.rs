@@ -740,7 +740,7 @@ impl Render for LoginPage {
 mod tests {
     use super::*;
 
-    #[test]
+    #[core::prelude::v1::test]
     fn test_auth_event_variants() {
         let logged_in = AuthEvent::LoggedIn;
         let signed_up = AuthEvent::SignedUp;

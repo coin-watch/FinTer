@@ -306,27 +306,56 @@ struct SubscribeMsg<'a> {
 }
 
 /// Top-level envelope for every message from the gateway.
-#[derive(serde::Deserialize, Debug)]
+#[derive(Debug)]
 struct GatewayMessage {
     /// Set on subscription ack: `"info"` / `"data"`.
-    #[serde(default)]
-    #[serde(rename = "type")]
     msg_type: Option<String>,
     /// Set on data pushes: `"trades"` / `"orderbook"` / `"kline"` / `"ticker"`.
-    #[serde(default)]
     channel: Option<String>,
-    #[serde(default)]
     exchange: Option<String>,
-    #[serde(default)]
     symbol: Option<String>,
-    #[serde(default)]
     timeframe: Option<String>,
     /// Payload — shape depends on `channel`.
-    #[serde(default, alias = "payload")]
     data: Option<serde_json::Value>,
     /// Server-side error string or info message.
-    #[serde(default)]
     message: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for GatewayMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut msg = GatewayMessage {
+            msg_type: None,
+            channel: None,
+            exchange: None,
+            symbol: None,
+            timeframe: None,
+            data: None,
+            message: None,
+        };
+
+        if let serde_json::Value::Object(map) = value {
+            msg.msg_type = map.get("type").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.channel = map.get("channel").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.exchange = map.get("exchange").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.symbol = map.get("symbol").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.timeframe = map.get("timeframe").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.message = map.get("message").and_then(|v| v.as_str()).map(ToString::to_string);
+
+            // Accept "data" or "payload". If both exist, take whichever is non-null (preferring "data").
+            msg.data = match (map.get("data"), map.get("payload")) {
+                (Some(d), _) if !d.is_null() => Some(d.clone()),
+                (_, Some(p)) if !p.is_null() => Some(p.clone()),
+                (Some(d), _) => Some(d.clone()),
+                _ => None,
+            };
+        }
+
+        Ok(msg)
+    }
 }
 
 /// A single trade entry in a `trades` data push.
@@ -527,17 +556,34 @@ fn handle_message(
 
     match msg.channel.as_deref() {
         Some("ticker") => {
-            if let Some(price) = data.get("c").or_else(|| data.get("last")).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))) {
+            let price_opt = data
+                .get("last")
+                .or_else(|| data.get("close"))
+                .or_else(|| data.get("c"))
+                .or_else(|| data.get("price"))
+                .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
+            if let Some(price) = price_opt {
+                let ts = data
+                    .get("timestamp")
+                    .or_else(|| data.get("t"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or_else(|| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0)
+                    });
+                // Note: ticker push carries 24-hour cumulative market volume,
+                // not an individual trade amount or candle volume.
+                // UnifiedTick.amount represents individual traded amount, so set 0.0 here.
                 let tick = UnifiedTick::new(
                     msg.exchange.as_deref().unwrap_or(&config.exchange),
                     msg.symbol.as_deref().unwrap_or(&config.symbol),
                     price,
                     0.0,
                     TradeSide::Unknown,
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
+                    ts,
                 );
                 let _ = tick_tx.send(Arc::new(tick));
             }
@@ -630,36 +676,39 @@ fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
     }
 
     if let Some(arr) = val.as_array() {
-        if arr.len() >= 6 {
+        if arr.len() >= 5 {
             let t = arr[0].as_i64().or_else(|| arr[0].as_str().and_then(|s| s.parse().ok()))?;
             let o = arr[1].as_f64().or_else(|| arr[1].as_str().and_then(|s| s.parse().ok()))?;
             let h = arr[2].as_f64().or_else(|| arr[2].as_str().and_then(|s| s.parse().ok()))?;
             let l = arr[3].as_f64().or_else(|| arr[3].as_str().and_then(|s| s.parse().ok()))?;
             let c = arr[4].as_f64().or_else(|| arr[4].as_str().and_then(|s| s.parse().ok()))?;
-            let v = arr[5].as_f64().or_else(|| arr[5].as_str().and_then(|s| s.parse().ok()))?;
+            let v = arr.get(5).and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
             let timestamp = if t > 0 && t < 10_000_000_000 { t * 1000 } else { t };
             return Some(OhlcvCandle { timestamp, open: o, high: h, low: l, close: c, volume: v });
         }
     }
 
     if let Some(obj) = val.as_object() {
-        if let (Some(t_val), Some(o_val), Some(h_val), Some(l_val), Some(c_val), Some(v_val)) = (
-            obj.get("t").or_else(|| obj.get("timestamp")),
-            obj.get("o").or_else(|| obj.get("open")),
-            obj.get("h").or_else(|| obj.get("high")),
-            obj.get("l").or_else(|| obj.get("low")),
-            obj.get("c").or_else(|| obj.get("close")),
-            obj.get("v").or_else(|| obj.get("volume")),
-        ) {
-            let t = t_val.as_i64().or_else(|| t_val.as_str().and_then(|s| s.parse().ok()))?;
-            let o = o_val.as_f64().or_else(|| o_val.as_str().and_then(|s| s.parse().ok()))?;
-            let h = h_val.as_f64().or_else(|| h_val.as_str().and_then(|s| s.parse().ok()))?;
-            let l = l_val.as_f64().or_else(|| l_val.as_str().and_then(|s| s.parse().ok()))?;
-            let c = c_val.as_f64().or_else(|| c_val.as_str().and_then(|s| s.parse().ok()))?;
-            let v = v_val.as_f64().or_else(|| v_val.as_str().and_then(|s| s.parse().ok()))?;
-            let timestamp = if t > 0 && t < 10_000_000_000 { t * 1000 } else { t };
-            return Some(OhlcvCandle { timestamp, open: o, high: h, low: l, close: c, volume: v });
-        }
+        let t_val = obj.get("t")
+            .or_else(|| obj.get("timestamp"))
+            .or_else(|| obj.get("time"))?;
+        let o_val = obj.get("o").or_else(|| obj.get("open"))?;
+        let h_val = obj.get("h").or_else(|| obj.get("high"))?;
+        let l_val = obj.get("l").or_else(|| obj.get("low"))?;
+        let c_val = obj.get("c").or_else(|| obj.get("close"))?;
+
+        let t = t_val.as_i64().or_else(|| t_val.as_str().and_then(|s| s.parse().ok()))?;
+        let o = o_val.as_f64().or_else(|| o_val.as_str().and_then(|s| s.parse().ok()))?;
+        let h = h_val.as_f64().or_else(|| h_val.as_str().and_then(|s| s.parse().ok()))?;
+        let l = l_val.as_f64().or_else(|| l_val.as_str().and_then(|s| s.parse().ok()))?;
+        let c = c_val.as_f64().or_else(|| c_val.as_str().and_then(|s| s.parse().ok()))?;
+        let v = obj.get("v")
+            .or_else(|| obj.get("volume"))
+            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0);
+
+        let timestamp = if t > 0 && t < 10_000_000_000 { t * 1000 } else { t };
+        return Some(OhlcvCandle { timestamp, open: o, high: h, low: l, close: c, volume: v });
     }
 
     None
@@ -674,20 +723,31 @@ fn parse_kline_payload(data: &serde_json::Value) -> Vec<OhlcvCandle> {
                 out.push(candle);
             }
         }
-        return out;
+        if !out.is_empty() {
+            return out;
+        }
+    }
+
+    if let Some(k) = data.get("k").or_else(|| data.get("kline")) {
+        if let Some(candle) = parse_single_candle(k) {
+            out.push(candle);
+            return out;
+        }
     }
 
     if let Some(arr) = data.as_array() {
-        if !arr.is_empty() && arr[0].is_array() {
-            for item in arr {
-                if let Some(candle) = parse_single_candle(item) {
-                    out.push(candle);
-                }
+        for item in arr {
+            if let Some(candle) = parse_single_candle(item) {
+                out.push(candle);
             }
-        } else if let Some(candle) = parse_single_candle(data) {
-            out.push(candle);
         }
-        return out;
+        if !out.is_empty() {
+            return out;
+        }
+        if let Some(candle) = parse_single_candle(data) {
+            out.push(candle);
+            return out;
+        }
     }
 
     if let Some(candle) = parse_single_candle(data) {
@@ -871,5 +931,30 @@ mod tests {
         .expect("parse");
         assert_eq!(msg.msg_type.as_deref(), Some("error"));
         assert_eq!(msg.message.as_deref(), Some("Unsupported exchange"));
+    }
+
+    #[test]
+    fn gateway_message_with_duplicate_data_field_parses() {
+        // Test handling of duplicate "data" field or both "data" and "payload"
+        let json = r#"{
+            "type":"data","exchange":"binance","symbol":"BTC-USDT","channel":"ticker",
+            "data":{"symbol":"BTC-USDT","timestamp":1792380983006,"datetime":"2026-10-19T03:36:23.006Z","open":81844.39,"high":82817.1,"low":81000.0,"close":82500.0,"last":82500.0},
+            "data":{"symbol":"BTC-USDT","last":82500.0}
+        }"#;
+        let msg: GatewayMessage = serde_json::from_str(json).expect("parse with duplicate data field");
+        assert_eq!(msg.channel.as_deref(), Some("ticker"));
+        assert!(msg.data.is_some());
+    }
+
+    #[test]
+    fn gateway_message_with_both_data_and_payload_parses() {
+        let json = r#"{
+            "type":"data","exchange":"binance","symbol":"BTC-USDT","channel":"ticker",
+            "payload":{"symbol":"BTC-USDT","last":82500.0},
+            "data":{"symbol":"BTC-USDT","timestamp":1792380983006,"last":82500.0}
+        }"#;
+        let msg: GatewayMessage = serde_json::from_str(json).expect("parse with both data and payload");
+        assert_eq!(msg.channel.as_deref(), Some("ticker"));
+        assert!(msg.data.is_some());
     }
 }

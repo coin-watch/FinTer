@@ -784,16 +784,21 @@ impl Render for ChartPanel {
 
         let mut candles: Vec<OhlcvCandle> = candles_snap
             .into_iter()
-            .filter(|c| {
-                c.timestamp > 0
-                    && c.open.is_finite()
-                    && c.high.is_finite()
-                    && c.low.is_finite()
-                    && c.close.is_finite()
-                    && c.volume.is_finite()
-                    && c.high >= c.low
-                    && c.high >= c.open.max(c.close)
-                    && c.low <= c.open.min(c.close)
+            .filter_map(|mut c| {
+                if c.timestamp <= 0
+                    || !c.open.is_finite()
+                    || !c.high.is_finite()
+                    || !c.low.is_finite()
+                    || !c.close.is_finite()
+                {
+                    return None;
+                }
+                c.high = c.high.max(c.open).max(c.close);
+                c.low = c.low.min(c.open).min(c.close);
+                if !c.volume.is_finite() {
+                    c.volume = 0.0;
+                }
+                Some(c)
             })
             .collect();
 
