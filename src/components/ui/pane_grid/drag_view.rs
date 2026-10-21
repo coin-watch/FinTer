@@ -8,6 +8,12 @@ pub enum DragContent {
     Chart(Entity<crate::components::ui::chart_panel::ChartPanel>),
     Ticker(Entity<crate::components::ui::ticker_panel::TickerPanel>),
     Orderbook(Entity<crate::components::ui::orderbook_panel::OrderBookPanel>),
+    Depth(Entity<crate::components::ui::depth_panel::DepthPanel>),
+    Tape(Entity<crate::components::ui::tape_panel::TapePanel>),
+    Execution(Entity<crate::components::ui::execution_panel::ExecutionPanel>),
+    Positions(Entity<crate::components::ui::positions_panel::PositionsPanel>),
+    Watchlist(Entity<crate::components::ui::watchlist_panel::WatchlistPanel>),
+    MarketCap(Entity<crate::components::ui::market_cap_panel::MarketCapPanel>),
     Newsfeed(Entity<crate::components::ui::newsfeed_panel::NewsfeedPanel>),
     Clock(Entity<crate::components::ui::clock_panel::ClockPanel>),
     FearGreed(Entity<crate::components::ui::fear_greed_panel::FearGreedPanel>),
@@ -20,6 +26,12 @@ impl DragContent {
             Self::Chart(entity) => entity.clone().into_any_element(),
             Self::Ticker(entity) => entity.clone().into_any_element(),
             Self::Orderbook(entity) => entity.clone().into_any_element(),
+            Self::Depth(entity) => entity.clone().into_any_element(),
+            Self::Tape(entity) => entity.clone().into_any_element(),
+            Self::Execution(entity) => entity.clone().into_any_element(),
+            Self::Positions(entity) => entity.clone().into_any_element(),
+            Self::Watchlist(entity) => entity.clone().into_any_element(),
+            Self::MarketCap(entity) => entity.clone().into_any_element(),
             Self::Newsfeed(entity) => entity.clone().into_any_element(),
             Self::Clock(entity) => entity.clone().into_any_element(),
             Self::FearGreed(entity) => entity.clone().into_any_element(),
@@ -57,11 +69,13 @@ impl Render for DragView {
         let theme = cx.theme();
         let is_market_module = matches!(
             self.module_type.to_lowercase().as_str(),
-            "chart" | "ticker" | "orderbook" | "depth"
+            "chart" | "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk"
         );
         let suffix = match self.module_type.to_lowercase().as_str() {
             "orderbook" => Some("OB"),
             "depth" => Some("DEPTH"),
+            "trades" | "tape" => Some("TRADES"),
+            "execution" | "tradedesk" => Some("DESK"),
             _ => None,
         };
 
@@ -154,8 +168,14 @@ impl Render for DragView {
                                                         self.timezone.replace('/', ", ").replace('_', " ")
                                                     } else if self.module_type.to_lowercase() == "marketcap" {
                                                         "Market Cap".to_string()
+                                                    } else if self.module_type.to_lowercase() == "watchlist" {
+                                                        "Watchlist".to_string()
                                                     } else if self.module_type.to_lowercase() == "feargreed" {
                                                         "Fear & Greed Index".to_string()
+                                                    } else if self.module_type.to_lowercase() == "execution" || self.module_type.to_lowercase() == "tradedesk" {
+                                                        "Trade Desk · Read Only".to_string()
+                                                    } else if self.module_type.to_lowercase() == "positions" {
+                                                        "Positions".to_string()
                                                     } else {
                                                         self.module_type.clone()
                                                     },

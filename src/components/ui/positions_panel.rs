@@ -100,6 +100,8 @@ pub struct PositionsPanel {
     /// Display title.
     title: String,
     focus_handle: FocusHandle,
+    width: f32,
+    height: f32,
 }
 
 impl PositionsPanel {
@@ -108,7 +110,18 @@ impl PositionsPanel {
             positions,
             title: title.into(),
             focus_handle: cx.focus_handle(),
+            width: 0.0,
+            height: 0.0,
         }
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
     /// Format a price for display.
@@ -373,7 +386,9 @@ impl PositionsPanel {
             .justify_center()
             .text_sm()
             .text_color(colors.muted_foreground)
-            .child("No open positions")
+            .p_4()
+            .text_center()
+            .child("Account positions unavailable · No account position API is connected.")
     }
 }
 

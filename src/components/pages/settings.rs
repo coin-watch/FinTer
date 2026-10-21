@@ -246,7 +246,6 @@ impl SettingsPage {
             .page(self.build_alerts_page(settings.clone(), on_change.clone()))
             .page(self.build_performance_page(settings.clone(), on_change.clone()))
             .page(self.build_layout_page(settings.clone(), on_change.clone()))
-            .page(self.build_chart_page(settings.clone(), on_change.clone()))
             .page(self.build_updates_page(settings.clone(), on_change.clone()))
     }
 
@@ -701,66 +700,6 @@ impl SettingsPage {
             )
     }
 
-    fn build_chart_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
-        let settings_clone = settings.clone();
-
-        SettingPage::new("Chart & Drawing")
-            .description("Configure chart display and drawing tools")
-            .group(
-                SettingGroup::new()
-                    .title("Chart Display")
-                    .item(
-                        SettingItem::new(
-                            "Show Grid",
-                            SettingField::switch(
-                                {
-                                    let settings = settings.clone();
-                                    move |cx| settings.read(cx).enable_chart_grid
-                                },
-                                {
-                                    let settings = settings.clone();
-                                    let on_change = on_change.clone();
-                                    move |value, cx| {
-                                        settings.update(cx, |s, _| s.enable_chart_grid = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
-                                    }
-                                },
-                            )
-                            .default_value(true),
-                        )
-                        .description("Display grid lines on charts"),
-                    )
-                    .item(
-                        SettingItem::new(
-                            "Magnet Snap",
-                            SettingField::switch(
-                                {
-                                    let settings = settings_clone.clone();
-                                    move |cx| settings.read(cx).enable_magnet_snap
-                                },
-                                {
-                                    let settings = settings_clone.clone();
-                                    let on_change = on_change.clone();
-                                    move |value, cx| {
-                                        settings.update(cx, |s, _| s.enable_magnet_snap = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
-                                    }
-                                },
-                            )
-                            .default_value(true),
-                        )
-                        .description("Snap drawing tools to candle OHLC values"),
-                    ),
-            )
-    }
     fn build_updates_page(
         &self,
         settings: Entity<AppSettings>,

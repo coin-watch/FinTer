@@ -25,11 +25,6 @@ impl HomePage {
             cx.set_global(crate::components::ui::pane_grid::renderer::PendingGridEvents::default());
         }
         
-        let view = cx.weak_entity();
-        cx.set_global(GlobalHomeView { view });
-        
-
-        
         let pane_grid = cx.new(|_cx| PaneGridRenderer::new());
         let subscription = cx.subscribe(
             &pane_grid,
@@ -248,8 +243,11 @@ impl HomePage {
 
     pub fn apply_settings(&mut self, settings: SettingsData, cx: &mut Context<Self>) {
         let timezone = settings.timezone.unwrap_or_else(|| "UTC".into());
+        let sound_alerts = settings.alert_sound_enabled.unwrap_or(true);
+        crate::data::terminal_audio::TerminalAudio::set_global_enabled(sound_alerts);
         self.pane_grid.update(cx, |grid, cx| {
             grid.timezone = timezone.clone();
+            grid.sound_alerts_enabled = sound_alerts;
             for state in grid.chart_views.borrow().values() {
                 let timezone = timezone.clone();
                 state.entity.update(cx, |chart, _| chart.set_timezone(timezone));
@@ -262,6 +260,9 @@ impl HomePage {
                 let timezone = timezone.clone();
                 state.entity.update(cx, |panel, _| panel.set_timezone(timezone));
             }
+            for state in grid.tape_views.borrow().values() {
+                state.entity.update(cx, |tape, _| tape.set_global_sound_enabled(sound_alerts));
+            }
             cx.notify();
         });
     }
@@ -269,11 +270,19 @@ impl HomePage {
 
 impl Render for HomePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Pane controls use GlobalHomeView for legacy callbacks. Refresh it at
+        // the event boundary so the window/tab under the cursor owns the edit,
+        // rather than whichever dashboard happened to render last.
+        let current_home = cx.weak_entity();
         div()
+            .id("home-dashboard-workspace")
             .flex()
             .flex_col()
             .size_full()
-            .bg(cx.theme().colors.background) // Will be overridden by PaneGrid background
+            .bg(cx.theme().colors.background)
+            .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
+                cx.set_global(GlobalHomeView { view: current_home.clone() });
+            })
             .child(self.pane_grid.clone())
     }
 }

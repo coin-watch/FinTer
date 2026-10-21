@@ -6,8 +6,8 @@
 //! - On Linux: Renders custom window controls with client-side decorations
 
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Decorations, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, Render, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled,
+    AnyElement, App, ClickEvent, Decorations, Hsla, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled,
     Window, WindowControlArea, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
@@ -40,6 +40,7 @@ pub struct FinTerTitleBar {
     leading_children: SmallVec<[AnyElement; 2]>,
     on_close_window: CloseWindowFn,
     title: String,
+    tab_strip: Option<AnyElement>,
 }
 
 impl FinTerTitleBar {
@@ -50,7 +51,14 @@ impl FinTerTitleBar {
             leading_children: SmallVec::new(),
             on_close_window: None,
             title: title.into(),
+            tab_strip: None,
         }
+    }
+
+    /// Add an editor-style strip between the app title and window controls.
+    pub fn tabs<E: IntoElement>(mut self, tabs: E) -> Self {
+        self.tab_strip = Some(tabs.into_any_element());
+        self
     }
 
     #[allow(dead_code)]
@@ -94,6 +102,8 @@ impl RenderOnce for FinTerTitleBar {
         let title_bar_border = cx.theme().title_bar_border;
         let foreground = cx.theme().foreground;
 
+        let has_tabs = self.tab_strip.is_some();
+
         div().flex_shrink_0().child(
             div()
                 .id("finter-title-bar")
@@ -101,7 +111,7 @@ impl RenderOnce for FinTerTitleBar {
                 .flex_row()
                 .justify_between()
                 .h(TITLE_BAR_HEIGHT)
-                .pl(TITLE_BAR_LEFT_PADDING)
+                .pl(if has_tabs && !is_macos { px(0.0) } else { TITLE_BAR_LEFT_PADDING })
                 .pr(TITLE_BAR_RIGHT_PADDING)
                 .bg(title_bar_bg)
                 .refine_style(&self.style)
@@ -114,41 +124,53 @@ impl RenderOnce for FinTerTitleBar {
                 .child(
                     h_flex()
                         .id("title-bar-content")
-                        .window_control_area(WindowControlArea::Drag)
-                        .when(window.is_fullscreen(), |this| this.pl_3())
+                        .when(!has_tabs && window.is_fullscreen(), |this| this.pl_3())
                         .h_full()
                         .flex_1()
                         .items_center()
                         .border_b_1()
                         .border_color(title_bar_border)
-                        .gap_3()
-                        .when(is_linux && is_client_decorated, |this| {
-                            this.on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
-                            })
-                        })
-                        .when(is_linux && is_client_decorated, |this| {
+                        .when(!has_tabs, |this| this.gap_3())
+                        .when(has_tabs, |this| this.gap(px(0.0)))
+                        .children(self.leading_children)
+                        .when(!self.title.is_empty(), |this| {
                             this.child(
                                 div()
-                                    .top_0()
-                                    .left_0()
-                                    .absolute()
-                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .h_full()
-                                    .on_mouse_down(MouseButton::Right, move |ev, window, _| {
-                                        window.show_window_menu(ev.position)
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(foreground)
+                                            .child(self.title.clone()),
+                                    )
+                                    .when(self.tab_strip.is_some(), |this| {
+                                        this.child(
+                                            div()
+                                                .w(px(1.0))
+                                                .h(px(16.0))
+                                                .bg(title_bar_border),
+                                        )
                                     }),
                             )
                         })
-                        .children(self.leading_children)
+                        .when_some(self.tab_strip, |this, tabs| this.child(tabs))
+                        .children(self.children)
                         .child(
                             div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(foreground)
-                                .child(self.title.clone()),
-                        )
-                        .children(self.children),
+                                .id("title-bar-drag-spacer")
+                                .flex_1()
+                                .h_full()
+                                .window_control_area(WindowControlArea::Drag)
+                                .when(is_linux && is_client_decorated, |this| {
+                                    this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.start_window_move();
+                                    })
+                                }),
+                        ),
                 )
                 .child(WindowControls {
                     on_close_window: self.on_close_window,

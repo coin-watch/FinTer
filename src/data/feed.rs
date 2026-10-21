@@ -45,6 +45,7 @@ pub const MAX_TICKS: usize = 500;
 #[derive(Clone)]
 pub struct TickFeed {
     inner: Arc<Mutex<VecDeque<Arc<UnifiedTick>>>>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
     /// Keep the background drain task alive.
     _task: Arc<JoinHandle<()>>,
 }
@@ -59,13 +60,16 @@ impl TickFeed {
             Arc::new(Mutex::new(VecDeque::with_capacity(MAX_TICKS)));
 
         let drain_inner = Arc::clone(&inner);
+        let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let drain_sequence = Arc::clone(&sequence);
 
         let task = tokio_runtime().spawn(async move {
-            drain_loop(receiver, drain_inner).await;
+            drain_loop(receiver, drain_inner, drain_sequence).await;
         });
 
         Self {
             inner,
+            sequence,
             _task: Arc::new(task),
         }
     }
@@ -80,6 +84,19 @@ impl TickFeed {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Atomically snapshot arrival sequence and bounded rows. Sequence counts
+    /// arrivals, not timestamps; identical/equal-timestamp executions stay distinct.
+    pub fn sequenced_snapshot(&self) -> (u64, Vec<Arc<UnifiedTick>>) {
+        let buffer = self.inner.lock().expect("TickFeed mutex poisoned");
+        let sequence = self.sequence.load(std::sync::atomic::Ordering::Relaxed);
+        (sequence, buffer.iter().cloned().collect())
+    }
+
+    pub fn sequence(&self) -> u64 {
+        let _buffer = self.inner.lock().expect("TickFeed mutex poisoned");
+        self.sequence.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Number of ticks currently in the ring buffer.
@@ -100,6 +117,7 @@ impl TickFeed {
 async fn drain_loop(
     mut rx: broadcast::Receiver<Arc<UnifiedTick>>,
     buffer: Arc<Mutex<VecDeque<Arc<UnifiedTick>>>>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
 ) {
     loop {
         match rx.recv().await {
@@ -109,6 +127,7 @@ async fn drain_loop(
                     buf.pop_front(); // evict oldest
                 }
                 buf.push_back(tick);
+                sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!("TickFeed: buffer size = {}", buf.len());
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {

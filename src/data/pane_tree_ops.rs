@@ -183,7 +183,6 @@ impl PaneNode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::data::pane_tree::{Axis, ModuleData, PaneNode};
 
     #[test]
@@ -208,7 +207,7 @@ mod tests {
             }),
         };
 
-        assert!(tree.swap_panes("pane-1", "pane-2"));
+        assert!(tree.swap_data("pane-1", "pane-2"));
 
         if let PaneNode::Split { a, b, .. } = tree {
             if let PaneNode::Pane { id, data } = *a {

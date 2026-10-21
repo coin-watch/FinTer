@@ -19,6 +19,7 @@ pub mod price_format;
 pub mod session_store;
 pub mod settings;
 pub mod subscription;
+pub mod terminal_audio;
 pub mod theme;
 pub mod tick;
 pub mod update_checker;

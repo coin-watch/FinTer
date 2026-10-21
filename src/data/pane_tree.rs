@@ -34,4 +34,30 @@ impl PaneNode {
     pub fn generate_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
+
+    /// Recursively collect all configured exchanges from all panes in this tree.
+    pub fn collect_exchanges(&self) -> Vec<String> {
+        let mut set = std::collections::HashSet::new();
+        self.collect_exchanges_into(&mut set);
+        let mut list: Vec<_> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    fn collect_exchanges_into(&self, set: &mut std::collections::HashSet<String>) {
+        match self {
+            PaneNode::Pane { data, .. } => {
+                if let Some(exchange) = data.config.get("exchange").and_then(|v| v.as_str()) {
+                    let trimmed = exchange.trim().to_lowercase();
+                    if !trimmed.is_empty() {
+                        set.insert(trimmed);
+                    }
+                }
+            }
+            PaneNode::Split { a, b, .. } => {
+                a.collect_exchanges_into(set);
+                b.collect_exchanges_into(set);
+            }
+        }
+    }
 }

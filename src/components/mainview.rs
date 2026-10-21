@@ -6,9 +6,6 @@ use crate::components::pages::{
     profile::ProfilePage,
     settings::SettingsPage,
 };
-use crate::components::ui::create_dashboard_dialog::{
-    CreateDashboardDialogEvent, open_create_dashboard_dialog,
-};
 use crate::components::ui::delete_dashboard_dialog::{
     DeleteDashboardDialogEvent, open_delete_dashboard_dialog,
 };
@@ -24,9 +21,10 @@ use crate::data::version::UpdateState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, StyleRefinement, Styled, Timer, Window, WindowControlArea, div, px,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Timer, Window, WindowControlArea, div, px,
 };
 use gpui_component::button::ButtonVariants;
+use gpui_component::Sizable;
 use gpui_component::theme::ActiveTheme;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +57,6 @@ pub enum SecondarySidebar {
 
 /// Pending dialog actions (since subscribe doesn't have Window access)
 enum PendingDialogAction {
-    OpenCreateDashboard,
     OpenDeleteDashboard {
         module_id: String,
         module_name: String,
@@ -73,6 +70,60 @@ struct PendingModuleLoad {
     module: Module,
 }
 
+/// Payload used to reorder dashboard tabs by drag and drop.
+#[derive(Clone, Debug)]
+struct DragDashboardTab(String);
+
+struct DetachedDashboard {
+    module_id: String,
+    title: String,
+    home: Entity<HomePage>,
+    main_view: Option<gpui::WeakEntity<MainView>>,
+}
+
+impl Render for DetachedDashboard {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let main_view = self.main_view.clone();
+        let module_id = self.module_id.clone();
+        let attach_btn = gpui_component::button::Button::new("attach-tab-btn")
+            .icon(gpui_component::Icon::default().path("icons/panel-left.svg"))
+            .xsmall()
+            .ghost()
+            .tooltip("Attach to Main Window")
+            .on_click(move |_event, window, app| {
+                if let Some(main) = main_view.as_ref().and_then(|w| w.upgrade()) {
+                    let id = module_id.clone();
+                    app.update_entity(&main, |view, cx| {
+                        view.closed_dashboard_tabs.remove(&id);
+                        view.dashboard_views.remove(&id);
+                        // The detached view is a separate GPUI entity; restore its latest
+                        // payload into the main window when reattaching.
+                        view.load_and_apply_module(id, cx);
+                    });
+                }
+                window.remove_window();
+            });
+
+        div()
+            .id("detached-dashboard-root")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(colors.background)
+            .child(FinTerTitleBar::new(self.title.clone()).child_before_title(attach_btn))
+            .child(div().flex_1().overflow_hidden().child(self.home.clone()))
+    }
+}
+
+struct TabDragPreview(String);
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(160.0)).p(px(10.0)).bg(cx.theme().colors.background)
+            .text_xs().child(self.0.clone())
+    }
+}
+
 pub struct MainView {
     current_page: Page,
     /// Active secondary sidebar (if any)
@@ -80,6 +131,9 @@ pub struct MainView {
     dashboard_page: Option<Entity<DashboardPage>>,
     login_page: Option<Entity<LoginPage>>,
     home_page: Option<Entity<HomePage>>,
+    /// Live dashboard views keyed by module id. Keeping these entities alive prevents
+    /// panels and their network subscriptions from being recreated on every tab switch.
+    dashboard_views: std::collections::HashMap<String, Entity<HomePage>>,
     settings_page: Option<Entity<SettingsPage>>,
     dashboard_manager: Option<Entity<crate::components::ui::dashboard_manager::DashboardManager>>,
     api_client: ApiClient,
@@ -103,6 +157,8 @@ pub struct MainView {
     layout_presets: Vec<LayoutPreset>,
     /// Cached layout data (module_id -> Module) for instant switching
     layout_cache: std::collections::HashMap<String, Module>,
+    /// Dashboards explicitly closed from the title-bar tab strip.
+    closed_dashboard_tabs: std::collections::HashSet<String>,
     /// Auto-update manager
     update_manager: Arc<UpdateManager>,
     /// Update notification banner entity
@@ -118,6 +174,7 @@ impl MainView {
             dashboard_page: None,
             login_page: None,
             home_page: None,
+            dashboard_views: std::collections::HashMap::new(),
             settings_page: None,
             dashboard_manager: None,
             api_client,
@@ -132,6 +189,7 @@ impl MainView {
             dashboard_modules: Vec::new(),
             layout_presets: Vec::new(),
             layout_cache: std::collections::HashMap::new(),
+            closed_dashboard_tabs: std::collections::HashSet::new(),
             update_manager: Arc::new(UpdateManager::new()),
             update_banner: None,
             update_check_started: false,
@@ -320,6 +378,9 @@ impl MainView {
                 if restored.is_some() {
                     this.is_authenticated = true;
                     this.current_page = Page::Home;
+                    let token = this.api_client.access_token();
+                    crate::data::gateway_registry::GatewayRegistry::global()
+                        .refresh_for_session(token.as_deref());
                     // Load settings first, then modules with current_dashboard for auto-selection
                     this.load_settings_then_modules(cx);
                 } else {
@@ -407,11 +468,300 @@ impl MainView {
             .unwrap_or_else(|| "FinTer".to_string())
     }
 
+    /// Build the editor-style dashboard tabs shown in the title bar.
+    fn dashboard_tabs(&self, entity: gpui::WeakEntity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        let list_hover = colors.list_hover;
+        let primary = colors.primary;
+        let title_bar_border = colors.title_bar_border;
+        let bg_active = colors.background;
+        let bg_tab = colors.title_bar;
+        let fg_active = colors.foreground;
+        let fg_muted = colors.muted_foreground;
+        let sec_hover = colors.secondary_hover;
+
+        let active_id = self.active_module.as_ref().and_then(|module| module.id.clone());
+        let tabs = self.dashboard_modules.iter().filter(|module| {
+            module.id.as_ref().is_some_and(|id| !self.closed_dashboard_tabs.contains(id))
+        }).cloned().collect::<Vec<_>>();
+
+        let plus_entity = entity.clone();
+
+        div()
+            .id("dashboard-tabs")
+            .flex()
+            .items_end()
+            .h_full()
+            .gap(px(0.0))
+            .overflow_hidden()
+            .children(tabs.into_iter().filter_map(|module| {
+                let id = module.id?;
+                let name = module.module_name;
+                let drag_name = name.clone();
+                let is_active = active_id.as_ref() == Some(&id);
+                let load_id = id.clone();
+                let close_id = id.clone();
+                let load_entity = entity.clone();
+                let middle_close_entity = entity.clone();
+                let middle_close_id = id.clone();
+                let close_entity = entity.clone();
+                let detach_entity = entity.clone();
+                let detach_id = id.clone();
+                Some(div()
+                    .id(gpui::ElementId::Name(gpui::SharedString::from(format!("dashboard-tab-{id}"))))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .h_full()
+                    .w(px(160.0))
+                    .flex_shrink_0()
+                    .px(px(10.0))
+                    .border_b_2()
+                    .border_color(if is_active { primary } else { title_bar_border })
+                    .bg(if is_active { bg_active } else { bg_tab })
+                    .text_color(if is_active { fg_active } else { fg_muted })
+                    .cursor_pointer()
+                    .hover(move |style| {
+                        if !is_active {
+                            style.bg(list_hover)
+                        } else {
+                            style
+                        }
+                    })
+                    .drag_over::<DragDashboardTab>(move |style, _, _, _| style.bg(list_hover))
+                    .on_drop({
+                        let target_id = id.clone();
+                        let entity = entity.clone();
+                        move |drag: &DragDashboardTab, _window, app| {
+                            if let Some(view) = entity.upgrade() {
+                                let dragged_id = drag.0.clone();
+                                let target_id = target_id.clone();
+                                app.update_entity(&view, |view, cx| {
+                                    view.reorder_dashboard_tab(dragged_id, target_id, cx);
+                                });
+                            }
+                        }
+                    })
+                    .on_drag(
+                        DragDashboardTab(id.clone()),
+                        {
+                            let name = drag_name.clone();
+                            move |_drag, _offset, _window, app| {
+                                let name = name.clone();
+                                app.new(|_| TabDragPreview(name))
+                            }
+                        },
+                    )
+                    .on_mouse_down(gpui::MouseButton::Middle, move |_event, _window, app| {
+                        if let Some(view) = middle_close_entity.upgrade() {
+                            app.update_entity(&view, |view, cx| {
+                                view.close_dashboard_tab(middle_close_id.clone(), cx);
+                            });
+                        }
+                    })
+                    .on_click(move |_event, _window, app| {
+                        if let Some(view) = load_entity.upgrade() {
+                            app.update_entity(&view, |view, cx| {
+                                view.closed_dashboard_tabs.remove(&load_id);
+                                view.load_and_apply_module(load_id.clone(), cx);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(
+                        gpui_component::Icon::default()
+                            .path("icons/layout-dashboard.svg")
+                            .xsmall()
+                            .text_color(if is_active { primary } else { fg_muted }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_ellipsis()
+                            .font_weight(if is_active { gpui::FontWeight::MEDIUM } else { gpui::FontWeight::NORMAL })
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(gpui::SharedString::from(format!("detach-dashboard-tab-{detach_id}"))))
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(sec_hover).text_color(fg_active))
+                            .text_color(fg_muted)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_event, _window, app| {
+                                if let Some(view) = detach_entity.upgrade() {
+                                    app.update_entity(&view, |view, cx| {
+                                        view.detach_dashboard(detach_id.clone(), cx);
+                                    });
+                                }
+                            })
+                            .child(gpui_component::Icon::default().path("icons/external-link.svg").xsmall()),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(gpui::SharedString::from(format!("close-dashboard-tab-{close_id}"))))
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(sec_hover).text_color(fg_active))
+                            .text_color(fg_muted)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(move |_event, _window, app| {
+                                if let Some(view) = close_entity.upgrade() {
+                                    app.update_entity(&view, |view, cx| {
+                                        view.close_dashboard_tab(close_id.clone(), cx);
+                                    });
+                                }
+                            })
+                            .child(gpui_component::Icon::default().path("icons/window-close.svg").xsmall()),
+                    ))
+            }))
+            .child(
+                div()
+                    .id("add-dashboard-tab-btn")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h_full()
+                    .w(px(28.0))
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .text_color(fg_muted)
+                    .hover(move |style| style.bg(list_hover).text_color(fg_active))
+                    .on_click(move |_event, _window, app| {
+                        if let Some(view) = plus_entity.upgrade() {
+                            app.update_entity(&view, |view, cx| {
+                                view.create_new_dashboard("Untitled Dashboard".to_string(), cx);
+                            });
+                        }
+                    })
+                    .child(gpui_component::Icon::default().path("icons/plus.svg").xsmall()),
+            )
+    }
+
+    /// Open a detached dashboard window. The dashboard is loaded from the cached
+    /// module payload; it is not removed from the main tab strip.
+    fn detach_dashboard(&mut self, module_id: String, cx: &mut Context<Self>) {
+        let Some(module) = self.dashboard_modules.iter().find(|m| m.id.as_ref() == Some(&module_id)).cloned() else {
+            return;
+        };
+        let title = module.module_name.clone();
+        let entity = cx.weak_entity();
+        // Detached windows get their own HomePage entity. Reusing the entity rendered
+        // by the main Root makes GPUI route input to the original window.
+        let target_module_id = module_id.clone();
+        let module_payload = module.module.clone();
+        let _ = cx.spawn(async move |this, cx| {
+            let window_module_id = target_module_id.clone();
+            let result = cx.open_window(
+                gpui::WindowOptions {
+                    #[cfg(target_os = "linux")]
+                    titlebar: None,
+                    #[cfg(not(target_os = "linux"))]
+                    titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    app_id: Some("finter-dashboard".to_string()),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let module_payload = module_payload.clone();
+                    let module_id = window_module_id.clone();
+                    let home = cx.new(|cx| {
+                        let mut home = HomePage::new(cx);
+                        home.request_module_load(module_payload, module_id, cx);
+                        home
+                    });
+                    let main_for_save = entity.clone();
+                    let module_for_save = window_module_id.clone();
+                    cx.subscribe(&home, move |home, event: &HomePageEvent, cx| {
+                        if matches!(event, HomePageEvent::LayoutModified) {
+                            let tree = home.read(cx).pane_grid.read(cx).tree.clone();
+                            if let (Some(main), Some(tree)) = (main_for_save.upgrade(), tree) {
+                                let module_id = module_for_save.clone();
+                                cx.update_entity(&main, |main, cx| {
+                                    main.save_detached_layout(module_id, tree, cx);
+                                });
+                            }
+                        }
+                    }).detach();
+                    cx.new(|cx| {
+                        let detached = cx.new(|_| DetachedDashboard {
+                            module_id: window_module_id,
+                            title: title.clone(),
+                            home,
+                            main_view: Some(entity.clone()),
+                        });
+                        gpui_component::Root::new(detached, window, cx)
+                    })
+                },
+            );
+            if result.is_ok() {
+                let _ = this.update(cx, |this, cx| {
+                    this.close_dashboard_tab(target_module_id, cx);
+                });
+            }
+        }).detach();
+    }
+
+    /// Move a dragged dashboard tab immediately before the target tab.
+    fn reorder_dashboard_tab(&mut self, dragged_id: String, target_id: String, cx: &mut Context<Self>) {
+        if dragged_id == target_id {
+            return;
+        }
+        let Some(from) = self.dashboard_modules.iter().position(|module| module.id.as_ref() == Some(&dragged_id)) else {
+            return;
+        };
+        let module = self.dashboard_modules.remove(from);
+        let target = self.dashboard_modules.iter().position(|item| item.id.as_ref() == Some(&target_id))
+            .unwrap_or(self.dashboard_modules.len());
+        self.dashboard_modules.insert(target, module);
+        if let Some(manager) = &self.dashboard_manager {
+            let modules = self.dashboard_modules.clone();
+            manager.update(cx, |manager, cx| manager.update_modules(modules, cx));
+        }
+        cx.notify();
+    }
+
+    /// Close a title-bar tab without deleting the saved dashboard.
+    fn close_dashboard_tab(&mut self, module_id: String, cx: &mut Context<Self>) {
+        self.closed_dashboard_tabs.insert(module_id.clone());
+        self.dashboard_views.remove(&module_id);
+        if self.active_module.as_ref().and_then(|module| module.id.as_ref()) == Some(&module_id) {
+            if let Some(next) = self.dashboard_modules.iter().find(|module| {
+                module.id.as_ref().is_some_and(|id| !self.closed_dashboard_tabs.contains(id))
+            }).and_then(|module| module.id.clone()) {
+                self.load_and_apply_module(next, cx);
+            } else {
+                self.active_module = None;
+            }
+        }
+        cx.notify();
+    }
+
     /// Handle successful login: switch to home with trading view
     fn on_logged_in(&mut self, cx: &mut Context<Self>) {
         self.is_authenticated = true;
         self.current_page = Page::Home;
         self.is_restoring = true;
+
+        let token = self.api_client.access_token();
+        crate::data::gateway_registry::GatewayRegistry::global()
+            .refresh_for_session(token.as_deref());
 
         // Load settings first, then modules with current_dashboard for auto-selection
         self.load_settings_then_modules(cx);
@@ -424,6 +774,10 @@ impl MainView {
         self.is_authenticated = true;
         self.current_page = Page::Home;
         self.is_restoring = true;
+
+        let token = self.api_client.access_token();
+        crate::data::gateway_registry::GatewayRegistry::global()
+            .refresh_for_session(token.as_deref());
 
         // Create default module for new user, then load modules
         self.create_default_module_then_load(cx);
@@ -485,11 +839,14 @@ impl MainView {
                 id: Some(new_id.clone()),
                 module_name: name.clone(),
                 user_id: None,
-                module: serde_json::to_value(PaneNode::Pane {
-                    id: PaneNode::generate_id(),
-                    data: ModuleData::default(),
-                })
-                .unwrap_or_default(),
+                module: serde_json::json!({
+                    "kind": "pane",
+                    "id": PaneNode::generate_id(),
+                    "data": {
+                        "type": "Empty",
+                        "config": {}
+                    }
+                }),
                 created_at: None,
                 updated_at: None,
             };
@@ -566,6 +923,7 @@ impl MainView {
 
     /// Delete a layout by module ID
     fn delete_dashboard(&mut self, module_id: String, cx: &mut Context<Self>) {
+        self.dashboard_views.remove(&module_id);
         if !self.is_authenticated {
             let is_active = self.active_module.as_ref().and_then(|m| m.id.as_ref()) == Some(&module_id);
             self.dashboard_modules.retain(|m| m.id.as_ref() != Some(&module_id));
@@ -814,13 +1172,27 @@ impl MainView {
     ) {
         // Preload all layouts into cache for instant switching
         self.layout_cache.clear();
+        let mut module_exchanges = std::collections::HashSet::new();
         for module in &modules {
             if let Some(module_id) = &module.id {
                 self.layout_cache.insert(module_id.clone(), module.clone());
                 tracing::debug!("Preloaded layout: {} ({})", module.module_name, module_id);
             }
+            if let Ok(tree) = serde_json::from_value::<crate::data::pane_tree::PaneNode>(module.module.clone()) {
+                for ex in tree.collect_exchanges() {
+                    module_exchanges.insert(ex);
+                }
+            } else {
+                collect_exchanges_from_json(&module.module, &mut module_exchanges);
+            }
         }
         tracing::info!("Preloaded {} layouts into cache", self.layout_cache.len());
+
+        // Prefetch exchange and symbol lists via API for all module exchanges
+        let module_exchanges_vec: Vec<String> = module_exchanges.into_iter().collect();
+        let token = self.api_client.access_token();
+        crate::data::gateway_registry::GatewayRegistry::global()
+            .prefetch_for_modules(&module_exchanges_vec, token.as_deref());
 
         // Update the dashboard manager with fetched modules and layout presets
         if let Some(dm) = &self.dashboard_manager {
@@ -861,6 +1233,56 @@ impl MainView {
         }
 
         cx.notify();
+    }
+
+    /// Persist a layout edited in a detached window without relying on the
+    /// currently selected tab in the main window.
+    fn save_detached_layout(
+        &mut self,
+        module_id: String,
+        tree: PaneNode,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(layout_json) = serde_json::to_value(&tree) else { return; };
+
+        if let Some(module) = self.dashboard_modules.iter_mut().find(|m| m.id.as_ref() == Some(&module_id)) {
+            module.module = layout_json.clone();
+        }
+        if let Some(module) = self.layout_cache.get_mut(&module_id) {
+            module.module = layout_json.clone();
+        }
+
+        if !self.is_authenticated {
+            // Keep detached guest edits on disk as well as in the in-memory list.
+            if let Some(mut path) = Self::guest_layout_path() {
+                path.pop();
+                path.push("dashboards");
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    tracing::error!(?error, "Failed to create guest dashboard cache");
+                } else {
+                    path.push(format!("{module_id}.json"));
+                    if let Ok(json) = serde_json::to_string_pretty(&tree) {
+                        if let Err(error) = std::fs::write(path, json) {
+                            tracing::error!(?error, "Failed to save detached guest dashboard");
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        let client = self.api_client.clone();
+        cx.spawn(async move |_this, _cx| {
+            let id = module_id.clone();
+            let result = crate::data::client::tokio_runtime()
+                .spawn_blocking(move || client.update_module(&id, None, Some(layout_json)))
+                .await;
+            match result {
+                Ok(Ok(_)) => tracing::debug!("Saved detached dashboard {module_id}"),
+                Ok(Err(error)) => tracing::error!(?error, "Failed to save detached dashboard {module_id}"),
+                Err(error) => tracing::error!(?error, "Detached dashboard save task failed"),
+            }
+        }).detach();
     }
 
     /// Save current settings to the API
@@ -1126,6 +1548,11 @@ impl MainView {
     fn load_and_apply_module(&mut self, module_id: String, cx: &mut Context<Self>) {
         tracing::debug!("load_and_apply_module called with id: {}", module_id);
 
+        // Selecting the active tab must not rebuild the pane tree or refresh modules.
+        if self.active_module.as_ref().and_then(|module| module.id.as_ref()) == Some(&module_id) {
+            return;
+        }
+
         let module_to_load = self
             .dashboard_modules
             .iter()
@@ -1133,12 +1560,39 @@ impl MainView {
             .cloned();
 
         if let Some(module) = module_to_load {
-            self.active_module = Some(module.clone());
-            if let Some(home) = &self.home_page {
+            if let (Some(previous_id), Some(home)) = (
+                self.active_module.as_ref().and_then(|module| module.id.clone()),
+                self.home_page.clone(),
+            ) {
+                self.dashboard_views.insert(previous_id, home);
+            }
+            let home = if let Some(home) = self.dashboard_views.get(&module_id) {
+                home.clone()
+            } else {
+                let home = cx.new(HomePage::new);
+                cx.subscribe(&home, |this, source, _: &HomePageEvent, cx| {
+                    if this.home_page.as_ref() == Some(&source) {
+                        this.save_current_layout_immediately(cx);
+                    }
+                }).detach();
                 home.update(cx, |page, cx| {
                     page.request_module_load(module.module.clone(), module_id.clone(), cx);
+                    if let Some(settings) = self.user_settings.clone() {
+                        page.apply_settings(settings, cx);
+                    }
                 });
+                self.dashboard_views.insert(module_id.clone(), home.clone());
+                home
+            };
+            cx.set_global(crate::components::pages::home::GlobalHomeView { view: home.downgrade() });
+            self.home_page = Some(home);
+            self.closed_dashboard_tabs.remove(&module_id);
+            self.active_module = Some(module.clone());
+            if let Some(dm) = &self.dashboard_manager {
+                dm.update(cx, |manager, cx| manager.set_active_module(module_id.clone(), cx));
             }
+            self.current_page = Page::Home;
+            cx.notify();
         } else {
             tracing::warn!(
                 "Could not find module ID {} in dashboard_modules",
@@ -1582,27 +2036,9 @@ impl Render for MainView {
             })
             .unwrap_or_default();
 
-        // Process pending dialog actions (need Window access here)
+        // Delete confirmations still use a modal dialog; creation is immediate in the workspace.
         if let Some(action) = self.pending_dialog_action.take() {
             match action {
-                PendingDialogAction::OpenCreateDashboard => {
-                    let dialog_entity = open_create_dashboard_dialog(window, cx);
-                    // Subscribe to dialog events
-                    cx.subscribe(
-                        &dialog_entity,
-                        |this: &mut MainView, _dialog, event: &CreateDashboardDialogEvent, cx| {
-                            match event {
-                                CreateDashboardDialogEvent::Create(name) => {
-                                    this.create_new_dashboard(name.clone(), cx);
-                                }
-                                CreateDashboardDialogEvent::Cancel => {
-                                    // Dialog will close itself
-                                }
-                            }
-                        },
-                    )
-                    .detach();
-                }
                 PendingDialogAction::OpenDeleteDashboard {
                     module_id,
                     module_name,
@@ -1699,8 +2135,7 @@ impl Render for MainView {
                             this.delete_dashboard(module_id.clone(), cx);
                         }
                         crate::components::ui::dashboard_manager::DashboardManagerEvent::OpenCreateDialog => {
-                            this.pending_dialog_action = Some(PendingDialogAction::OpenCreateDashboard);
-                            cx.notify();
+                            this.create_new_dashboard("Untitled Dashboard".to_string(), cx);
                         }
                         crate::components::ui::dashboard_manager::DashboardManagerEvent::OpenDeleteDialog(module_id, module_name) => {
                             this.pending_dialog_action = Some(PendingDialogAction::OpenDeleteDashboard {
@@ -1708,6 +2143,12 @@ impl Render for MainView {
                                 module_name: module_name.clone(),
                             });
                             cx.notify();
+                        }
+                        crate::components::ui::dashboard_manager::DashboardManagerEvent::CloseDashboard(module_id) => {
+                            this.close_dashboard_tab(module_id.clone(), cx);
+                        }
+                        crate::components::ui::dashboard_manager::DashboardManagerEvent::DetachDashboard(module_id) => {
+                            this.detach_dashboard(module_id.clone(), cx);
                         }
                     }
                 },
@@ -1928,7 +2369,8 @@ impl Render for MainView {
 
         // Create home page lazily (main trading view)
         if self.home_page.is_none() {
-            let home_page = cx.new(|cx| HomePage::new(cx));
+            let active_id = self.active_module.as_ref().and_then(|m| m.id.clone()).unwrap_or_else(|| "default".to_string());
+            let home_page = cx.new(HomePage::new);
 
             // Subscribe to HomePage events to handle immediate layout saves
             cx.subscribe(
@@ -1952,6 +2394,7 @@ impl Render for MainView {
                 }
             }
 
+            self.dashboard_views.insert(active_id, home_page.clone());
             self.home_page = Some(home_page);
         }
 
@@ -2102,7 +2545,7 @@ impl Render for MainView {
             .flex_col()
             .flex_1()
             .overflow_hidden()
-            .child(FinTerTitleBar::new(self.title_bar_title()))
+            .child(FinTerTitleBar::new("").tabs(self.dashboard_tabs(entity.clone(), cx)))
             .when(show_update_banner, |this| {
                 if let Some(banner) = self.update_banner.as_ref() {
                     this.child(banner.clone())
@@ -2119,7 +2562,18 @@ impl Render for MainView {
                             current_page == Page::Home || current_page == Page::Dashboard,
                             |this| {
                                 if let Some(home_page) = self.home_page.as_ref() {
-                                    this.child(home_page.clone())
+                                    let active_home = home_page.downgrade();
+                                    this.child(
+                                        div()
+                                            .id("main-dashboard-workspace")
+                                            .size_full()
+                                            .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
+                                                cx.set_global(crate::components::pages::home::GlobalHomeView {
+                                                    view: active_home.clone(),
+                                                });
+                                            })
+                                            .child(home_page.clone()),
+                                    )
                                 } else {
                                     this
                                 }
@@ -2202,5 +2656,30 @@ impl Render for MainView {
                 })
                 .child(content_with_title_bar)
         }
+    }
+}
+
+fn collect_exchanges_from_json(
+    val: &serde_json::Value,
+    set: &mut std::collections::HashSet<String>,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            if let Some(ex) = map.get("exchange").and_then(|v| v.as_str()) {
+                let trimmed = ex.trim().to_lowercase();
+                if !trimmed.is_empty() {
+                    set.insert(trimmed);
+                }
+            }
+            for v in map.values() {
+                collect_exchanges_from_json(v, set);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_exchanges_from_json(v, set);
+            }
+        }
+        _ => {}
     }
 }

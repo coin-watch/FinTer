@@ -81,6 +81,8 @@ pub struct NewsfeedPanel {
     filter: String,
     pane_id: String,
     timezone: String,
+    width: f32,
+    height: f32,
 }
 
 impl NewsfeedPanel {
@@ -98,7 +100,21 @@ impl NewsfeedPanel {
             filter,
             pane_id,
             timezone: "UTC".into(),
+            width: 320.0,
+            height: 300.0,
         }
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        if (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5 {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
     fn ensure_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -350,26 +366,28 @@ impl Render for NewsfeedPanel {
         let status_color = if self.connected { gpui::green() } else { colors.muted_foreground };
         let priority = self.priority.clone();
         let pane_id = self.pane_id.clone();
+        let is_narrow = self.width < 340.0;
+        let is_compact_row = self.width < 320.0;
         let header = div()
             .h_8()
             .flex()
             .items_center()
             .justify_between()
-            .gap_2()
-            .px_3()
+            .gap_1()
+            .px_2()
             .border_b_1()
             .border_color(colors.border)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .flex_shrink_0()
                     .text_size(px(10.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(colors.muted_foreground)
                     .child(div().size(px(6.0)).rounded_full().bg(status_color))
-                    .child(status),
+                    .when(!is_narrow, |this| this.child(status)),
             )
             .child(
                 div()
@@ -377,11 +395,15 @@ impl Render for NewsfeedPanel {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .child(Input::new(&input).small())
                     .child(
                         Button::new("news-category")
-                            .label(priority.to_uppercase())
+                            .label(if is_narrow {
+                                priority.chars().take(3).collect::<String>().to_uppercase()
+                            } else {
+                                priority.to_uppercase()
+                            })
                             .outline()
                             .small()
                             .dropdown_caret(true)
@@ -429,7 +451,7 @@ impl Render for NewsfeedPanel {
                     )
                     .child(
                         Button::new("news-refresh")
-                            .label("REFRESH")
+                            .label(if is_narrow { "↻" } else { "REFRESH" })
                             .ghost()
                             .small()
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -495,90 +517,175 @@ impl Render for NewsfeedPanel {
                     let top = (article.priority >= 60).then_some("TOP").unwrap_or("");
                     let bg_hover = colors.muted;
 
-                    div()
-                        .id(id)
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .border_b_1()
-                        .border_color(colors.border.opacity(0.7))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(bg_hover.opacity(0.6)))
-                        .on_click(move |_, _, _| {
-                            let _ = webbrowser::open(&url);
-                        })
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
+                    let summary_color = colors.foreground.opacity(0.75);
+
+                    if is_compact_row {
+                        div()
+                            .id(id)
+                            .w_full()
+                            .px_2()
+                            .py(px(6.0))
+                            .border_b_1()
+                            .border_color(colors.border.opacity(0.7))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(bg_hover.opacity(0.6)))
+                            .on_click(move |_, _, _| {
+                                let _ = webbrowser::open(&url);
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .max_w(px(110.0))
+                                                    .overflow_hidden()
+                                                    .text_size(px(9.5))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(colors.primary)
+                                                    .child(source),
+                                            )
+                                            .child(
+                                                div()
+                                                    .rounded_sm()
+                                                    .bg(colors.muted)
+                                                    .px(px(3.0))
+                                                    .py(px(1.0))
+                                                    .text_size(px(8.5))
+                                                    .text_color(colors.foreground.opacity(0.7))
+                                                    .child(category.to_uppercase()),
+                                            )
+                                            .when(!top.is_empty(), |element| {
+                                                element.child(
+                                                    div()
+                                                        .text_size(px(8.5))
+                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .text_color(gpui::rgb(0xf59e0b))
+                                                        .child(top),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(9.0))
+                                            .text_color(colors.muted_foreground)
+                                            .child(time),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .pt_1()
+                                    .w_full()
+                                    .text_size(px(12.0))
+                                    .line_height(gpui::relative(1.2))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(colors.foreground)
+                                    .child(title),
+                            )
+                            .when(!summary.is_empty(), |element| {
+                                element.child(
                                     div()
-                                        .flex_shrink_0()
-                                        .font_family(".SF NS Mono")
-                                        .text_size(px(10.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(colors.foreground.opacity(0.7))
-                                        .child(time),
+                                        .pt_1()
+                                        .text_size(px(10.5))
+                                        .line_height(gpui::relative(1.2))
+                                        .text_color(summary_color)
+                                        .child(summary),
                                 )
-                                .child(
-                                    div()
-                                        .max_w(px(144.0))
-                                        .flex_shrink_0()
-                                        .overflow_hidden()
-                                        .text_size(px(10.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(colors.primary)
-                                        .child(source),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .rounded_sm()
-                                        .bg(colors.muted)
-                                        .px(px(4.0))
-                                        .py(px(2.0))
-                                        .text_size(px(9.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(colors.foreground.opacity(0.7))
-                                        .child(category.to_uppercase()),
-                                )
-                                .when(!top.is_empty(), |element| {
-                                    element.child(
+                            })
+                    } else {
+                        div()
+                            .id(id)
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(colors.border.opacity(0.7))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(bg_hover.opacity(0.6)))
+                            .on_click(move |_, _, _| {
+                                let _ = webbrowser::open(&url);
+                            })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
                                         div()
                                             .flex_shrink_0()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(gpui::rgb(0xf59e0b)) // amber-500
-                                            .child(top),
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(colors.foreground.opacity(0.7))
+                                            .child(time),
                                     )
-                                })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .text_size(px(13.0))
-                                        .line_height(gpui::relative(1.2))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(colors.foreground)
-                                        .group_hover(format!("news_row_{local_state_id}"), |s| s.text_color(colors.primary))
-                                        .child(title),
-                                ),
-                        )
-                        .when(!summary.is_empty(), |element| {
-                            let summary_color = colors.foreground.opacity(0.75);
-                            element.child(
-                                div()
-                                    .pt_2()
-                                    .pl(px(52.0))
-                                    .text_xs()
-                                    .line_height(gpui::relative(1.25))
-                                    .text_color(summary_color)
-                                    .child(summary),
+                                    .child(
+                                        div()
+                                            .max_w(px(144.0))
+                                            .flex_shrink_0()
+                                            .overflow_hidden()
+                                            .text_size(px(10.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(colors.primary)
+                                            .child(source),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .rounded_sm()
+                                            .bg(colors.muted)
+                                            .px(px(4.0))
+                                            .py(px(2.0))
+                                            .text_size(px(9.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(colors.foreground.opacity(0.7))
+                                            .child(category.to_uppercase()),
+                                    )
+                                    .when(!top.is_empty(), |element| {
+                                        element.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(gpui::rgb(0xf59e0b)) // amber-500
+                                                .child(top),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_size(px(13.0))
+                                            .line_height(gpui::relative(1.2))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(colors.foreground)
+                                            .group_hover(format!("news_row_{local_state_id}"), |s| s.text_color(colors.primary))
+                                            .child(title),
+                                    ),
                             )
-                        })
-                        .group(format!("news_row_{local_state_id}"))
+                            .when(!summary.is_empty(), |element| {
+                                element.child(
+                                    div()
+                                        .pt_2()
+                                        .pl(px(52.0))
+                                        .text_xs()
+                                        .line_height(gpui::relative(1.25))
+                                        .text_color(summary_color)
+                                        .child(summary),
+                                )
+                            })
+                            .group(format!("news_row_{local_state_id}"))
+                    }
                 }))
                 .into_any_element()
         };

@@ -155,6 +155,7 @@ impl BridgeConfig {
 /// Dropping this cancels the loop and closes the WebSocket connection.
 pub struct Bridge {
     tick_sender: broadcast::Sender<Arc<UnifiedTick>>,
+    trade_sender: broadcast::Sender<Arc<UnifiedTick>>,
     ob_sender: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
@@ -176,6 +177,7 @@ impl Bridge {
     /// The supervision loop will reconnect automatically on any disconnect.
     pub fn start(config: BridgeConfig) -> anyhow::Result<Self> {
         let (tick_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (trade_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ob_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let (ohlcv_sender, _) = broadcast::channel(OHLCV_BROADCAST_CAPACITY);
         let cancel_token = CancellationToken::new();
@@ -183,17 +185,19 @@ impl Bridge {
             Arc::new(std::sync::Mutex::new(None));
 
         let tick_tx = tick_sender.clone();
+        let trade_tx = trade_sender.clone();
         let ob_tx = ob_sender.clone();
         let ohlcv_tx = ohlcv_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
 
         let supervisor = tokio_runtime().spawn(async move {
-            supervision_loop(config, tick_tx, ob_tx, ohlcv_tx, token, history_cache).await;
+            supervision_loop(config, tick_tx, trade_tx, ob_tx, ohlcv_tx, token, history_cache).await;
         });
 
         Ok(Self {
             tick_sender,
+            trade_sender,
             ob_sender,
             ohlcv_sender,
             last_ohlcv_history,
@@ -205,6 +209,11 @@ impl Bridge {
     /// Subscribe to the trade tick stream.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<UnifiedTick>> {
         self.tick_sender.subscribe()
+    }
+
+    /// Subscribe to actual executed market trades stream.
+    pub fn subscribe_trades(&self) -> broadcast::Receiver<Arc<UnifiedTick>> {
+        self.trade_sender.subscribe()
     }
 
     /// Subscribe to the order book snapshot stream.
@@ -246,6 +255,7 @@ impl Bridge {
 async fn supervision_loop(
     config: BridgeConfig,
     tick_tx: broadcast::Sender<Arc<UnifiedTick>>,
+    trade_tx: broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     cancel_token: CancellationToken,
@@ -267,6 +277,7 @@ async fn supervision_loop(
         match connect_and_stream(
             &config,
             &tick_tx,
+            &trade_tx,
             &ob_tx,
             &ohlcv_tx,
             &cancel_token,
@@ -339,7 +350,11 @@ impl<'de> serde::Deserialize<'de> for GatewayMessage {
 
         if let serde_json::Value::Object(map) = value {
             msg.msg_type = map.get("type").and_then(|v| v.as_str()).map(ToString::to_string);
-            msg.channel = map.get("channel").and_then(|v| v.as_str()).map(ToString::to_string);
+            msg.channel = map.get("channel")
+                .or_else(|| map.get("topic"))
+                .or_else(|| map.get("stream"))
+                .and_then(|v| v.as_str())
+                .map(|s| if s == "ohlcv" { "kline".to_string() } else { s.to_string() });
             msg.exchange = map.get("exchange").and_then(|v| v.as_str()).map(ToString::to_string);
             msg.symbol = map.get("symbol").and_then(|v| v.as_str()).map(ToString::to_string);
             msg.timeframe = map.get("timeframe").and_then(|v| v.as_str()).map(ToString::to_string);
@@ -359,12 +374,18 @@ impl<'de> serde::Deserialize<'de> for GatewayMessage {
 }
 
 /// A single trade entry in a `trades` data push.
-#[derive(serde::Deserialize, Debug)]
-struct GatewayTrade {
-    timestamp: i64,
-    side: String,
-    price: f64,
-    amount: f64,
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct GatewayTrade {
+    #[serde(default, alias = "id", alias = "a")]
+    pub id: Option<String>,
+    #[serde(default, alias = "t", alias = "T", alias = "time")]
+    pub timestamp: i64,
+    #[serde(default, alias = "s", alias = "S")]
+    pub side: String,
+    #[serde(default, alias = "p", alias = "px")]
+    pub price: f64,
+    #[serde(default, alias = "q", alias = "qty", alias = "size", alias = "sz")]
+    pub amount: f64,
 }
 
 /// Order book payload in an `orderbook` data push.
@@ -378,6 +399,7 @@ struct GatewayOrderBook {
 async fn connect_and_stream(
     config: &BridgeConfig,
     tick_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     cancel_token: &CancellationToken,
@@ -436,6 +458,13 @@ async fn connect_and_stream(
             symbol: &ws_symbol,
             timeframe: None,
         },
+        SubscribeMsg {
+            action: "subscribe",
+            channel: "trades",
+            exchange: &config.exchange,
+            symbol: &ws_symbol,
+            timeframe: None,
+        },
     ] {
         write.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         loop {
@@ -462,7 +491,7 @@ async fn connect_and_stream(
             }
         }
     }
-    debug!("gateway: subscriptions acknowledged (ticker, kline/{}, orderbook)", config.timeframe);
+    debug!("gateway: subscriptions acknowledged (ticker, kline/{}, orderbook, trades)", config.timeframe);
 
     // Heartbeat ticker to keep the connection alive (matching CoinWatch client interval).
     let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
@@ -489,7 +518,7 @@ async fn connect_and_stream(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(&text, config, tick_tx, ob_tx, ohlcv_tx, history_cache);
+                        handle_message(&text, config, tick_tx, trade_tx, ob_tx, ohlcv_tx, history_cache);
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("gateway: received close frame");
@@ -521,6 +550,7 @@ fn handle_message(
     text: &str,
     config: &BridgeConfig,
     tick_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
@@ -556,17 +586,25 @@ fn handle_message(
 
     match msg.channel.as_deref() {
         Some("ticker") => {
-            let price_opt = data
+            let target = if let Some(inner) = data.get("data").or_else(|| data.get("ticker")) {
+                if inner.is_object() { inner } else { &data }
+            } else {
+                &data
+            };
+
+            let price_opt = target
                 .get("last")
-                .or_else(|| data.get("close"))
-                .or_else(|| data.get("c"))
-                .or_else(|| data.get("price"))
+                .or_else(|| target.get("close"))
+                .or_else(|| target.get("c"))
+                .or_else(|| target.get("price"))
+                .or_else(|| target.get("p"))
                 .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
 
             if let Some(price) = price_opt {
-                let ts = data
+                let raw_ts = target
                     .get("timestamp")
-                    .or_else(|| data.get("t"))
+                    .or_else(|| target.get("t"))
+                    .or_else(|| target.get("time"))
                     .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
                     .unwrap_or_else(|| {
                         std::time::SystemTime::now()
@@ -574,6 +612,7 @@ fn handle_message(
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0)
                     });
+                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
                 // Note: ticker push carries 24-hour cumulative market volume,
                 // not an individual trade amount or candle volume.
                 // UnifiedTick.amount represents individual traded amount, so set 0.0 here.
@@ -590,29 +629,42 @@ fn handle_message(
         }
 
         Some("trades") => {
-            if tick_tx.receiver_count() == 0 {
-                return;
-            }
-            match serde_json::from_value::<Vec<GatewayTrade>>(data) {
-                Ok(trades) => {
-                    for trade in trades {
-                        let side = match trade.side.as_str() {
-                            "buy" | "Buy" => TradeSide::Buy,
-                            "sell" | "Sell" => TradeSide::Sell,
-                            _ => TradeSide::Unknown,
-                        };
-                        let tick = UnifiedTick::new(
-                            msg.exchange.as_deref().unwrap_or(&config.exchange),
-                            msg.symbol.as_deref().unwrap_or(&config.symbol),
-                            trade.price,
-                            trade.amount,
-                            side,
-                            trade.timestamp,
-                        );
-                        let _ = tick_tx.send(Arc::new(tick));
-                    }
+            let trades_list: Vec<GatewayTrade> = if let Ok(trades) = serde_json::from_value::<Vec<GatewayTrade>>(data.clone()) {
+                trades
+            } else if let Some(arr) = data.get("trades").or_else(|| data.get("data")).and_then(|v| v.as_array()) {
+                arr.iter().filter_map(|item| serde_json::from_value::<GatewayTrade>(item.clone()).ok()).collect()
+            } else if let Ok(single) = serde_json::from_value::<GatewayTrade>(data.clone()) {
+                vec![single]
+            } else {
+                Vec::new()
+            };
+
+            for trade in trades_list {
+                if trade.price <= 0.0 || trade.amount <= 0.0 {
+                    continue;
                 }
-                Err(e) => warn!("gateway: trades data parse error: {e}"),
+                let raw_side = trade.side.to_lowercase();
+                let side = if raw_side.contains("buy") || raw_side == "b" || raw_side == "bid" {
+                    TradeSide::Buy
+                } else if raw_side.contains("sell") || raw_side == "s" || raw_side == "ask" {
+                    TradeSide::Sell
+                } else {
+                    TradeSide::Unknown
+                };
+
+                let raw_ts = trade.timestamp;
+                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
+
+                let tick = Arc::new(UnifiedTick::new(
+                    msg.exchange.as_deref().unwrap_or(&config.exchange),
+                    msg.symbol.as_deref().unwrap_or(&config.symbol),
+                    trade.price,
+                    trade.amount,
+                    side,
+                    ts,
+                ));
+
+                let _ = trade_tx.send(tick);
             }
         }
 
@@ -646,7 +698,7 @@ fn handle_message(
             }
         }
 
-        Some("kline") => {
+        Some("kline") | Some("ohlcv") => {
             let candles = parse_kline_payload(&data);
             if !candles.is_empty() {
                 debug!(

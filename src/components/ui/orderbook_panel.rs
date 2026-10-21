@@ -12,7 +12,7 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, ElementId, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
+    IntoElement, ParentElement, Render, SharedString, Styled, Window,
     div, px,
 };
 use gpui_component::button::Button;
@@ -27,8 +27,6 @@ use crate::data::orderbook_feed::OrderBookFeed;
 // Display constants
 // ---------------------------------------------------------------------------
 
-/// Number of price levels shown on each side.
-const VISIBLE_DEPTH: usize = 15;
 
 // ---------------------------------------------------------------------------
 // OrderBookPanel
@@ -38,6 +36,8 @@ pub struct OrderBookPanel {
     feed: OrderBookFeed,
     title: String,
     focus_handle: FocusHandle,
+    width: f32,
+    height: f32,
 }
 
 impl OrderBookPanel {
@@ -46,7 +46,21 @@ impl OrderBookPanel {
             feed,
             title: title.into(),
             focus_handle: cx.focus_handle(),
+            width: 300.0,
+            height: 350.0,
         }
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        if (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5 {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
     /// Format a price for display, adapting precision to magnitude.
@@ -76,7 +90,7 @@ impl OrderBookPanel {
     /// Render a single level row with an inline size bar.
     ///
     /// `bar_frac` is the fraction [0, 1] of the maximum quantity on either
-    /// side — used to set the width of the background size bar.
+    /// side — used to set the proportional width of the background size bar.
     fn render_level_row(
         level: &PriceLevel,
         idx: usize,
@@ -84,28 +98,28 @@ impl OrderBookPanel {
         price_color: gpui::Hsla,
         bar_color: gpui::Hsla,
         id_prefix: &'static str,
+        row_h: f32,
+        qty_w: f32,
+        font_size: f32,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let colors = &cx.theme().colors;
         let price_str = Self::fmt_price(level.price);
         let qty_str = Self::fmt_qty(level.quantity);
 
-        // Bar width: minimum 2 px so tiny levels are still visible.
-        let bar_width = (bar_frac * 120.0).max(2.0) as f32;
-
         div()
             .id(ElementId::Name(format!("{id_prefix}-{idx}").into()))
             .w_full()
-            .h(px(18.0))
+            .h(px(row_h))
             .relative()
-            // Size bar (absolute, behind text)
+            // Size bar dynamically spans proportional percentage of the module width
             .child(
                 div()
                     .absolute()
                     .right_0()
                     .top_0()
                     .bottom_0()
-                    .w(px(bar_width))
+                    .w(gpui::relative(bar_frac.clamp(0.01, 1.0) as f32))
                     .bg(bar_color),
             )
             // Text row (relative, on top of bar)
@@ -116,11 +130,13 @@ impl OrderBookPanel {
                     .px_2()
                     .gap_2()
                     .items_center()
+                    .justify_between()
                     // Price
                     .child(
                         div()
                             .flex_1()
-                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(font_size))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(price_color)
                             .child(price_str),
@@ -128,8 +144,10 @@ impl OrderBookPanel {
                     // Quantity
                     .child(
                         div()
-                            .w(px(80.0))
-                            .text_xs()
+                            .w(px(qty_w))
+                            .text_align(gpui::TextAlign::Right)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(font_size))
                             .text_color(colors.muted_foreground)
                             .child(qty_str),
                     ),
@@ -137,7 +155,7 @@ impl OrderBookPanel {
     }
 
     /// Render the column header.
-    fn render_header(cx: &Context<Self>) -> impl IntoElement {
+    fn render_header(qty_w: f32, font_size: f32, cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
         h_flex()
             .w_full()
@@ -147,18 +165,21 @@ impl OrderBookPanel {
             .border_b_1()
             .border_color(colors.border)
             .gap_2()
+            .items_center()
+            .justify_between()
             .child(
                 div()
                     .flex_1()
-                    .text_xs()
+                    .text_size(px(font_size))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(colors.muted_foreground)
                     .child("PRICE"),
             )
             .child(
                 div()
-                    .w(px(80.0))
-                    .text_xs()
+                    .w(px(qty_w))
+                    .text_align(gpui::TextAlign::Right)
+                    .text_size(px(font_size))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(colors.muted_foreground)
                     .child("QUANTITY"),
@@ -178,83 +199,166 @@ impl OrderBookPanel {
 
         let mid_str = book
             .mid_price()
-            .map_or(String::new(), |m| format!("  Mid: {}", Self::fmt_price(m)));
+            .map_or(String::new(), |m| format!("Mid: {}", Self::fmt_price(m)));
 
         h_flex()
             .w_full()
             .px_2()
-            .py(px(4.0))
+            .py(px(3.0))
             .bg(Hsla {
-                a: 0.14,
+                a: 0.12,
                 ..colors.warning
             })
             .border_y_1()
-            .border_color(colors.border)
+            .border_color(colors.border.opacity(0.6))
             .gap_2()
+            .items_center()
+            .justify_between()
             .child(
                 div()
-                    .text_xs()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(11.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(colors.warning)
                     .child(spread_str),
             )
             .child(
                 div()
-                    .text_xs()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(11.0))
                     .text_color(colors.muted_foreground)
                     .child(mid_str),
             )
     }
 
-    /// Render the full depth ladder for a live order book.
-    fn render_book(book: &Arc<OrderBook>, cx: &Context<Self>) -> impl IntoElement {
+    /// Render the full depth ladder dynamically fitted to the pane dimensions.
+    fn render_book(&self, book: &Arc<OrderBook>, cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
-        let max_qty = book.max_quantity(VISIBLE_DEPTH).max(f64::EPSILON);
+        let row_h = if self.height < 240.0 { 16.0 } else { 18.0 };
+        let qty_w = if self.width < 220.0 { 60.0 } else { 80.0 };
+        let font_size = if self.width < 220.0 { 10.5 } else { 11.5 };
 
-        let asks = book.top_asks(VISIBLE_DEPTH);
-        let bids = book.top_bids(VISIBLE_DEPTH);
+        let is_dual_column = self.width >= 380.0 && self.height < 320.0;
 
-        // Asks are displayed in reverse order (worst ask at top, best ask
-        // closest to the spread) so the spread sits at the natural centre.
-        let asks_reversed: Vec<&PriceLevel> = asks.iter().rev().collect();
+        if is_dual_column {
+            // Dual-column mode for wide short panes: BIDS on left, ASKS on right
+            let depth = (((self.height - 52.0) / row_h).floor() as usize).clamp(3, 30);
+            let max_qty = book.max_quantity(depth).max(f64::EPSILON);
+            let asks = book.top_asks(depth);
+            let bids = book.top_bids(depth);
 
-        v_flex()
-            .size_full()
-            .overflow_hidden()
-            // Asks section (reversed — worst ask at top)
-            .children(asks_reversed.iter().enumerate().map(|(i, level)| {
-                let frac = level.quantity / max_qty;
-                Self::render_level_row(
-                    level,
-                    i,
-                    frac,
-                    colors.bearish,
-                    Hsla {
-                        a: 0.28,
-                        ..colors.bearish
-                    },
-                    "ask",
-                    cx,
+            v_flex()
+                .size_full()
+                .overflow_hidden()
+                .child(Self::render_spread(book, cx))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .w_full()
+                        .min_h_0()
+                        .child(
+                            // Bids column (green)
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .border_r_1()
+                                .border_color(colors.border)
+                                .child(Self::render_header(qty_w, font_size - 1.0, cx))
+                                .children(bids.iter().enumerate().map(|(i, level)| {
+                                    let frac = level.quantity / max_qty;
+                                    Self::render_level_row(
+                                        level,
+                                        i,
+                                        frac,
+                                        colors.bullish,
+                                        Hsla { a: 0.22, ..colors.bullish },
+                                        "bid",
+                                        row_h,
+                                        qty_w,
+                                        font_size,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            // Asks column (red)
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(Self::render_header(qty_w, font_size - 1.0, cx))
+                                .children(asks.iter().enumerate().map(|(i, level)| {
+                                    let frac = level.quantity / max_qty;
+                                    Self::render_level_row(
+                                        level,
+                                        i,
+                                        frac,
+                                        colors.bearish,
+                                        Hsla { a: 0.22, ..colors.bearish },
+                                        "ask",
+                                        row_h,
+                                        qty_w,
+                                        font_size,
+                                        cx,
+                                    )
+                                })),
+                        ),
                 )
-            }))
-            // Spread / mid price separator
-            .child(Self::render_spread(book, cx))
-            // Bids section
-            .children(bids.iter().enumerate().map(|(i, level)| {
-                let frac = level.quantity / max_qty;
-                Self::render_level_row(
-                    level,
-                    i,
-                    frac,
-                    colors.bullish,
-                    Hsla {
-                        a: 0.28,
-                        ..colors.bullish
-                    },
-                    "bid",
-                    cx,
-                )
-            }))
+        } else {
+            // Stacked depth ladder: Asks at top, Spread in center, Bids at bottom
+            let available_h = (self.height - 24.0 - 24.0).max(36.0);
+            let depth = (((available_h / (row_h * 2.0))).floor() as usize).clamp(3, 35);
+
+            let max_qty = book.max_quantity(depth).max(f64::EPSILON);
+            let asks = book.top_asks(depth);
+            let bids = book.top_bids(depth);
+            let asks_reversed: Vec<&PriceLevel> = asks.iter().rev().collect();
+
+            v_flex()
+                .size_full()
+                .overflow_hidden()
+                // Asks section (reversed — worst ask at top)
+                .children(asks_reversed.iter().enumerate().map(|(i, level)| {
+                    let frac = level.quantity / max_qty;
+                    Self::render_level_row(
+                        level,
+                        i,
+                        frac,
+                        colors.bearish,
+                        Hsla {
+                            a: 0.22,
+                            ..colors.bearish
+                        },
+                        "ask",
+                        row_h,
+                        qty_w,
+                        font_size,
+                        cx,
+                    )
+                }))
+                // Spread / mid price separator
+                .child(Self::render_spread(book, cx))
+                // Bids section
+                .children(bids.iter().enumerate().map(|(i, level)| {
+                    let frac = level.quantity / max_qty;
+                    Self::render_level_row(
+                        level,
+                        i,
+                        frac,
+                        colors.bullish,
+                        Hsla {
+                            a: 0.22,
+                            ..colors.bullish
+                        },
+                        "bid",
+                        row_h,
+                        qty_w,
+                        font_size,
+                        cx,
+                    )
+                }))
+        }
     }
 
     /// Render empty-state placeholder.
@@ -277,21 +381,24 @@ impl Render for OrderBookPanel {
         window.request_animation_frame();
 
         let snapshot = self.feed.snapshot();
+        let qty_w = if self.width < 220.0 { 60.0 } else { 80.0 };
+        let font_size = if self.width < 220.0 { 10.5 } else { 11.5 };
+        let is_dual_column = self.width >= 380.0 && self.height < 320.0;
 
         v_flex()
             .size_full()
+            .overflow_hidden()
             .bg(cx.theme().colors.background)
-            .child(Self::render_header(cx))
+            .when(!is_dual_column, |this| this.child(Self::render_header(qty_w, font_size, cx)))
             .when(snapshot.is_none(), |el: gpui::Div| {
                 el.child(Self::render_empty(cx))
             })
             .when_some(snapshot, |el, book| {
                 el.child(
-                    v_flex()
-                        .id("ob-scroll")
+                    div()
                         .size_full()
-                        .overflow_y_scroll()
-                        .child(Self::render_book(&book, cx)),
+                        .overflow_hidden()
+                        .child(self.render_book(&book, cx)),
                 )
             })
     }

@@ -110,10 +110,12 @@ impl ApiClient {
             .build()
             .expect("failed to build HTTP client");
 
+        let initial_session = session_store::load_session().ok().flatten();
+
         Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
-            session: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(initial_session)),
         }
     }
 
@@ -207,8 +209,15 @@ impl ApiClient {
 
     /// Build a GET request with Bearer auth (if logged in).
     pub fn auth_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.get(self.url(path)).header("Origin", self.base_url.clone());
-        if let Some(token) = self.access_token() {
+        let mut req = self
+            .http
+            .get(self.url(path))
+            .header("Accept", "application/json")
+            .header("Origin", self.base_url.clone())
+            .header("Referer", format!("{}/", self.base_url));
+        if let Some(token) = self.access_token().or_else(|| {
+            session_store::load_session().ok().flatten().map(|s| s.access_token)
+        }) {
             req = req.bearer_auth(token);
         }
         req
@@ -216,8 +225,15 @@ impl ApiClient {
 
     /// Build a POST request with Bearer auth (if logged in).
     pub fn auth_post(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.post(self.url(path)).header("Origin", self.base_url.clone());
-        if let Some(token) = self.access_token() {
+        let mut req = self
+            .http
+            .post(self.url(path))
+            .header("Accept", "application/json")
+            .header("Origin", self.base_url.clone())
+            .header("Referer", format!("{}/", self.base_url));
+        if let Some(token) = self.access_token().or_else(|| {
+            session_store::load_session().ok().flatten().map(|s| s.access_token)
+        }) {
             req = req.bearer_auth(token);
         }
         req
@@ -225,8 +241,15 @@ impl ApiClient {
 
     /// Build a PATCH request with Bearer auth (if logged in).
     pub fn auth_patch(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.patch(self.url(path)).header("Origin", self.base_url.clone());
-        if let Some(token) = self.access_token() {
+        let mut req = self
+            .http
+            .patch(self.url(path))
+            .header("Accept", "application/json")
+            .header("Origin", self.base_url.clone())
+            .header("Referer", format!("{}/", self.base_url));
+        if let Some(token) = self.access_token().or_else(|| {
+            session_store::load_session().ok().flatten().map(|s| s.access_token)
+        }) {
             req = req.bearer_auth(token);
         }
         req
@@ -234,8 +257,15 @@ impl ApiClient {
 
     /// Build a DELETE request with Bearer auth (if logged in).
     pub fn auth_delete(&self, path: &str) -> reqwest::RequestBuilder {
-        let mut req = self.http.delete(self.url(path)).header("Origin", self.base_url.clone());
-        if let Some(token) = self.access_token() {
+        let mut req = self
+            .http
+            .delete(self.url(path))
+            .header("Accept", "application/json")
+            .header("Origin", self.base_url.clone())
+            .header("Referer", format!("{}/", self.base_url));
+        if let Some(token) = self.access_token().or_else(|| {
+            session_store::load_session().ok().flatten().map(|s| s.access_token)
+        }) {
             req = req.bearer_auth(token);
         }
         req

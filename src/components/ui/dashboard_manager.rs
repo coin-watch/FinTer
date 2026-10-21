@@ -1,13 +1,15 @@
-//! Dashboard manager for cloud dashboards and saved layout presets.
+//! Compact editor-style dashboard explorer for FinTer.
+//! Provides a file tree view reminiscent of modern code editors (VS Code, Zed, Sublime),
+//! featuring collapsible folders, tree guides, row action hover states, and status badges.
 
 use crate::data::models::{LayoutPreset, Module};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, actions, div, prelude::*, px,
+    actions, div, prelude::*, px, App, Context, EventEmitter, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::theme::ActiveTheme;
-use gpui_component::{Selectable, Sizable};
+use gpui_component::{ActiveTheme, Icon, Sizable};
 
 actions!(dashboard_manager, [RefreshDashboards]);
 
@@ -21,6 +23,8 @@ pub enum DashboardManagerEvent {
     OpenCreateDialog,
     OpenDeleteDialog(String, String),
     DeletePreset(String),
+    CloseDashboard(String),
+    DetachDashboard(String),
 }
 
 pub struct DashboardManager {
@@ -28,6 +32,9 @@ pub struct DashboardManager {
     modules: Vec<Module>,
     layout_presets: Vec<LayoutPreset>,
     active_module: Option<String>,
+    open_module_ids: Vec<String>,
+    dashboards_expanded: bool,
+    presets_expanded: bool,
     pub api_error: Option<String>,
 }
 
@@ -38,6 +45,9 @@ impl DashboardManager {
             modules: Vec::new(),
             layout_presets: Vec::new(),
             active_module: None,
+            open_module_ids: Vec::new(),
+            dashboards_expanded: true,
+            presets_expanded: true,
             api_error: None,
         }
     }
@@ -62,165 +72,18 @@ impl DashboardManager {
         cx.notify();
     }
 
+    pub fn clear_active_module(&mut self, cx: &mut Context<Self>) {
+        self.active_module = None;
+        cx.notify();
+    }
+
+    pub fn set_open_modules(&mut self, open_ids: Vec<String>, cx: &mut Context<Self>) {
+        self.open_module_ids = open_ids;
+        cx.notify();
+    }
+
     pub fn active_module(&self) -> Option<&String> {
         self.active_module.as_ref()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_module_item(
-        &self,
-        module: Module,
-        cx: &mut Context<Self>,
-        is_active: bool,
-        list_bg: gpui::Hsla,
-        border_color: gpui::Hsla,
-        list_hover: gpui::Hsla,
-        primary: gpui::Hsla,
-        muted_fg: gpui::Hsla,
-        foreground: gpui::Hsla,
-    ) -> gpui::Stateful<gpui::Div> {
-        let module_id = module.id.clone().unwrap_or_default();
-        let module_id_for_delete = module_id.clone();
-        let module_name = module.module_name.clone();
-        let module_name_for_delete = module_name.clone();
-
-        div()
-            .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
-                "module-{module_id}"
-            ))))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .p(px(10.0))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .bg(list_bg)
-            .border_1()
-            .border_color(if is_active { primary } else { border_color })
-            .hover(|style| style.bg(list_hover))
-            .on_click(cx.listener(move |_this, _event, _window, cx| {
-                cx.emit(DashboardManagerEvent::LoadModule(module_id.clone()));
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .w(px(8.0))
-                                    .h(px(8.0))
-                                    .rounded(px(4.0))
-                                    .bg(if is_active { primary } else { muted_fg }),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(foreground)
-                                    .font_weight(if is_active {
-                                        gpui::FontWeight::SEMIBOLD
-                                    } else {
-                                        gpui::FontWeight::NORMAL
-                                    })
-                                    .child(module_name),
-                            ),
-                    )
-                    .child(
-                        Button::new(gpui::SharedString::from(format!(
-                            "delete-module-{module_id_for_delete}"
-                        )))
-                        .icon(gpui_component::Icon::default().path("icons/delete.svg"))
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(
-                            move |_this, _event, _window, cx| {
-                                cx.emit(DashboardManagerEvent::OpenDeleteDialog(
-                                    module_id_for_delete.clone(),
-                                    module_name_for_delete.clone(),
-                                ));
-                            },
-                        )),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child("Cloud dashboard"),
-            )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_preset_item(
-        &self,
-        preset: LayoutPreset,
-        cx: &mut Context<Self>,
-        list_bg: gpui::Hsla,
-        border_color: gpui::Hsla,
-        list_hover: gpui::Hsla,
-        primary: gpui::Hsla,
-        foreground: gpui::Hsla,
-    ) -> gpui::Stateful<gpui::Div> {
-        let preset_id = preset.id.clone().unwrap_or_default();
-        let delete_id = preset_id.clone();
-        let tree = preset.tree.clone();
-
-        div()
-            .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
-                "preset-{preset_id}"
-            ))))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .py(px(8.0))
-            .rounded(px(6.0))
-            .bg(list_bg)
-            .border_1()
-            .border_color(border_color)
-            .hover(|style| style.bg(list_hover))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(4.0)).bg(primary))
-                    .child(div().text_sm().text_color(foreground).child(preset.name)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        Button::new(gpui::SharedString::from(format!("load-preset-{preset_id}")))
-                            .label("Load")
-                            .xsmall()
-                            .secondary_selected(false)
-                            .on_click(cx.listener(move |_this, _event, _window, cx| {
-                                cx.emit(DashboardManagerEvent::LoadPreset(tree.clone()));
-                            })),
-                    )
-                    .child(
-                        Button::new(gpui::SharedString::from(format!(
-                            "delete-preset-{delete_id}"
-                        )))
-                        .icon(gpui_component::Icon::default().path("icons/delete.svg"))
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(
-                            move |_this, _event, _window, cx| {
-                                cx.emit(DashboardManagerEvent::DeletePreset(delete_id.clone()));
-                            },
-                        )),
-                    ),
-            )
     }
 }
 
@@ -234,155 +97,527 @@ impl Focusable for DashboardManager {
 
 impl Render for DashboardManager {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let module_count = self.modules.len();
-        let preset_count = self.layout_presets.len();
         let colors = cx.theme().colors;
+        let active_id = self.active_module.clone();
+        let open_ids = self.open_module_ids.clone();
 
-        let mut module_items = Vec::new();
-        for module in self.modules.clone() {
-            let is_active = self
-                .active_module
-                .as_ref()
-                .map(|id| module.id.as_ref() == Some(id))
-                .unwrap_or(false);
-            module_items.push(self.render_module_item(
-                module,
-                cx,
-                is_active,
-                if is_active {
-                    colors.list_active
-                } else {
-                    colors.list
-                },
-                colors.border,
-                colors.list_hover,
-                colors.primary,
-                colors.muted_foreground,
-                colors.foreground,
-            ));
-        }
+        // Render dashboard file items
+        let module_rows: Vec<_> = self
+            .modules
+            .clone()
+            .into_iter()
+            .map(|module| {
+                let id = module.id.clone().unwrap_or_default();
+                let delete_id = id.clone();
+                let name = module.module_name.clone();
+                let is_active = active_id.as_ref() == Some(&id);
+                let is_open = open_ids.contains(&id);
 
-        let mut preset_items = Vec::new();
-        for preset in self.layout_presets.clone() {
-            preset_items.push(self.render_preset_item(
-                preset,
-                cx,
-                colors.list,
-                colors.border,
-                colors.list_hover,
-                colors.primary,
-                colors.foreground,
-            ));
-        }
-
-        div()
-            .id("dashboard-manager-scroll")
-            .flex()
-            .flex_col()
-            .size_full()
-            .p(px(16.0))
-            .overflow_y_scroll()
-            .gap(px(24.0))
-            .child(
                 div()
+                    .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
+                        "file-tree-dash-{id}"
+                    ))))
                     .flex()
-                    .flex_col()
-                    .gap(px(8.0))
+                    .items_center()
+                    .justify_between()
+                    .h(px(28.0))
+                    .pl(px(26.0))
+                    .pr(px(8.0))
+                    .cursor_pointer()
+                    .border_l_2()
+                    .border_color(if is_active {
+                        colors.primary
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .bg(if is_active {
+                        colors.list_active
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .hover(|style| {
+                        if !is_active {
+                            style.bg(colors.list_hover)
+                        } else {
+                            style
+                        }
+                    })
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |_this, _event, _window, cx| {
+                            cx.emit(DashboardManagerEvent::LoadModule(id.clone()));
+                        }
+                    }))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(colors.foreground)
-                            .child("Dashboards Manager"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.muted_foreground)
-                            .child(format!(
-                                "{} dashboard{}",
-                                module_count,
-                                if module_count == 1 { "" } else { "s" }
-                            )),
-                    )
-                    .child(
-                        Button::new("create-dashboard")
-                            .label("New Dashboard")
-                            .primary()
-                            .small()
-                            .w_full()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(DashboardManagerEvent::OpenCreateDialog)
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .overflow_hidden()
+                            .child(
+                                Icon::default()
+                                    .path("icons/layout-dashboard.svg")
+                                    .xsmall()
+                                    .text_color(if is_active {
+                                        colors.primary
+                                    } else {
+                                        colors.muted_foreground
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(if is_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(if is_active {
+                                        colors.foreground
+                                    } else {
+                                        colors.muted_foreground
+                                    })
+                                    .overflow_hidden()
+                                    .child(name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted_foreground.opacity(0.6))
+                                    .child(".dash"),
+                            )
+                            .when(is_open && !is_active, |this| {
+                                this.child(
+                                    div()
+                                        .w(px(5.0))
+                                        .h(px(5.0))
+                                        .rounded(px(2.5))
+                                        .bg(colors.muted_foreground.opacity(0.4)),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .flex()
-                            .gap(px(8.0))
+                            .items_center()
+                            .gap(px(2.0))
                             .child(
-                                Button::new("export-dashboard")
-                                    .label("Export")
-                                    .secondary_selected(false)
-                                    .xsmall()
-                                    .on_click(cx.listener(|_this, _event, _window, cx| {
-                                        cx.emit(DashboardManagerEvent::ExportDashboard)
-                                    })),
-                            )
-                            .child(
-                                Button::new("import-dashboard")
-                                    .label("Import")
-                                    .secondary_selected(false)
-                                    .xsmall()
-                                    .on_click(cx.listener(|_this, _event, _window, cx| {
-                                        cx.emit(DashboardManagerEvent::ImportDashboard(None))
-                                    })),
+                                div()
+                                    .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
+                                        "del-btn-{delete_id}"
+                                    ))))
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.0))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style
+                                            .bg(colors.danger.opacity(0.15))
+                                            .text_color(colors.danger)
+                                    })
+                                    .text_color(colors.muted_foreground.opacity(0.5))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener({
+                                        let delete_id = delete_id.clone();
+                                        let name = name.clone();
+                                        move |_this, _event, _window, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(DashboardManagerEvent::OpenDeleteDialog(
+                                                delete_id.clone(),
+                                                name.clone(),
+                                            ));
+                                        }
+                                    }))
+                                    .child(Icon::default().path("icons/delete.svg").xsmall()),
                             ),
                     )
-                    .when(module_count > 0, |el| {
-                        el.child(div().flex().flex_col().gap(px(8.0)).children(module_items))
-                    })
-                    .when(module_count == 0, |el| {
-                        el.child(
-                            div()
-                                .text_sm()
-                                .text_color(colors.muted_foreground)
-                                .child("No dashboards yet."),
-                        )
-                    }),
-            )
+            })
+            .collect();
+
+        // Render layout preset items
+        let preset_rows: Vec<_> = self
+            .layout_presets
+            .clone()
+            .into_iter()
+            .map(|preset| {
+                let id = preset.id.clone().unwrap_or_default();
+                let tree = preset.tree;
+                let name = preset.name;
+
+                div()
+                    .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
+                        "file-tree-preset-{id}"
+                    ))))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(28.0))
+                    .pl(px(26.0))
+                    .pr(px(8.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.list_hover))
+                    .on_click(cx.listener({
+                        let tree = tree.clone();
+                        move |_this, _event, _window, cx| {
+                            cx.emit(DashboardManagerEvent::LoadPreset(tree.clone()));
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .overflow_hidden()
+                            .child(
+                                Icon::default()
+                                    .path("icons/blocks.svg")
+                                    .xsmall()
+                                    .text_color(colors.muted_foreground),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted_foreground)
+                                    .overflow_hidden()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted_foreground.opacity(0.6))
+                                    .child(".preset"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .id(gpui::ElementId::Name(gpui::SharedString::from(format!(
+                                        "del-preset-{id}"
+                                    ))))
+                                    .w(px(20.0))
+                                    .h(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.0))
+                                    .cursor_pointer()
+                                    .hover(|style| {
+                                        style
+                                            .bg(colors.danger.opacity(0.15))
+                                            .text_color(colors.danger)
+                                    })
+                                    .text_color(colors.muted_foreground.opacity(0.5))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener({
+                                        let id = id.clone();
+                                        move |_this, _event, _window, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(DashboardManagerEvent::DeletePreset(id.clone()));
+                                        }
+                                    }))
+                                    .child(Icon::default().path("icons/delete.svg").xsmall()),
+                            ),
+                    )
+            })
+            .collect();
+
+        div()
+            .id("dashboard-file-explorer")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(colors.sidebar)
+            .text_color(colors.foreground)
+            // Explorer Toolbar Header
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(8.0))
+                    .items_center()
+                    .justify_between()
+                    .h(px(32.0))
+                    .px(px(12.0))
+                    .border_b_1()
+                    .border_color(colors.border.opacity(0.5))
                     .child(
                         div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(colors.foreground)
-                            .child("Layout Presets"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
                             .text_color(colors.muted_foreground)
-                            .child(format!(
-                                "{} preset{}",
-                                preset_count,
-                                if preset_count == 1 { "" } else { "s" }
-                            )),
+                            .child("WORKSPACE EXPLORER"),
                     )
-                    .when(preset_count > 0, |el| {
-                        el.child(div().flex().flex_col().gap(px(8.0)).children(preset_items))
-                    })
-                    .when(preset_count == 0, |el| {
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                Button::new("toolbar-new-dashboard")
+                                    .icon(Icon::default().path("icons/plus.svg"))
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(DashboardManagerEvent::CreateDashboard("Untitled Dashboard".to_string()));
+                                    })),
+                            )
+                            .child(
+                                Button::new("toolbar-import")
+                                    .icon(Icon::default().path("icons/undo-2.svg"))
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(DashboardManagerEvent::ImportDashboard(None));
+                                    })),
+                            )
+                            .child(
+                                Button::new("toolbar-export")
+                                    .icon(Icon::default().path("icons/external-link.svg"))
+                                    .xsmall()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(DashboardManagerEvent::ExportDashboard);
+                                    })),
+                            ),
+                    ),
+            )
+            // Tree View Area with vertical guides
+            .child(
+                div()
+                    .id("explorer-tree-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .py(px(6.0))
+                    // Section 1: Dashboards Folder
+                    .child(
+                        div()
+                            .id("dashboards-folder-header")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(px(26.0))
+                            .px(px(8.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.list_hover))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.dashboards_expanded = !this.dashboards_expanded;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        Icon::default()
+                                            .path(if self.dashboards_expanded {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
+                                            })
+                                            .xsmall()
+                                            .text_color(colors.muted_foreground),
+                                    )
+                                    .child(
+                                        Icon::default()
+                                            .path(if self.dashboards_expanded {
+                                                "icons/folder-open.svg"
+                                            } else {
+                                                "icons/folder-closed.svg"
+                                            })
+                                            .xsmall()
+                                            .text_color(colors.primary),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(colors.foreground)
+                                            .child("dashboards"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.0))
+                                    .rounded(px(8.0))
+                                    .bg(colors.border.opacity(0.3))
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted_foreground)
+                                    .child(self.modules.len().to_string()),
+                            ),
+                    )
+                    // Dashboards children container with indentation guide
+                    .when(self.dashboards_expanded, |el| {
                         el.child(
                             div()
-                                .text_sm()
-                                .text_color(colors.muted_foreground)
-                                .child("No saved presets yet."),
+                                .relative()
+                                .child(
+                                    // Subtle vertical tree hierarchy guide
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .bottom(px(0.0))
+                                        .left(px(15.0))
+                                        .w(px(1.0))
+                                        .bg(colors.border.opacity(0.4)),
+                                )
+                                .children(module_rows)
+                                .when(self.modules.is_empty(), |empty_el| {
+                                    empty_el.child(
+                                        div()
+                                            .pl(px(32.0))
+                                            .py(px(8.0))
+                                            .pr(px(12.0))
+                                            .text_xs()
+                                            .text_color(colors.muted_foreground.opacity(0.7))
+                                            .child("No dashboards found. Click + to create one."),
+                                    )
+                                }),
+                        )
+                    })
+                    // Section 2: Layout Presets Folder
+                    .child(
+                        div()
+                            .id("presets-folder-header")
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .h(px(26.0))
+                            .px(px(8.0))
+                            .mt(px(4.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(colors.list_hover))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.presets_expanded = !this.presets_expanded;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        Icon::default()
+                                            .path(if self.presets_expanded {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
+                                            })
+                                            .xsmall()
+                                            .text_color(colors.muted_foreground),
+                                    )
+                                    .child(
+                                        Icon::default()
+                                            .path(if self.presets_expanded {
+                                                "icons/folder-open.svg"
+                                            } else {
+                                                "icons/folder-closed.svg"
+                                            })
+                                            .xsmall()
+                                            .text_color(colors.muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(colors.foreground)
+                                            .child("presets"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.0))
+                                    .rounded(px(8.0))
+                                    .bg(colors.border.opacity(0.3))
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted_foreground)
+                                    .child(self.layout_presets.len().to_string()),
+                            ),
+                    )
+                    // Presets children container with indentation guide
+                    .when(self.presets_expanded, |el| {
+                        el.child(
+                            div()
+                                .relative()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.0))
+                                        .bottom(px(0.0))
+                                        .left(px(15.0))
+                                        .w(px(1.0))
+                                        .bg(colors.border.opacity(0.4)),
+                                )
+                                .children(preset_rows)
+                                .when(self.layout_presets.is_empty(), |empty_el| {
+                                    empty_el.child(
+                                        div()
+                                            .pl(px(32.0))
+                                            .py(px(8.0))
+                                            .pr(px(12.0))
+                                            .text_xs()
+                                            .text_color(colors.muted_foreground.opacity(0.7))
+                                            .child("No layout presets available."),
+                                    )
+                                }),
+                        )
+                    })
+                    // API Error notification banner if present
+                    .when_some(self.api_error.clone(), |el, error| {
+                        el.child(
+                            div()
+                                .m(px(10.0))
+                                .p(px(8.0))
+                                .rounded(px(4.0))
+                                .bg(colors.danger.opacity(0.1))
+                                .border_1()
+                                .border_color(colors.danger.opacity(0.3))
+                                .text_xs()
+                                .text_color(colors.danger)
+                                .child(error),
                         )
                     }),
+            )
+            // Footer status line
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .h(px(26.0))
+                    .px(px(10.0))
+                    .border_t_1()
+                    .border_color(colors.border.opacity(0.4))
+                    .text_size(px(10.0))
+                    .text_color(colors.muted_foreground)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(Icon::default().path("icons/hard-drive.svg").xsmall())
+                            .child(format!("{} items", self.modules.len())),
+                    )
+                    .child(
+                        Button::new("footer-new-dash")
+                            .label("+ New")
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|_this, _event, _window, cx| {
+                                cx.emit(DashboardManagerEvent::CreateDashboard("Untitled Dashboard".to_string()));
+                            })),
+                    ),
             )
     }
 }

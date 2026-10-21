@@ -106,6 +106,8 @@ struct CandleFeedInner {
     version: u64,
     /// Timestamp of candle currently owned/driven by the real-time ticker stream.
     live_ticker_candle_ts: Option<i64>,
+    /// Most recent live ticker price observed from tick_rx.
+    latest_ticker_price: Option<f64>,
 }
 
 impl CandleFeed {
@@ -122,6 +124,7 @@ impl CandleFeed {
             last_update_ms: 0,
             version: 0,
             live_ticker_candle_ts: None,
+            latest_ticker_price: None,
         }));
 
         let drain_inner = Arc::clone(&inner);
@@ -144,7 +147,8 @@ impl CandleFeed {
     pub fn prepend_history(&self, older_candles: &[OhlcvCandle]) {
         let mut inner = self.inner.lock().unwrap();
         let ticker_ts = inner.live_ticker_candle_ts;
-        if merge_candles(&mut inner.candles, older_candles, ticker_ts) {
+        let latest_price = inner.latest_ticker_price;
+        if merge_candles(&mut inner.candles, older_candles, ticker_ts, latest_price) {
             inner.version = inner.version.saturating_add(1);
         }
     }
@@ -278,7 +282,8 @@ async fn drain_loop(
 
                         let mut inner = buffer.lock().expect("CandleFeed mutex poisoned");
                         let ticker_ts = inner.live_ticker_candle_ts;
-                        if merge_candles(&mut inner.candles, &batch, ticker_ts) {
+                        let latest_price = inner.latest_ticker_price;
+                        if merge_candles(&mut inner.candles, &batch, ticker_ts, latest_price) {
                             inner.version = inner.version.saturating_add(1);
                             inner.last_update_ms = now_ms;
                         }
@@ -302,8 +307,8 @@ async fn drain_loop(
                     let price = tick.price;
                     if price > 0.0 && price.is_finite() {
                         let mut inner = buffer.lock().expect("CandleFeed mutex poisoned");
+                        inner.latest_ticker_price = Some(price);
                         
-                        // Use tick's timestamp instead of local wall clock!
                         let tick_ms = tick.timestamp_ms;
                         let current_bucket_ts = align_timestamp(tick_ms, interval_ms, &timeframe);
 
@@ -321,7 +326,13 @@ async fn drain_loop(
                             inner.live_ticker_candle_ts = Some(current_bucket_ts);
                             changed = true;
                         } else if let Some(last) = inner.candles.last_mut() {
-                            if last.timestamp == current_bucket_ts {
+                            let next_candle_ts = if timeframe == "1M" {
+                                align_timestamp(last.timestamp + 32 * 86_400_000, interval_ms, &timeframe)
+                            } else {
+                                last.timestamp + interval_ms
+                            };
+
+                            if last.timestamp == current_bucket_ts || tick_ms < next_candle_ts {
                                 let high = last.high.max(price);
                                 let low = last.low.min(price);
                                 changed = last.close != price || last.high != high || last.low != low;
@@ -330,42 +341,23 @@ async fn drain_loop(
                                     last.high = high;
                                     last.low = low;
                                 }
-                                inner.live_ticker_candle_ts = Some(current_bucket_ts);
-                            } else {
-                                let is_new_period = if timeframe == "1M" {
-                                    current_bucket_ts > last.timestamp
-                                } else {
-                                    current_bucket_ts > last.timestamp && tick_ms >= last.timestamp + interval_ms
+                                inner.live_ticker_candle_ts = Some(last.timestamp);
+                            } else if tick_ms >= next_candle_ts {
+                                let bucket = current_bucket_ts.max(next_candle_ts);
+                                let new_candle = OhlcvCandle {
+                                    timestamp: bucket,
+                                    open: last.close,
+                                    high: last.close.max(price),
+                                    low: last.close.min(price),
+                                    close: price,
+                                    volume: 0.0,
                                 };
-
-                                if is_new_period {
-                                    let new_candle = OhlcvCandle {
-                                        timestamp: current_bucket_ts,
-                                        open: last.close,
-                                        high: last.close.max(price),
-                                        low: last.close.min(price),
-                                        close: price,
-                                        volume: 0.0,
-                                    };
-                                    inner.candles.push(new_candle);
-                                    if inner.candles.len() > MAX_CANDLES {
-                                        inner.candles.remove(0);
-                                    }
-                                    inner.live_ticker_candle_ts = Some(current_bucket_ts);
-                                    changed = true;
-                                } else {
-                                    // Tick is within current candle duration or from older bucket;
-                                    // update the forming last candle so ticker price stays visible.
-                                    let high = last.high.max(price);
-                                    let low = last.low.min(price);
-                                    changed = last.close != price || last.high != high || last.low != low;
-                                    if changed {
-                                        last.close = price;
-                                        last.high = high;
-                                        last.low = low;
-                                    }
-                                    inner.live_ticker_candle_ts = Some(last.timestamp);
+                                inner.candles.push(new_candle);
+                                if inner.candles.len() > MAX_CANDLES {
+                                    inner.candles.remove(0);
                                 }
+                                inner.live_ticker_candle_ts = Some(bucket);
+                                changed = true;
                             }
                         }
                         if changed {
@@ -389,43 +381,66 @@ async fn drain_loop(
 /// - If a candle with the same timestamp exists, overwrite it (live update).
 /// - Otherwise insert in sorted order.
 ///
+/// For the latest forming candle, preserves real-time ticker close price and
+/// incorporates incoming volume and high/low ranges.
+///
 /// After merging, evict the oldest candles if the buffer exceeds `MAX_CANDLES`.
 fn merge_candles(
     buf: &mut Vec<OhlcvCandle>,
     incoming: &[OhlcvCandle],
     live_ticker_candle_ts: Option<i64>,
+    latest_ticker_price: Option<f64>,
 ) -> bool {
     let before = buf.clone();
     for candle in incoming {
-        // If a candle currently owned by the live ticker stream exists at this timestamp,
-        // do not let a lagging exchange snapshot overwrite the live ticker close/high/low,
-        // but backfill its true volume from the exchange kline.
+        let is_incoming_latest = buf.last().map(|last| candle.timestamp >= last.timestamp).unwrap_or(true);
+
         if let Some(live_ts) = live_ticker_candle_ts {
             if candle.timestamp == live_ts {
                 if let Ok(idx) = buf.binary_search_by_key(&candle.timestamp, |c| c.timestamp) {
                     let live_c = &mut buf[idx];
                     live_c.high = live_c.high.max(candle.high);
                     live_c.low = live_c.low.min(candle.low);
+                    if let Some(tp) = latest_ticker_price {
+                        live_c.close = tp;
+                        live_c.high = live_c.high.max(tp);
+                        live_c.low = live_c.low.min(tp);
+                    }
                     if candle.volume.is_finite() && candle.volume >= 0.0 {
                         live_c.volume = candle.volume;
                     }
                     continue;
                 }
-            } else if candle.timestamp > live_ts {
-                // If the exchange kline snapshot is newer than our live candle,
-                // the candle period has definitively rolled over on the exchange.
-                // Insert/upsert it normally.
             }
         }
 
         match buf.binary_search_by_key(&candle.timestamp, |c| c.timestamp) {
             Ok(idx) => {
-                // Preserve a no-op update so it cannot invalidate caches.
-                if buf[idx] != *candle {
+                let is_last_idx = idx + 1 == buf.len();
+                if is_last_idx && latest_ticker_price.is_some() {
+                    let tp = latest_ticker_price.unwrap();
+                    let live_c = &mut buf[idx];
+                    live_c.high = live_c.high.max(candle.high).max(tp);
+                    live_c.low = live_c.low.min(candle.low).min(tp);
+                    live_c.close = tp;
+                    if candle.volume.is_finite() && candle.volume >= 0.0 {
+                        live_c.volume = candle.volume;
+                    }
+                } else if buf[idx] != *candle {
                     buf[idx] = candle.clone();
                 }
             }
-            Err(idx) => buf.insert(idx, candle.clone()),
+            Err(idx) => {
+                let mut c = candle.clone();
+                if is_incoming_latest && idx == buf.len() {
+                    if let Some(tp) = latest_ticker_price {
+                        c.high = c.high.max(tp);
+                        c.low = c.low.min(tp);
+                        c.close = tp;
+                    }
+                }
+                buf.insert(idx, c);
+            }
         }
     }
 
@@ -480,7 +495,7 @@ mod tests {
     #[test]
     fn merge_inserts_sorted() {
         let mut buf = vec![candle(1000, 1.0), candle(3000, 3.0)];
-        merge_candles(&mut buf, &[candle(2000, 2.0)], None);
+        merge_candles(&mut buf, &[candle(2000, 2.0)], None, None);
         assert_eq!(buf.len(), 3);
         assert_eq!(buf[0].timestamp, 1000);
         assert_eq!(buf[1].timestamp, 2000);
@@ -491,7 +506,7 @@ mod tests {
     fn merge_upserts_existing() {
         let mut buf = vec![candle(1000, 1.0), candle(2000, 2.0)];
         // Update the forming candle at ts=2000 with a new close price.
-        merge_candles(&mut buf, &[candle(2000, 2.5)], None);
+        merge_candles(&mut buf, &[candle(2000, 2.5)], None, None);
         assert_eq!(buf.len(), 2);
         assert!((buf[1].close - 2.5).abs() < f64::EPSILON);
     }
@@ -502,7 +517,7 @@ mod tests {
             .map(|i| candle(i * 1000, i as f64))
             .collect();
         // Add one more — should evict the oldest.
-        merge_candles(&mut buf, &[candle(MAX_CANDLES as i64 * 1000, 999.0)], None);
+        merge_candles(&mut buf, &[candle(MAX_CANDLES as i64 * 1000, 999.0)], None, None);
         assert_eq!(buf.len(), MAX_CANDLES);
         // Oldest (ts=0) should be gone.
         assert_eq!(buf[0].timestamp, 1000);
@@ -525,9 +540,9 @@ mod tests {
             volume: 15.0, // newer/larger volume
         };
 
-        // If ts=2000 is marked as live_ticker_candle_ts, live price is not overwritten,
-        // but high/low bounds expand and volume updates.
-        merge_candles(&mut buf, &[lagging_kline], Some(2000));
+        // If ts=2000 is marked as live_ticker_candle_ts or latest_ticker_price is Some(2.8),
+        // live price is not overwritten, but high/low bounds expand and volume updates.
+        merge_candles(&mut buf, &[lagging_kline], Some(2000), Some(2.8));
         assert_eq!(buf.len(), 2);
         assert!((buf[1].close - 2.8).abs() < f64::EPSILON); // preserved!
         assert!((buf[1].high - 3.0).abs() < f64::EPSILON);
@@ -611,7 +626,7 @@ mod tests {
             volume: 12.5,
         };
 
-        merge_candles(&mut buf, &[kline], Some(2000));
+        merge_candles(&mut buf, &[kline], Some(2000), Some(2.8));
         assert_eq!(buf.len(), 2);
         // Preserves live ticker close and high
         assert!((buf[1].close - 2.8).abs() < f64::EPSILON);
@@ -686,5 +701,85 @@ mod tests {
         assert_eq!(live_candle2.high, 104.5);
         // True volume from kline is backfilled
         assert!((live_candle2.volume - 3.4).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_drain_loop_ticker_price_aligns_and_creates_new_period() {
+        let (rx_tx, rx) = broadcast::channel(16);
+        let (tick_tx, tick_rx) = broadcast::channel(16);
+
+        let feed = CandleFeed::new(rx, Some(tick_rx), Some("1m".to_string()));
+
+        // Initial historical candle at ts = 60_000
+        rx_tx
+            .send(Arc::new(vec![OhlcvCandle {
+                timestamp: 60_000,
+                open: 100.0,
+                high: 105.0,
+                low: 95.0,
+                close: 102.0,
+                volume: 8.5,
+            }]))
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Ticker tick arrives within current candle duration (ts = 80_000)
+        let tick1 = Arc::new(crate::data::tick::UnifiedTick::new(
+            "binance",
+            "BTC/USDT",
+            105.0,
+            0.0,
+            crate::data::tick::TradeSide::Unknown,
+            80_000,
+        ));
+        tick_tx.send(tick1).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let snap1 = feed.snapshot();
+        assert_eq!(snap1.len(), 1);
+        assert_eq!(snap1[0].timestamp, 60_000);
+        assert_eq!(snap1[0].close, 105.0);
+
+        // Next ticker tick crosses into next 1m period (ts = 125_000 >= 60_000 + 60_000)
+        let tick2 = Arc::new(crate::data::tick::UnifiedTick::new(
+            "binance",
+            "BTC/USDT",
+            106.5,
+            0.0,
+            crate::data::tick::TradeSide::Unknown,
+            125_000,
+        ));
+        tick_tx.send(tick2).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let snap2 = feed.snapshot();
+        assert_eq!(snap2.len(), 2);
+        assert_eq!(snap2[0].close, 105.0);
+        assert_eq!(snap2[1].timestamp, 120_000);
+        assert_eq!(snap2[1].open, 105.0);
+        assert_eq!(snap2[1].close, 106.5);
+
+        // Delayed exchange kline arrives for 120_000 with a lagging close (104.0)
+        rx_tx
+            .send(Arc::new(vec![OhlcvCandle {
+                timestamp: 120_000,
+                open: 105.0,
+                high: 107.0,
+                low: 103.0,
+                close: 104.0,
+                volume: 15.0,
+            }]))
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let snap3 = feed.snapshot();
+        assert_eq!(snap3.len(), 2);
+        // Live close remains synchronized with ticker (106.5), NOT lagging kline (104.0)
+        assert_eq!(snap3[1].close, 106.5);
+        // Bounds and volume merged
+        assert_eq!(snap3[1].high, 107.0);
+        assert_eq!(snap3[1].low, 103.0);
+        assert_eq!(snap3[1].volume, 15.0);
     }
 }

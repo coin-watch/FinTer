@@ -1,6 +1,6 @@
 use gpui::{
     div, px, Context, IntoElement, ParentElement, Render, Styled, Window,
-    SharedString, rgba
+    SharedString, rgba, prelude::FluentBuilder, Hsla
 };
 use gpui_component::theme::ActiveTheme;
 use serde::Deserialize;
@@ -27,7 +27,8 @@ pub struct FearGreedPanel {
     updated_at: Option<chrono::DateTime<chrono::Local>>,
     is_loading: bool,
     error: Option<SharedString>,
-    
+    width: f32,
+    height: f32,
 }
 
 impl FearGreedPanel {
@@ -38,11 +39,24 @@ impl FearGreedPanel {
             updated_at: None,
             is_loading: true,
             error: None,
-            
+            width: 300.0,
+            height: 200.0,
         };
 
         panel.fetch_data(cx);
         panel
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        if (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5 {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
     fn fetch_data(&mut self, cx: &mut Context<Self>) {
@@ -130,125 +144,198 @@ impl Render for FearGreedPanel {
         let classification = self.classification.as_ref().map(|s| s.as_ref()).unwrap_or("Unknown");
         let val_pct = (val / 100.0).clamp(0.0, 1.0);
 
-        div()
-            .size_full()
-            .bg(colors.background)
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .p(px(16.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_3xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(colors.foreground)
-                            .child(format!("{:.0}", val)),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(colors.muted_foreground)
-                            .child(classification.to_string()),
-                    ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .mt(px(24.))
-                    .px(px(24.))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(16.))
-                            .child(
-                                // Track
+        let sentiment_color: Hsla = if val < 25.0 {
+            gpui::rgba(0xe85d38ff).into()
+        } else if val < 45.0 {
+            gpui::rgba(0xf18545ff).into()
+        } else if val < 55.0 {
+            gpui::rgba(0x9ca3afff).into()
+        } else if val < 75.0 {
+            gpui::rgba(0x8bc34aff).into()
+        } else {
+            gpui::rgba(0x28a745ff).into()
+        };
+
+        let render_gauge_track = |h_track: f32, h_thumb: f32| {
+            div()
+                .relative()
+                .w_full()
+                .h(px(h_thumb))
+                .child(
+                    // Track
+                    div()
+                        .absolute()
+                        .top(px((h_thumb - h_track) / 2.0))
+                        .w_full()
+                        .h(px(h_track))
+                        .flex()
+                        .rounded_full()
+                        .overflow_hidden()
+                        .child(div().w(gpui::relative(0.25)).h_full().bg(gpui::rgba(0xe85d38ff)))
+                        .child(div().w(gpui::relative(0.20)).h_full().bg(gpui::rgba(0xf18545ff)))
+                        .child(div().w(gpui::relative(0.10)).h_full().bg(gpui::rgba(0x9ca3afff)))
+                        .child(div().w(gpui::relative(0.20)).h_full().bg(gpui::rgba(0x8bc34aff)))
+                        .child(div().w(gpui::relative(0.25)).h_full().bg(gpui::rgba(0x28a745ff))),
+                )
+                .child(
+                    // Thumb
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(gpui::relative(val_pct))
+                        .ml(px(-4.))
+                        .w(px(8.))
+                        .h(px(h_thumb))
+                        .bg(gpui::white())
+                        .border_1()
+                        .border_color(gpui::rgba(0x00000044))
+                        .rounded_sm()
+                        .shadow_md(),
+                )
+        };
+
+        let is_horizontal = self.height < 140.0 || (self.width >= 320.0 && self.height < 190.0);
+
+        if is_horizontal {
+            let score_size = (self.height * 0.32).clamp(24.0, 42.0);
+            gpui_component::h_flex()
+                .size_full()
+                .bg(colors.background)
+                .items_center()
+                .px(px(14.0))
+                .gap(px(14.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .w(px(90.0))
+                        .child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(score_size))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(sentiment_color)
+                                .child(format!("{:.0}", val)),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.5))
+                                .rounded_sm()
+                                .bg(sentiment_color.opacity(0.15))
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(sentiment_color)
+                                .child(classification.to_uppercase()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .child(render_gauge_track(8.0, 16.0))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .w_full()
+                                .text_size(px(9.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(div().text_color(gpui::rgba(0xe85d38ff)).child("Ext. Fear"))
+                                .child(div().text_color(gpui::rgba(0x9ca3afff)).child("Neutral"))
+                                .child(div().text_color(gpui::rgba(0x28a745ff)).child("Ext. Greed")),
+                        )
+                        .when_some(self.updated_at, |this, dt| {
+                            this.child(
                                 div()
-                                    .absolute()
-                                    .top(px(4.))
-                                    .w_full()
-                                    .h(px(8.))
-                                    .flex()
-                                    .rounded_full()
-                                    .overflow_hidden()
-                                    // 5 distinct FNG segments mapped to exact width percentages
-                                    .child(div().w(gpui::relative(0.25)).h_full().bg(gpui::rgba(0xe85d38ff))) // Extreme Fear (0-25)
-                                    .child(div().w(gpui::relative(0.20)).h_full().bg(gpui::rgba(0xf18545ff))) // Fear (25-45)
-                                    .child(div().w(gpui::relative(0.10)).h_full().bg(gpui::rgba(0x9ca3afff))) // Neutral (45-55)
-                                    .child(div().w(gpui::relative(0.20)).h_full().bg(gpui::rgba(0x8bc34aff))) // Greed (55-75)
-                                    .child(div().w(gpui::relative(0.25)).h_full().bg(gpui::rgba(0x28a745ff))), // Extreme Greed (75-100)
+                                    .text_color(colors.muted_foreground)
+                                    .text_size(px(9.0))
+                                    .child(format!("Updated {}", dt.format("%b %-d, %I:%M %p"))),
                             )
-                            .child(
-                                // Thumb
-                                div()
-                                    .absolute()
-                                    .top(px(0.))
-                                    .left(gpui::relative(val_pct))
-                                    .ml(px(-4.))
-                                    .w(px(8.))
-                                    .h(px(16.))
-                                    .bg(gpui::white())
-                                    .border_1()
-                                    .border_color(gpui::rgba(0x00000044))
-                                    .rounded_sm()
-                                    .shadow_md(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_between()
-                            .w_full()
-                            .mt(px(8.))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(gpui::rgba(0xe85d38ff))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Ext. Fear"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(gpui::rgba(0x9ca3afff))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Neutral"),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(gpui::rgba(0x28a745ff))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("Ext. Greed"),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(6.))
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_color(colors.muted_foreground)
-                            .text_size(px(10.))
-                            .child(if let Some(dt) = self.updated_at {
-                                format!("Updated {}", dt.format("%b %-d, %I:%M %p"))
-                            } else {
-                                "".to_string()
-                            })
-                    )
-            )
-            .into_any_element()
+                        }),
+                )
+                .into_any_element()
+        } else {
+            let val_size = (self.width * 0.16).min(self.height * 0.24).clamp(26.0, 54.0);
+            let class_size = (val_size * 0.30).clamp(10.0, 13.0);
+            let track_margin = (self.height * 0.06).clamp(8.0, 18.0);
+            let pad = (self.width * 0.06).min(self.height * 0.06).clamp(8.0, 20.0);
+
+            div()
+                .size_full()
+                .bg(colors.background)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .p(px(pad))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(px(val_size))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(sentiment_color)
+                                .child(format!("{:.0}", val)),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded_sm()
+                                .bg(sentiment_color.opacity(0.14))
+                                .text_size(px(class_size))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(sentiment_color)
+                                .child(classification.to_uppercase()),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(320.0))
+                        .mt(px(track_margin))
+                        .flex()
+                        .flex_col()
+                        .child(render_gauge_track(8.0, 16.0))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .w_full()
+                                .mt(px(6.0))
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(div().text_color(gpui::rgba(0xe85d38ff)).child("Ext. Fear"))
+                                .child(div().text_color(gpui::rgba(0x9ca3afff)).child("Neutral"))
+                                .child(div().text_color(gpui::rgba(0x28a745ff)).child("Ext. Greed")),
+                        ),
+                )
+                .when_some(self.updated_at, |this, dt| {
+                    if self.height >= 170.0 {
+                        this.child(
+                            div()
+                                .mt(px(track_margin * 0.8))
+                                .text_color(colors.muted_foreground)
+                                .text_size(px(10.0))
+                                .child(format!("Updated {}", dt.format("%b %-d, %I:%M %p"))),
+                        )
+                    } else {
+                        this
+                    }
+                })
+                .into_any_element()
+        }
     }
 }

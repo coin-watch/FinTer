@@ -48,12 +48,52 @@ pub struct AuthStatusResponse {
 // Exchange / CCXT models
 // ──────────────────────────────────────────────
 
-/// An exchange as returned by GET /api/exchanges.
+fn default_true() -> bool {
+    true
+}
+
+fn default_spot() -> String {
+    "spot".to_string()
+}
+
+/// An exchange as returned by GET /api/exchanges or /api/v1/exchanges.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExchangeInfo {
     pub id: String,
+    #[serde(default)]
     pub value: String,
+    #[serde(default)]
     pub label: String,
+}
+
+impl ExchangeInfo {
+    pub fn new(id: impl Into<String>, value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+
+    pub fn from_id(id: impl Into<String>) -> Self {
+        let id_str = id.into();
+        let label = id_str.to_uppercase();
+        Self {
+            id: id_str.clone(),
+            value: id_str,
+            label,
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if self.value.is_empty() {
+            self.value = self.id.clone();
+        }
+        if self.label.is_empty() {
+            self.label = self.id.to_uppercase();
+        }
+        self
+    }
 }
 
 /// A market type as returned by GET /api/exchanges/{id}/markets.
@@ -69,18 +109,58 @@ pub struct MarketInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SymbolInfo {
     pub symbol: String,
+    #[serde(default)]
     pub base: String,
+    #[serde(default)]
     pub quote: String,
-    #[serde(rename = "baseAsset")]
+    #[serde(rename = "baseAsset", default)]
     pub base_asset: Option<String>,
-    #[serde(rename = "quoteAsset")]
+    #[serde(rename = "quoteAsset", default)]
     pub quote_asset: Option<String>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_spot")]
     pub symbol_type: String,
+    #[serde(default = "default_true")]
     pub active: bool,
     /// Precision for price (number of decimal places)
     #[serde(default)]
     pub precision: Option<PrecisionInfo>,
+}
+
+impl SymbolInfo {
+    pub fn from_symbol(symbol: impl Into<String>) -> Self {
+        let sym_str = symbol.into();
+        let mut parts = sym_str.split('/');
+        let base = parts.next().unwrap_or(&sym_str).to_string();
+        let quote = parts.next().unwrap_or("").to_string();
+        Self {
+            symbol: sym_str,
+            base,
+            quote,
+            base_asset: None,
+            quote_asset: None,
+            symbol_type: "spot".to_string(),
+            active: true,
+            precision: None,
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if self.base.is_empty() || self.quote.is_empty() {
+            let mut parts = self.symbol.split('/');
+            if self.base.is_empty() {
+                self.base = parts.next().unwrap_or(&self.symbol).to_string();
+            } else {
+                let _ = parts.next();
+            }
+            if self.quote.is_empty() {
+                self.quote = parts.next().unwrap_or("").to_string();
+            }
+        }
+        if self.symbol_type.is_empty() {
+            self.symbol_type = "spot".to_string();
+        }
+        self
+    }
 }
 
 /// Price and amount precision information from exchange markets

@@ -4,7 +4,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui::StyledImage;
 use gpui_component::{Selectable, Sizable};
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::theme::ActiveTheme;
 use gpui_component::popover::Popover;
@@ -41,6 +40,35 @@ pub struct OrderBookViewState {
     pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
 }
 
+pub struct DepthViewState {
+    pub exchange: String,
+    pub symbol: String,
+    pub entity: Entity<crate::components::ui::depth_panel::DepthPanel>,
+    pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
+}
+
+pub struct TapeViewState {
+    pub exchange: String,
+    pub symbol: String,
+    pub entity: Entity<crate::components::ui::tape_panel::TapePanel>,
+    pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
+}
+
+pub struct ExecutionViewState {
+    pub exchange: String,
+    pub symbol: String,
+    pub entity: Entity<crate::components::ui::execution_panel::ExecutionPanel>,
+    pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
+}
+
+pub struct WatchlistViewState {
+    pub entity: Entity<crate::components::ui::watchlist_panel::WatchlistPanel>,
+}
+
+pub struct MarketCapViewState {
+    pub entity: Entity<crate::components::ui::market_cap_panel::MarketCapPanel>,
+}
+
 pub struct NewsfeedViewState {
     pub priority: String,
     pub filter: String,
@@ -62,10 +90,18 @@ pub struct PaneGridRenderer {
     pub chart_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ChartViewState>>>,
     pub ticker_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, TickerViewState>>>,
     pub orderbook_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, OrderBookViewState>>>,
+    pub depth_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, DepthViewState>>>,
+    pub tape_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, TapeViewState>>>,
+    pub execution_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ExecutionViewState>>>,
+    pub positions_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gpui::Entity<crate::components::ui::positions_panel::PositionsPanel>>>>,
+    pub watchlist_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, WatchlistViewState>>>,
+    pub market_cap_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, MarketCapViewState>>>,
     pub newsfeed_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, NewsfeedViewState>>>,
     pub clock_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ClockViewState>>>,
     pub fear_greed_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, FearGreedViewState>>>,
     pub timezone: String,
+    /// Global setting; individual panels cannot bypass it.
+    pub sound_alerts_enabled: bool,
 }
 
 pub struct FearGreedViewState {
@@ -252,6 +288,30 @@ fn symbol_choices(exchange: &str) -> Vec<String> {
     .collect()
 }
 
+fn symbol_choices_for_menu(exchange: &str, current_symbol: &str) -> Vec<String> {
+    let all = symbol_choices(exchange);
+    if all.len() <= 60 {
+        return all;
+    }
+    let mut result = Vec::with_capacity(60);
+    if !current_symbol.is_empty() {
+        if let Some(pos) = all.iter().position(|s| s.eq_ignore_ascii_case(current_symbol)) {
+            result.push(all[pos].clone());
+        } else {
+            result.push(current_symbol.to_string());
+        }
+    }
+    for s in &all {
+        if result.len() >= 60 {
+            break;
+        }
+        if !result.iter().any(|existing| existing.eq_ignore_ascii_case(s)) {
+            result.push(s.clone());
+        }
+    }
+    result
+}
+
 fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
     match value {
         "candle_stroke" => gpui_component::chart::CandleType::Stroke,
@@ -260,7 +320,8 @@ fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
         "ohlc" => gpui_component::chart::CandleType::Ohlc,
         "area" => gpui_component::chart::CandleType::Area,
         "heikin_ashi" => gpui_component::chart::CandleType::HeikinAshi,
-        "candle_solid" | _ => gpui_component::chart::CandleType::Solid,
+        "candle_solid" => gpui_component::chart::CandleType::Solid,
+        _ => gpui_component::chart::CandleType::Solid,
     }
 }
 
@@ -538,26 +599,374 @@ impl PaneGridRenderer {
             chart_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             ticker_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             orderbook_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            depth_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            tape_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            execution_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            positions_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            watchlist_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            market_cap_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             newsfeed_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             clock_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             fear_greed_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             timezone: "UTC".into(),
+            sound_alerts_enabled: true,
         }
     }
 
     pub fn set_tree(&mut self, tree: PaneNode, cx: &mut Context<Self>) {
+        fn collect_modules(node: &PaneNode, modules: &mut std::collections::HashMap<String, String>) {
+            match node {
+                PaneNode::Pane { id, data } => {
+                    modules.insert(
+                        id.clone(),
+                        data.module_type.as_deref().unwrap_or("empty").to_lowercase(),
+                    );
+                }
+                PaneNode::Split { a, b, .. } => {
+                    collect_modules(a, modules);
+                    collect_modules(b, modules);
+                }
+            }
+        }
+
+        let mut modules = std::collections::HashMap::new();
+        collect_modules(&tree, &mut modules);
+
+        // Releasing a cached state drops its panel and bridge. Bridge::drop cancels
+        // the WebSocket supervisor, while MarketCapPanel::drop cancels its syncer.
+        self.chart_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "chart"));
+        self.ticker_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "ticker"));
+        self.orderbook_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "orderbook"));
+        self.depth_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "depth"));
+        self.tape_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "trades" || m == "tape"));
+        self.watchlist_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "watchlist"));
+        self.market_cap_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "marketcap"));
+        self.newsfeed_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "newsfeed"));
+        self.clock_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "time" || m == "clock"));
+        self.fear_greed_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "feargreed"));
+
+        self.positions_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "positions"));
+        self.execution_views.borrow_mut().retain(|id, state| {
+            fn matches_config(node: &PaneNode, id: &str, state: &ExecutionViewState) -> bool {
+                match node {
+                    PaneNode::Pane { id: pane_id, data } if pane_id == id => {
+                        let config = data.config.as_object();
+                        matches!(data.module_type.as_deref().unwrap_or("").to_lowercase().as_str(), "execution" | "tradedesk")
+                            && config_str(config, "exchange", "binance") == state.exchange
+                            && config_str(config, "symbol", "BTC/USDT") == state.symbol
+                    }
+                    PaneNode::Split { a, b, .. } => matches_config(a, id, state) || matches_config(b, id, state),
+                    _ => false,
+                }
+            }
+            matches_config(&tree, id, state)
+        });
         self.tree = Some(tree);
         cx.notify();
     }
 
+    fn render_placeholder_selector(
+        &self,
+        pane_id: &str,
+        width: f32,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let colors = &theme.colors;
+
+        let modules: [(&str, &str, &str, &str); 12] = [
+            ("chart", "Chart", "Candlestick & technical indicators", "icons/chart-candlestick.svg"),
+            ("ticker", "Ticker", "Live price, stats & sparkline", "icons/trending-up.svg"),
+            ("orderbook", "Order Book", "Level 2 market depth & ladder", "icons/sort-descending.svg"),
+            ("depth", "Depth", "Stepped cumulative market depth curve", "icons/sort-descending.svg"),
+            ("trades", "Trades / Tape", "Real-time executed market tape", "icons/trending-up.svg"),
+            ("positions", "Positions", "Open positions and unrealized P&L", "icons/crosshair.svg"),
+            ("execution", "Trade Desk", "Read-only order ticket preview", "icons/crosshair.svg"),
+            ("watchlist", "Watchlist", "Multi-symbol real-time price tracker", "icons/star.svg"),
+            ("marketcap", "Market Cap", "Crypto capitalization heatmap & table", "icons/chart-pie.svg"),
+            ("newsfeed", "Newsfeed", "Real-time crypto & market news", "icons/message-square.svg"),
+            ("time", "Clock", "Multi-timezone market clocks", "icons/globe.svg"),
+            ("feargreed", "Fear & Greed", "Crypto market sentiment index", "icons/chart-pie.svg"),
+        ];
+
+        let is_spacious = width >= 380.0 && height >= 220.0;
+        let is_compact = !is_spacious && (width >= 240.0 && height >= 140.0);
+
+        if is_spacious {
+            let use_3_cols = width >= 540.0;
+            let rows: Vec<Vec<(&str, &str, &str, &str)>> = if use_3_cols {
+                modules.chunks(3).map(|c| c.to_vec()).collect()
+            } else {
+                modules.chunks(2).map(|c| c.to_vec()).collect()
+            };
+
+            let mut grid_div = div().flex().flex_col().gap(px(8.0)).w_full().max_w(px(580.0));
+
+            for row in rows {
+                let mut row_div = div().flex().flex_row().gap(px(8.0)).w_full();
+                for (mod_id, label, desc, icon_path) in row {
+                    let target_pane_id = pane_id.to_string();
+                    let mod_id_str = mod_id.to_string();
+                    let card = div()
+                        .id(ElementId::Name(format!("placeholder-card-{pane_id}-{mod_id}").into()))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .p(px(10.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.muted.opacity(0.2))
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(colors.primary).bg(colors.muted.opacity(0.55)))
+                        .on_mouse_down(MouseButton::Left, cx.listener({
+                            let target_pane_id = target_pane_id.clone();
+                            let mod_id_str = mod_id_str.clone();
+                            move |_this, _event, window, cx| {
+                                let target_pane_id = target_pane_id.clone();
+                                let mod_id_str = mod_id_str.clone();
+                                window.defer(cx, move |_win, cx| {
+                                    cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                        let _ = global.view.update(cx, |view, cx| {
+                                            view.handle_pane_event(
+                                                &PaneGridEvent::SetModuleType {
+                                                    pane_id: target_pane_id,
+                                                    module_type: mod_id_str,
+                                                },
+                                                cx,
+                                            );
+                                        });
+                                    });
+                                });
+                            }
+                        }))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(32.0))
+                                .h(px(32.0))
+                                .rounded_sm()
+                                .bg(colors.primary.opacity(0.12))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    gpui_component::Icon::default()
+                                        .path(icon_path)
+                                        .size(px(16.0))
+                                        .text_color(colors.primary)
+                                )
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.0))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(colors.foreground)
+                                        .child(label)
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(colors.muted_foreground)
+                                        .truncate()
+                                        .child(desc)
+                                )
+                        );
+                    row_div = row_div.child(card);
+                }
+                grid_div = grid_div.child(row_div);
+            }
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .p(px(16.0))
+                .bg(colors.background)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.0))
+                        .mb(px(14.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.5))
+                                .rounded_sm()
+                                .bg(colors.primary.opacity(0.12))
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(colors.primary)
+                                .child("EMPTY WORKSPACE PANE")
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.foreground)
+                                .child("Select a module to display")
+                        )
+                )
+                .child(grid_div)
+                .into_any_element()
+        } else if is_compact {
+            let use_2_cols = width >= 280.0;
+            let rows: Vec<Vec<(&str, &str, &str, &str)>> = if use_2_cols {
+                modules.chunks(2).map(|c| c.to_vec()).collect()
+            } else {
+                modules.iter().map(|&m| vec![m]).collect()
+            };
+
+            let mut list_div = div().flex().flex_col().gap(px(4.0)).w_full().max_w(px(380.0));
+
+            for row in rows {
+                let mut row_div = div().flex().flex_row().gap(px(4.0)).w_full();
+                for (mod_id, label, _, icon_path) in row {
+                    let target_pane_id = pane_id.to_string();
+                    let mod_id_str = mod_id.to_string();
+                    let item = div()
+                        .id(ElementId::Name(format!("compact-pick-{pane_id}-{mod_id}").into()))
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.muted.opacity(0.2))
+                        .cursor_pointer()
+                        .hover(|s| s.border_color(colors.primary).bg(colors.muted.opacity(0.5)))
+                        .on_mouse_down(MouseButton::Left, cx.listener({
+                            let target_pane_id = target_pane_id.clone();
+                            let mod_id_str = mod_id_str.clone();
+                            move |_this, _event, window, cx| {
+                                let target_pane_id = target_pane_id.clone();
+                                let mod_id_str = mod_id_str.clone();
+                                window.defer(cx, move |_win, cx| {
+                                    cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                        let _ = global.view.update(cx, |view, cx| {
+                                            view.handle_pane_event(
+                                                &PaneGridEvent::SetModuleType {
+                                                    pane_id: target_pane_id,
+                                                    module_type: mod_id_str,
+                                                },
+                                                cx,
+                                            );
+                                        });
+                                    });
+                                });
+                            }
+                        }))
+                        .child(
+                            gpui_component::Icon::default()
+                                .path(icon_path)
+                                .size(px(13.0))
+                                .text_color(colors.primary)
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(colors.foreground)
+                                .truncate()
+                                .child(label)
+                        );
+                    row_div = row_div.child(item);
+                }
+                list_div = list_div.child(row_div);
+            }
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .p(px(8.0))
+                .bg(colors.background)
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(colors.muted_foreground)
+                        .mb(px(6.0))
+                        .child("Select Module")
+                )
+                .child(list_div)
+                .into_any_element()
+        } else {
+            let target_pane_id = pane_id.to_string();
+            let btn = Button::new(ElementId::Name(format!("mini-pick-btn-{pane_id}").into()))
+                .label("Select Module")
+                .xsmall()
+                .ghost()
+                .dropdown_caret(true)
+                .dropdown_menu_with_anchor(Corner::BottomLeft, move |mut menu, _window, _cx| {
+                    for (mod_id, label, _, _) in modules {
+                        let target_pane_id = target_pane_id.clone();
+                        let mod_id_str = mod_id.to_string();
+                        menu = menu.item(
+                            gpui_component::menu::PopupMenuItem::new(label)
+                                .on_click(move |_event, window, cx| {
+                                    let target_pane_id = target_pane_id.clone();
+                                    let mod_id_str = mod_id_str.clone();
+                                    window.defer(cx, move |_window, cx| {
+                                        cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                            let _ = global.view.update(cx, |view, cx| {
+                                                view.handle_pane_event(
+                                                    &PaneGridEvent::SetModuleType {
+                                                        pane_id: target_pane_id,
+                                                        module_type: mod_id_str,
+                                                    },
+                                                    cx,
+                                                );
+                                            });
+                                        });
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                });
+
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(4.0))
+                .bg(colors.background)
+                .child(btn)
+                .into_any_element()
+        }
+    }
 
     fn render_node(&self, node: &PaneNode, current_size: gpui::Size<f32>, cx: &mut Context<Self>) -> gpui::AnyElement {
         match node {
             PaneNode::Pane { id, data } => {
                 let theme = cx.theme().clone();
                 let module_type = data.module_type.as_deref().unwrap_or("Empty");
+                let content_w = (current_size.width - 8.0).max(10.0);
+                let content_h = (current_size.height - 8.0 - 33.0).max(10.0);
 
-                let is_empty = module_type == "Empty" || module_type.is_empty();
+                let is_empty = module_type.eq_ignore_ascii_case("empty") || module_type.is_empty();
                 let pane_id = id.clone();
                 let split_h_id = pane_id.clone();
                 let split_v_id = pane_id.clone();
@@ -597,11 +1006,17 @@ impl PaneGridRenderer {
 
                 let is_market_module = matches!(
                     module_type.to_lowercase().as_str(),
-                    "chart" | "ticker" | "orderbook" | "depth"
+                    "chart" | "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk"
                 );
+                if is_market_module {
+                    crate::data::gateway_registry::GatewayRegistry::global()
+                        .prefetch_symbols(&current_exchange);
+                }
                 let suffix = match module_type.to_lowercase().as_str() {
                     "orderbook" => Some("OB"),
                     "depth" => Some("DEPTH"),
+                    "trades" | "tape" => Some("TRADES"),
+                    "execution" | "tradedesk" => Some("DESK"),
                     _ => None,
                 };
 
@@ -673,7 +1088,13 @@ impl PaneGridRenderer {
                                     let drag_content = match module_type.to_lowercase().as_str() {
                                         "chart" => self.chart_views.borrow().get(&pane_id).map(|s| DragContent::Chart(s.entity.clone())),
                                         "ticker" => self.ticker_views.borrow().get(&pane_id).map(|s| DragContent::Ticker(s.entity.clone())),
-                                        "orderbook" | "depth" => self.orderbook_views.borrow().get(&pane_id).map(|s| DragContent::Orderbook(s.entity.clone())),
+                                        "orderbook" => self.orderbook_views.borrow().get(&pane_id).map(|s| DragContent::Orderbook(s.entity.clone())),
+                                        "depth" => self.depth_views.borrow().get(&pane_id).map(|s| DragContent::Depth(s.entity.clone())),
+                                        "trades" | "tape" => self.tape_views.borrow().get(&pane_id).map(|s| DragContent::Tape(s.entity.clone())),
+                                        "execution" | "tradedesk" => self.execution_views.borrow().get(&pane_id).map(|s| DragContent::Execution(s.entity.clone())),
+                                        "positions" => self.positions_views.borrow().get(&pane_id).map(|s| DragContent::Positions(s.clone())),
+                                        "watchlist" => self.watchlist_views.borrow().get(&pane_id).map(|s| DragContent::Watchlist(s.entity.clone())),
+                                        "marketcap" => self.market_cap_views.borrow().get(&pane_id).map(|s| DragContent::MarketCap(s.entity.clone())),
                                         "newsfeed" => self.newsfeed_views.borrow().get(&pane_id).map(|s| DragContent::Newsfeed(s.entity.clone())),
                                         "time" | "clock" => self.clock_views.borrow().get(&pane_id).map(|s| DragContent::Clock(s.entity.clone())),
                                         "feargreed" => self.fear_greed_views.borrow().get(&pane_id).map(|s| DragContent::FearGreed(s.entity.clone())),
@@ -749,8 +1170,12 @@ impl PaneGridRenderer {
                                                         current_timezone.replace('/', ", ").replace('_', " ")
                                                     } else if module_type.to_lowercase() == "marketcap" {
                                                         "Market Cap".to_string()
+                                                    } else if module_type.to_lowercase() == "watchlist" {
+                                                        "Watchlist".to_string()
                                                     } else if module_type.to_lowercase() == "feargreed" {
                                                         "Fear & Greed Index".to_string()
+                                                    } else if module_type.to_lowercase() == "positions" {
+                                                        "Positions".to_string()
                                                     } else {
                                                         module_type.to_string()
                                                     },
@@ -766,143 +1191,214 @@ impl PaneGridRenderer {
                                                 .bg(theme.colors.border.opacity(0.6))
                                                 .mx(px(2.0)),
                                         );
-                                        let common_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"];
-                                        let extra_timeframes = [
-                                            "1s", "3m", "30m", "2h", "6h", "8h", "12h", "1w", "1M",
-                                        ];
                                         let current_timeframe = chart_timeframe.clone();
-                                        let pane_id = pane_id.clone();
-                                        let mut controls = gpui_component::h_flex()
-                                            .flex_shrink_0()
-                                            .gap(px(1.0))
-                                            .items_center();
+                                        let all_timeframes = [
+                                            "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w", "1M",
+                                        ];
 
-                                        for timeframe in common_timeframes {
+                                        if current_size.width < 340.0 {
                                             let pane_id = pane_id.clone();
-                                            let selected = current_timeframe == timeframe;
-                                            controls = controls.child(
-                                                Button::new(ElementId::Name(
-                                                    format!("timeframe-{pane_id}-{timeframe}").into(),
-                                                ))
-                                                .label(timeframe)
-                                                .xsmall()
-                                                .ghost()
-                                                .selected(selected)
-                                                .when(selected, |button| {
-                                                    if is_active {
-                                                        button
-                                                            .bg(theme.colors.background)
-                                                            .text_color(theme.colors.primary)
-                                                            .font_weight(gpui::FontWeight::BOLD)
-                                                    } else {
-                                                        button
-                                                            .bg(theme.colors.primary)
-                                                            .text_color(theme.colors.primary_foreground)
-                                                            .font_weight(gpui::FontWeight::BOLD)
-                                                    }
-                                                })
-                                                .when(!selected && is_active, |button| {
-                                                    button.text_color(title_fg.opacity(0.8))
-                                                })
-                                                .on_click(move |_event, window, cx| {
-                                                    let pane_id = pane_id.clone();
-                                                    let timeframe = timeframe.to_string();
-                                                    window.defer(cx, move |_window, cx| {
-                                                        let mut config = serde_json::Map::new();
-                                                        config.insert(
-                                                            "interval".to_string(),
-                                                            serde_json::Value::String(timeframe),
-                                                        );
-                                                        cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
-                                                            let _ = global.view.update(cx, |view, cx| {
-                                                                view.handle_pane_event(
-                                                                    &PaneGridEvent::UpdateModuleConfig {
-                                                                        pane_id,
-                                                                        config: serde_json::Value::Object(config),
-                                                                    },
-                                                                    cx,
-                                                                );
+                                            let current_tf = current_timeframe.clone();
+                                            this.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .child(
+                                                        Button::new(ElementId::Name(format!("timeframe-dropdown-{pane_id}").into()))
+                                                            .label(current_timeframe)
+                                                            .xsmall()
+                                                            .ghost()
+                                                            .selected(true)
+                                                            .when(is_active, |button| {
+                                                                button
+                                                                    .bg(theme.colors.background)
+                                                                    .text_color(theme.colors.primary)
+                                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                            })
+                                                            .when(!is_active, |button| {
+                                                                button
+                                                                    .bg(theme.colors.primary)
+                                                                    .text_color(theme.colors.primary_foreground)
+                                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                            })
+                                                            .dropdown_caret(true)
+                                                            .dropdown_menu_with_anchor(Corner::BottomLeft, move |mut menu, _window, _cx| {
+                                                                for tf in all_timeframes {
+                                                                    let pane_id = pane_id.clone();
+                                                                    let selected = current_tf == tf;
+                                                                    menu = menu.item(
+                                                                        gpui_component::menu::PopupMenuItem::new(tf)
+                                                                            .checked(selected)
+                                                                            .on_click(move |_event, window, cx| {
+                                                                                let pane_id = pane_id.clone();
+                                                                                let tf_str = tf.to_string();
+                                                                                window.defer(cx, move |_window, cx| {
+                                                                                    let mut config = serde_json::Map::new();
+                                                                                    config.insert("interval".to_string(), serde_json::Value::String(tf_str));
+                                                                                    cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                                                                        let _ = global.view.update(cx, |view, cx| {
+                                                                                            view.handle_pane_event(
+                                                                                                &PaneGridEvent::UpdateModuleConfig {
+                                                                                                    pane_id,
+                                                                                                    config: serde_json::Value::Object(config),
+                                                                                                },
+                                                                                                cx,
+                                                                                            );
+                                                                                        });
+                                                                                    });
+                                                                                });
+                                                                            }),
+                                                                    );
+                                                                }
+                                                                menu
+                                                            }),
+                                                    )
+                                            )
+                                        } else {
+                                            let common_timeframes: &[&str] = if current_size.width < 500.0 {
+                                                &["1m", "15m", "1h", "1d"]
+                                            } else {
+                                                &["1m", "5m", "15m", "1h", "4h", "1d"]
+                                            };
+                                            let extra_timeframes: Vec<&str> = all_timeframes
+                                                .iter()
+                                                .copied()
+                                                .filter(|tf| !common_timeframes.contains(tf))
+                                                .collect();
+
+                                            let pane_id = pane_id.clone();
+                                            let mut controls = gpui_component::h_flex()
+                                                .flex_shrink_0()
+                                                .gap(px(1.0))
+                                                .items_center();
+
+                                            for timeframe in common_timeframes {
+                                                let pane_id = pane_id.clone();
+                                                let selected = current_timeframe == *timeframe;
+                                                controls = controls.child(
+                                                    Button::new(ElementId::Name(
+                                                        format!("timeframe-{pane_id}-{timeframe}").into(),
+                                                    ))
+                                                    .label(*timeframe)
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .selected(selected)
+                                                    .when(selected, |button| {
+                                                        if is_active {
+                                                            button
+                                                                .bg(theme.colors.background)
+                                                                .text_color(theme.colors.primary)
+                                                                .font_weight(gpui::FontWeight::BOLD)
+                                                        } else {
+                                                            button
+                                                                .bg(theme.colors.primary)
+                                                                .text_color(theme.colors.primary_foreground)
+                                                                .font_weight(gpui::FontWeight::BOLD)
+                                                        }
+                                                    })
+                                                    .when(!selected && is_active, |button| {
+                                                        button.text_color(title_fg.opacity(0.8))
+                                                    })
+                                                    .on_click(move |_event, window, cx| {
+                                                        let pane_id = pane_id.clone();
+                                                        let timeframe = timeframe.to_string();
+                                                        window.defer(cx, move |_window, cx| {
+                                                            let mut config = serde_json::Map::new();
+                                                            config.insert(
+                                                                "interval".to_string(),
+                                                                serde_json::Value::String(timeframe),
+                                                            );
+                                                            cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                                                let _ = global.view.update(cx, |view, cx| {
+                                                                    view.handle_pane_event(
+                                                                        &PaneGridEvent::UpdateModuleConfig {
+                                                                            pane_id,
+                                                                            config: serde_json::Value::Object(config),
+                                                                        },
+                                                                        cx,
+                                                                    );
+                                                                });
                                                             });
                                                         });
-                                                    });
-                                                }),
-                                            );
-                                        }
+                                                    }),
+                                                );
+                                            }
 
-                                        let pane_id = pane_id.clone();
-                                        let is_extra_selected = extra_timeframes.contains(&current_timeframe.as_str());
-                                        let more_label = if is_extra_selected {
-                                            current_timeframe.clone()
-                                        } else {
-                                            "More".to_string()
-                                        };
-                                        let current_timeframe = current_timeframe.clone();
-                                        this.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .child(controls.child(
-                                                Button::new(ElementId::Name(
-                                                    format!("timeframe-more-{pane_id}").into(),
-                                                ))
-                                                .label(more_label)
-                                                .xsmall()
-                                                .ghost()
-                                                .selected(is_extra_selected)
-                                                .when(is_extra_selected, |button| {
-                                                    if is_active {
-                                                        button
-                                                            .bg(theme.colors.background)
-                                                            .text_color(theme.colors.primary)
-                                                            .font_weight(gpui::FontWeight::BOLD)
-                                                    } else {
-                                                        button
-                                                            .bg(theme.colors.primary)
-                                                            .text_color(theme.colors.primary_foreground)
-                                                            .font_weight(gpui::FontWeight::BOLD)
-                                                    }
-                                                })
-                                                .when(!is_extra_selected && is_active, |button| {
-                                                    button.text_color(title_fg.opacity(0.8))
-                                                })
-                                                .dropdown_caret(true)
-                                            .dropdown_menu_with_anchor(
-                                                gpui::Corner::BottomLeft,
-                                                move |mut menu, _window, _cx| {
-                                                    for timeframe in extra_timeframes {
-                                                        let pane_id = pane_id.clone();
-                                                        let selected = current_timeframe == timeframe;
-                                                        menu = menu.item(
-                                                            gpui_component::menu::PopupMenuItem::new(timeframe)
-                                                                .checked(selected)
-                                                                .on_click(move |_event, window, cx| {
+                                            let pane_id = pane_id.clone();
+                                            let is_extra_selected = extra_timeframes.contains(&current_timeframe.as_str());
+                                            let more_label = if is_extra_selected {
+                                                current_timeframe.clone()
+                                            } else {
+                                                "More".to_string()
+                                            };
+                                            let current_timeframe = current_timeframe.clone();
+                                            this.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .child(controls.child(
+                                                        Button::new(ElementId::Name(
+                                                            format!("timeframe-more-{pane_id}").into(),
+                                                        ))
+                                                        .label(more_label)
+                                                        .xsmall()
+                                                        .ghost()
+                                                        .selected(is_extra_selected)
+                                                        .when(is_extra_selected, |button| {
+                                                            if is_active {
+                                                                button
+                                                                    .bg(theme.colors.background)
+                                                                    .text_color(theme.colors.primary)
+                                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                            } else {
+                                                                button
+                                                                    .bg(theme.colors.primary)
+                                                                    .text_color(theme.colors.primary_foreground)
+                                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                            }
+                                                        })
+                                                        .when(!is_extra_selected && is_active, |button| {
+                                                            button.text_color(title_fg.opacity(0.8))
+                                                        })
+                                                        .dropdown_caret(true)
+                                                        .dropdown_menu_with_anchor(
+                                                            Corner::BottomLeft,
+                                                            move |mut menu, _window, _cx| {
+                                                                for timeframe in &extra_timeframes {
                                                                     let pane_id = pane_id.clone();
-                                                                    let timeframe = timeframe.to_string();
-                                                                    window.defer(cx, move |_window, cx| {
-                                                                        let mut config = serde_json::Map::new();
-                                                                        config.insert(
-                                                                            "interval".to_string(),
-                                                                            serde_json::Value::String(timeframe),
-                                                                        );
-                                                                        cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
-                                                                            let _ = global.view.update(cx, |view, cx| {
-                                                                                view.handle_pane_event(
-                                                                                    &PaneGridEvent::UpdateModuleConfig {
-                                                                                        pane_id,
-                                                                                        config: serde_json::Value::Object(config),
-                                                                                    },
-                                                                                    cx,
-                                                                                );
-                                                                            });
-                                                                        });
-                                                                    });
-                                                                }),
-                                                        );
-                                                    }
-                                                    menu
-                                                },
-                                            ),
-                                        )
-                                        ))
+                                                                    let selected = current_timeframe == *timeframe;
+                                                                    let tf_str = timeframe.to_string();
+                                                                    menu = menu.item(
+                                                                        gpui_component::menu::PopupMenuItem::new(tf_str.clone())
+                                                                            .checked(selected)
+                                                                            .on_click(move |_event, window, cx| {
+                                                                                let pane_id = pane_id.clone();
+                                                                                let timeframe = tf_str.clone();
+                                                                                window.defer(cx, move |_window, cx| {
+                                                                                    let mut config = serde_json::Map::new();
+                                                                                    config.insert(
+                                                                                        "interval".to_string(),
+                                                                                        serde_json::Value::String(timeframe),
+                                                                                    );
+                                                                                    cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
+                                                                                        let _ = global.view.update(cx, |view, cx| {
+                                                                                            view.handle_pane_event(
+                                                                                                &PaneGridEvent::UpdateModuleConfig {
+                                                                                                    pane_id,
+                                                                                                    config: serde_json::Value::Object(config),
+                                                                                                },
+                                                                                                cx,
+                                                                                            );
+                                                                                        });
+                                                                                    });
+                                                                                });
+                                                                            }),
+                                                                    );
+                                                                }
+                                                                menu
+                                                            },
+                                                        ),
+                                                    ))
+                                            )
+                                        }
                                     }),
                             )
                             // Toolbar
@@ -1057,15 +1553,18 @@ impl PaneGridRenderer {
                                                 let current_timezone = current_timezone.clone();
                                                 move |mut menu, _window, _cx| {
                                                     let module_types = [
-                                                        ("time", "Time"),
-                                                        ("ticker", "Ticker"),
                                                         ("chart", "Chart"),
-                                                        ("orderbook", "Orderbook"),
+                                                        ("ticker", "Ticker"),
+                                                        ("orderbook", "Order Book"),
                                                         ("depth", "Depth"),
+                                                        ("trades", "Trades / Tape"),
+                                                        ("positions", "Positions"),
+                                                        ("execution", "Trade Desk · Read Only"),
+                                                        ("watchlist", "Watchlist"),
                                                         ("marketcap", "Market Cap"),
-                                                        ("feargreed", "Fear and Greed Index"),
-                                                        ("editor", "Editor"),
                                                         ("newsfeed", "Newsfeed"),
+                                                        ("feargreed", "Fear and Greed Index"),
+                                                        ("time", "Time"),
                                                     ];
 
                                                     menu = menu.label("Module Type");
@@ -1104,7 +1603,7 @@ impl PaneGridRenderer {
                                                                 );
                                                             }
                                                         }
-                                                        "ticker" | "orderbook" | "depth" => {
+                                                        "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk" => {
                                                             menu = menu.separator().label("Exchange");
                                                             for exchange in exchange_choices() {
                                                                 let pane_id = pane_id_cfg.clone();
@@ -1121,7 +1620,7 @@ impl PaneGridRenderer {
                                                             }
 
                                                             menu = menu.label("Symbol");
-                                                            for symbol in symbol_choices(&current_exchange) {
+                                                            for symbol in symbol_choices_for_menu(&current_exchange, &current_symbol) {
                                                                 let pane_id = pane_id_cfg.clone();
                                                                 let selected = current_symbol == symbol;
                                                                 let value = symbol.clone();
@@ -1151,7 +1650,7 @@ impl PaneGridRenderer {
                                                             }
 
                                                             menu = menu.label("Symbol");
-                                                            for symbol in symbol_choices(&current_exchange) {
+                                                            for symbol in symbol_choices_for_menu(&current_exchange, &current_symbol) {
                                                                 let pane_id = pane_id_cfg.clone();
                                                                 let selected = current_symbol == symbol;
                                                                 let value = symbol.clone();
@@ -1311,6 +1810,7 @@ impl PaneGridRenderer {
                                                 let chart_panel = cx.new(|cx| {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
                                                     panel.on_load_more = Some(load_more);
+                                                    panel.set_size(content_w, content_h);
                                                     panel
                                                 });
                                                 let timezone = self.timezone.clone();
@@ -1336,7 +1836,12 @@ impl PaneGridRenderer {
                                             }
                                         }
                                     } else {
-                                        chart_map.get(&pane_id).unwrap().entity.clone().into_any_element()
+                                        // Reuse the live feed; update layout only when the pane actually resizes.
+                                        let ent = chart_map.get(&pane_id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |chart, _| chart.set_size(content_w, content_h));
+                                        }
+                                        ent.into_any_element()
                                     }
                                 }
                                 "ticker" => {
@@ -1350,20 +1855,29 @@ impl PaneGridRenderer {
                                         None => true,
                                     };
 
-                                    if needs_recreate {
-                                        let panel = cx.new(|cx| crate::components::ui::ticker_panel::TickerPanel::new(&exchange, &symbol, cx));
+                                    let panel = if needs_recreate {
+                                        let panel = cx.new(|cx| {
+                                            let mut p = crate::components::ui::ticker_panel::TickerPanel::new(&exchange, &symbol, cx);
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
                                         let state = TickerViewState {
                                             exchange: exchange.clone(),
                                             symbol: symbol.clone(),
                                             entity: panel.clone(),
                                         };
                                         ticker_map.insert(pane_id.clone(), state);
-                                        panel.into_any_element()
+                                        panel
                                     } else {
-                                        ticker_map.get(&pane_id).unwrap().entity.clone().into_any_element()
-                                    }
+                                        let ent = ticker_map.get(&pane_id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent
+                                    };
+                                    panel.into_any_element()
                                 }
-                                "orderbook" | "depth" => {
+                                "orderbook" => {
                                     let config = data.config.as_object();
                                     let exchange = config_str(config, "exchange", "binance");
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
@@ -1384,7 +1898,11 @@ impl PaneGridRenderer {
                                             Ok(bridge) => {
                                                 let feed = crate::data::orderbook_feed::OrderBookFeed::new(bridge.subscribe_orderbook());
                                                 let title = format!("{} {}", exchange.to_uppercase(), symbol);
-                                                let panel = cx.new(|cx| crate::components::ui::orderbook_panel::OrderBookPanel::new(feed, title, cx));
+                                                let panel = cx.new(|cx| {
+                                                    let mut p = crate::components::ui::orderbook_panel::OrderBookPanel::new(feed, title, cx);
+                                                    p.set_size(content_w, content_h);
+                                                    p
+                                                });
                                                 let state = OrderBookViewState {
                                                     exchange: exchange.clone(),
                                                     symbol: symbol.clone(),
@@ -1398,39 +1916,213 @@ impl PaneGridRenderer {
                                             Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting orderbook: {e}")).into_any_element(),
                                         }
                                     } else {
-                                        orderbook_map.get(&pane_id).unwrap().entity.clone().into_any_element()
+                                        let ent = orderbook_map.get(&pane_id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent.into_any_element()
                                     }
                                 }
-                                "tape" => div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child("Tape Module (Rendered)")
-                                    .into_any_element(),
-                                "positions" => div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child("Positions Module (Rendered)")
-                                    .into_any_element(),
-                                "watchlist" => div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child("Watchlist Module (Rendered)")
-                                    .into_any_element(),
+                                "depth" => {
+                                    let config = data.config.as_object();
+                                    let exchange = config_str(config, "exchange", "binance");
+                                    let symbol = config_str(config, "symbol", "BTC/USDT");
+                                    let mut depth_map = self.depth_views.borrow_mut();
+                                    let needs_recreate = match depth_map.get(&pane_id) {
+                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
+                                        None => true,
+                                    };
+
+                                    if needs_recreate {
+                                        let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        if let Ok(Some(session)) = crate::data::session_store::load_session() {
+                                            bridge_config.access_token = Some(session.access_token);
+                                        }
+                                        match crate::data::bridge::Bridge::start(bridge_config) {
+                                            Ok(bridge) => {
+                                                let feed = crate::data::orderbook_feed::OrderBookFeed::new(bridge.subscribe_orderbook());
+                                                let title = format!("{} {} Depth", exchange.to_uppercase(), symbol);
+                                                let panel = cx.new(|cx| {
+                                                    let mut p = crate::components::ui::depth_panel::DepthPanel::new(feed, title, cx);
+                                                    p.set_size(content_w, content_h);
+                                                    p
+                                                });
+                                                depth_map.insert(pane_id.clone(), DepthViewState {
+                                                    exchange: exchange.clone(),
+                                                    symbol: symbol.clone(),
+                                                    entity: panel.clone(),
+                                                    _bridge: std::sync::Arc::new(bridge),
+                                                });
+                                                panel.into_any_element()
+                                            }
+                                            Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting depth: {e}")).into_any_element(),
+                                        }
+                                    } else {
+                                        let ent = depth_map.get(&pane_id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent.into_any_element()
+                                    }
+                                }
+                                "trades" | "tape" => {
+                                    let config = data.config.as_object();
+                                    let exchange = config_str(config, "exchange", "binance");
+                                    let symbol = config_str(config, "symbol", "BTC/USDT");
+                                    let mut tape_map = self.tape_views.borrow_mut();
+                                    let needs_recreate = match tape_map.get(&pane_id) {
+                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
+                                        None => true,
+                                    };
+
+                                    if needs_recreate {
+                                        let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        if let Ok(Some(session)) = crate::data::session_store::load_session() {
+                                            bridge_config.access_token = Some(session.access_token);
+                                        }
+                                        match crate::data::bridge::Bridge::start(bridge_config) {
+                                            Ok(bridge) => {
+                                                let feed = crate::data::feed::TickFeed::new(bridge.subscribe_trades());
+                                                let title = format!("{} {} Trades", exchange.to_uppercase(), symbol);
+                                                let sound_alerts = self.sound_alerts_enabled;
+                                                let panel = cx.new(|cx| {
+                                                    let mut p = crate::components::ui::tape_panel::TapePanel::new(feed, title, cx);
+                                                    p.set_size(content_w, content_h);
+                                                    p.set_global_sound_enabled(sound_alerts);
+                                                    p
+                                                });
+                                                tape_map.insert(pane_id.clone(), TapeViewState {
+                                                    exchange: exchange.clone(),
+                                                    symbol: symbol.clone(),
+                                                    entity: panel.clone(),
+                                                    _bridge: std::sync::Arc::new(bridge),
+                                                });
+                                                panel.into_any_element()
+                                            }
+                                            Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting trades: {e}")).into_any_element(),
+                                        }
+                                    } else {
+                                        let ent = tape_map.get(&pane_id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent.into_any_element()
+                                    }
+                                }
+                                "positions" => {
+                                    let mut positions_map = self.positions_views.borrow_mut();
+                                    let panel = if let Some(entity) = positions_map.get(&pane_id) {
+                                        if !entity.read(cx).has_size(content_w, content_h) {
+                                            entity.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        entity.clone()
+                                    } else {
+                                        let entity = cx.new(|cx| {
+                                            let mut p = crate::components::ui::positions_panel::PositionsPanel::new(
+                                                Vec::new(), "Positions", cx,
+                                            );
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
+                                        positions_map.insert(pane_id.clone(), entity.clone());
+                                        entity
+                                    };
+                                    panel.into_any_element()
+                                }
+                                "execution" | "tradedesk" => {
+                                    let config = data.config.as_object();
+                                    let exchange = config_str(config, "exchange", "binance");
+                                    let symbol = config_str(config, "symbol", "BTC/USDT");
+                                    let mut execution_map = self.execution_views.borrow_mut();
+                                    let needs_recreate = match execution_map.get(&pane_id) {
+                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
+                                        None => true,
+                                    };
+                                    if needs_recreate {
+                                        let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        if let Ok(Some(session)) = crate::data::session_store::load_session() {
+                                            bridge_config.access_token = Some(session.access_token);
+                                        }
+                                        match crate::data::bridge::Bridge::start(bridge_config) {
+                                            Ok(bridge) => {
+                                                let feed = crate::data::feed::TickFeed::new(bridge.subscribe());
+                                                let title = format!("{} {} · Trade Desk", exchange.to_uppercase(), symbol);
+                                                let panel = cx.new(|cx| {
+                                                    let mut p = crate::components::ui::execution_panel::ExecutionPanel::new(feed, title, symbol.clone(), cx);
+                                                    p.set_size(content_w, content_h);
+                                                    p
+                                                });
+                                                execution_map.insert(pane_id.clone(), ExecutionViewState {
+                                                    exchange, symbol, entity: panel.clone(), _bridge: std::sync::Arc::new(bridge),
+                                                });
+                                                panel.into_any_element()
+                                            }
+                                            Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting trade desk price feed: {e}")).into_any_element(),
+                                        }
+                                    } else {
+                                        let entity = execution_map.get(&pane_id).unwrap().entity.clone();
+                                        if !entity.read(cx).has_size(content_w, content_h) {
+                                            entity.update(cx, |panel, _| panel.set_size(content_w, content_h));
+                                        }
+                                        entity.into_any_element()
+                                    }
+                                }
+                                "watchlist" => {
+                                    let mut watchlist_map = self.watchlist_views.borrow_mut();
+                                    let panel = if let Some(existing) = watchlist_map.get(&pane_id) {
+                                        let ent = existing.entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent
+                                    } else {
+                                        let entity = cx.new(|cx| {
+                                            let mut p = crate::components::ui::watchlist_panel::WatchlistPanel::new("Watchlist", cx);
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
+                                        watchlist_map.insert(pane_id.clone(), WatchlistViewState { entity: entity.clone() });
+                                        entity
+                                    };
+                                    panel.into_any_element()
+                                }
+                                "marketcap" => {
+                                    let mut market_cap_map = self.market_cap_views.borrow_mut();
+                                    let panel = if let Some(existing) = market_cap_map.get(&pane_id) {
+                                        let ent = existing.entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent
+                                    } else {
+                                        let entity = cx.new(|cx| {
+                                            let mut p = crate::components::ui::market_cap_panel::MarketCapPanel::new("Market Cap", cx);
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
+                                        market_cap_map.insert(pane_id.clone(), MarketCapViewState { entity: entity.clone() });
+                                        entity
+                                    };
+                                    panel.into_any_element()
+                                }
                                 "feargreed" => {
                                     let mut fg_map = self.fear_greed_views.borrow_mut();
-                                    if !fg_map.contains_key(id) {
-                                        let entity = cx.new(|cx| crate::components::ui::fear_greed_panel::FearGreedPanel::new(cx));
+                                    let panel = if !fg_map.contains_key(id) {
+                                        let entity = cx.new(|cx| {
+                                            let mut p = crate::components::ui::fear_greed_panel::FearGreedPanel::new(cx);
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
                                         fg_map.insert(id.clone(), FearGreedViewState { entity: entity.clone() });
-                                        entity.into_any_element()
+                                        entity
                                     } else {
-                                        fg_map.get(id).unwrap().entity.clone().into_any_element()
-                                    }
+                                        let ent = fg_map.get(id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent
+                                    };
+                                    panel.into_any_element()
                                 }
                                 "newsfeed" => {
                                     let config = data.config.as_object();
@@ -1443,19 +2135,28 @@ impl PaneGridRenderer {
                                         None => true,
                                     };
 
-                                    if needs_recreate {
+                                    let panel = if needs_recreate {
                                         let p_id = id.clone();
                                         let p = priority.clone();
                                         let f = filter.clone();
-                                        let entity = cx.new(|cx| crate::components::ui::newsfeed_panel::NewsfeedPanel::new(p_id, p, f, cx));
+                                        let entity = cx.new(|cx| {
+                                            let mut panel = crate::components::ui::newsfeed_panel::NewsfeedPanel::new(p_id, p, f, cx);
+                                            panel.set_size(content_w, content_h);
+                                            panel
+                                        });
                                         let timezone = self.timezone.clone();
                                         entity.update(cx, |panel, _| panel.set_timezone(timezone));
                                         let state = NewsfeedViewState { priority, filter, entity: entity.clone() };
                                         newsfeed_map.insert(id.clone(), state);
-                                        entity.into_any_element()
+                                        entity
                                     } else {
-                                        newsfeed_map.get(id).unwrap().entity.clone().into_any_element()
-                                    }
+                                        let ent = newsfeed_map.get(id).unwrap().entity.clone();
+                                        if !ent.read(cx).has_size(content_w, content_h) {
+                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                        }
+                                        ent
+                                    };
+                                    panel.into_any_element()
                                 }
                                 "time" | "clock" => {
                                     let config = data.config.as_object();
@@ -1466,29 +2167,54 @@ impl PaneGridRenderer {
                                         .to_string();
 
                                     let mut clock_map = self.clock_views.borrow_mut();
-                                    let needs_recreate = match clock_map.get(id) {
-                                        Some(existing) => existing.timezone != tz_str,
-                                        None => true,
-                                    };
+                                    let needs_recreate = !clock_map.contains_key(id);
 
-                                    if needs_recreate {
+                                    let panel = if needs_recreate {
                                         let p_id = id.clone();
                                         let timezone = tz_str.clone();
-                                        let entity = cx.new(|cx| crate::components::ui::clock_panel::ClockPanel::new(p_id, timezone.clone(), cx));
+                                        let entity = cx.new(|cx| {
+                                            let mut p = crate::components::ui::clock_panel::ClockPanel::new(p_id, timezone.clone(), cx);
+                                            p.set_size(content_w, content_h);
+                                            p
+                                        });
                                         let state = ClockViewState { timezone, entity: entity.clone() };
                                         clock_map.insert(id.clone(), state);
-                                        entity.into_any_element()
+                                        entity
                                     } else {
-                                        clock_map.get(id).unwrap().entity.clone().into_any_element()
+                                        let state = clock_map.get_mut(id).unwrap();
+                                        let ent = state.entity.clone();
+                                        // Keep the entity synchronized with the pane config. This is
+                                        // intentionally done independently of size updates so a
+                                        // timezone change is visible without rebuilding the clock.
+                                        // Always push the pane's configured timezone into the
+                                        // cached entity. The pane tree is the source of truth;
+                                        // relying only on the cached state can leave the clock
+                                        // showing the previous timezone after a menu selection.
+                                        let needs_resize = !ent.read(cx).has_size(content_w, content_h);
+                                        state.timezone = tz_str.clone();
+                                        ent.update(cx, |p, _| {
+                                            p.set_timezone(tz_str.clone());
+                                            if needs_resize {
+                                                p.set_size(content_w, content_h);
+                                            }
+                                        });
+                                        ent
+                                    };
+                                    panel.into_any_element()
+                                }
+                                _ => {
+                                    if is_empty {
+                                        self.render_placeholder_selector(&pane_id, content_w, content_h, cx)
+                                    } else {
+                                        div()
+                                            .size_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(module_type.to_string())
+                                            .into_any_element()
                                     }
                                 }
-                                _ => div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(if is_empty { "Empty module".to_string() } else { module_type.to_string() })
-                                    .into_any_element(),
                             })
                             // Unconditionally render drop zones so they are always in the hit-test tree and stay in front of content
                             .when(self.dragged_pane.borrow().is_some(), |this| this.map(|this| {
@@ -1744,5 +2470,11 @@ impl Render for PaneGridRenderer {
                         .child("No layout loaded"),
                 ).into_any_element()
         }
+    }
+}
+
+impl Default for PaneGridRenderer {
+    fn default() -> Self {
+        Self::new()
     }
 }

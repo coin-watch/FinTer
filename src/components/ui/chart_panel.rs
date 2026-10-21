@@ -64,9 +64,6 @@ use std::time::{Duration, Instant};
 // Display constants
 // ---------------------------------------------------------------------------
 
-/// Minimum chart height in pixels.
-const MIN_CHART_HEIGHT: f32 = 200.0;
-
 /// Zoom factor applied per mouse-wheel tick.
 const ZOOM_FACTOR_IN: f32 = 0.85;
 const ZOOM_FACTOR_OUT: f32 = 1.0 / ZOOM_FACTOR_IN;
@@ -75,6 +72,7 @@ const ZOOM_FACTOR_OUT: f32 = 1.0 / ZOOM_FACTOR_IN;
 // ChartPanel
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LegendSettingsTarget {
     Main,
@@ -93,6 +91,7 @@ pub type TechnicalIndicatorCategory = IndicatorCategory;
 
 struct IndicatorLineSpec {
     instance_id: String,
+    #[allow(dead_code)]
     kind: IndicatorKind,
     name: String,
     series: Vec<(i64, f64)>,
@@ -183,6 +182,8 @@ pub struct ChartPanel {
     show_horizontal_grid: bool,
     /// IANA timezone used for chart labels and crosshair timestamps.
     timezone: String,
+    pub pane_width: f32,
+    pub pane_height: f32,
 }
 
 impl ChartPanel {
@@ -228,6 +229,8 @@ impl ChartPanel {
             candle_type: CandleType::Solid,
             show_horizontal_grid: false,
             timezone: "UTC".into(),
+            pane_width: 800.0,
+            pane_height: 500.0,
             on_load_more: None,
             oldest_loaded_ts: 0,
             is_loading_more: false,
@@ -322,6 +325,20 @@ impl ChartPanel {
     pub fn set_show_horizontal_grid(&mut self, show: bool) {
         self.show_horizontal_grid = show;
         self.mark_dirty();
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        if (self.pane_width - width).abs() < 0.5 && (self.pane_height - height).abs() < 0.5 {
+            return;
+        }
+        self.pane_width = width;
+        self.pane_height = height;
+        // last_chart_width belongs to the measured chart canvas, not the pane.
+        // Overwriting it here makes toolbar breakpoints oscillate on live updates.
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.pane_width - width).abs() < 0.5 && (self.pane_height - height).abs() < 0.5
     }
 
     // -----------------------------------------------------------------------
@@ -1786,7 +1803,7 @@ impl Render for ChartPanel {
             .id("chart_interactive_area")
             .flex_1()
             .w_full()
-            .min_h(px(MIN_CHART_HEIGHT))
+            .min_h_0()
             .relative();
 
         if is_near_separator {
@@ -2197,8 +2214,12 @@ impl ChartPanel {
         };
 
         // Breakpoints for dynamic responsiveness
-        let is_wide = w >= 980.0;
-        let is_ultra_compact = w < 520.0;
+        let is_wide = w >= 780.0;
+        let is_medium = w >= 520.0 && w < 780.0;
+        let _is_compact = w >= 360.0 && w < 520.0;
+        let is_ultra_compact = w < 360.0;
+        let is_short = self.pane_height > 0.0 && self.pane_height < 140.0;
+        let toolbar_h = if is_short { px(28.0) } else { px(34.0) };
         let icon = |path: &'static str| {
             gpui_component::Icon::default().path(path).size(px(15.0))
         };
@@ -2675,13 +2696,13 @@ impl ChartPanel {
             }));
 
         div()
-            .h(px(38.0))
+            .h(toolbar_h)
             .w_full()
             .flex()
             .items_center()
             .justify_between()
             .overflow_hidden()
-            .gap(px(4.0))
+            .gap(px(2.0))
             .px(if is_wide { px(8.0) } else { px(4.0) })
             .border_b_1()
             .border_color(colors.border)
@@ -2701,29 +2722,35 @@ impl ChartPanel {
                     .gap(px(2.0))
                     .flex_shrink_0()
                     .child(indicators)
-                    .child(separator())
+                    .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(drawing_button(None, "toolbar_pointer", "icons/mouse-pointer.svg", "Pointer"))
-                    .child(drawing_button(Some(DrawingTool::Trendline), "toolbar_trendline", "icons/trending-up.svg", "Trend"))
-                    .child(drawing_button(Some(DrawingTool::HorizontalLine), "toolbar_horizontal", "icons/minus.svg", "Horizontal"))
                     .when(!is_ultra_compact, |this| {
+                        this.child(drawing_button(Some(DrawingTool::Trendline), "toolbar_trendline", "icons/trending-up.svg", "Trend"))
+                    })
+                    .when(is_wide || is_medium, |this| {
+                        this.child(drawing_button(Some(DrawingTool::HorizontalLine), "toolbar_horizontal", "icons/minus.svg", "Horizontal"))
+                    })
+                    .when(is_wide, |this| {
                         this.child(drawing_button(Some(DrawingTool::VerticalLine), "toolbar_vertical", "icons/arrow-up.svg", "Vertical"))
                             .child(drawing_button(Some(DrawingTool::Ray), "toolbar_ray", "icons/arrow-right.svg", "Ray"))
                             .child(drawing_button(Some(DrawingTool::Fibonacci), "toolbar_fibonacci", "icons/sort-ascending.svg", "Fib"))
                             .child(drawing_button(Some(DrawingTool::PriceChannel), "toolbar_channel", "icons/frame.svg", "Channel"))
                             .child(drawing_button(Some(DrawingTool::Text), "toolbar_text", "icons/a-large-small.svg", "Text"))
                     })
-                    .when(is_ultra_compact, |this| {
+                    .when(!is_wide, |this| {
                         this.child(more_drawings)
                     })
-                    .child(drawing_button(Some(DrawingTool::LongPosition), "toolbar_long", "icons/arrow-up.svg", "Long"))
-                    .child(drawing_button(Some(DrawingTool::ShortPosition), "toolbar_short", "icons/arrow-down.svg", "Short"))
-                    .child(separator())
+                    .when(is_wide || is_medium, |this| {
+                        this.child(drawing_button(Some(DrawingTool::LongPosition), "toolbar_long", "icons/arrow-up.svg", "Long"))
+                            .child(drawing_button(Some(DrawingTool::ShortPosition), "toolbar_short", "icons/arrow-down.svg", "Short"))
+                    })
+                    .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(color_picker)
-                    .child(snap)
-                    .child(separator())
+                    .when(!is_ultra_compact, |this| this.child(snap))
+                    .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(reset)
-                    .child(grid)
-                    .child(clear),
+                    .when(is_wide || is_medium, |this| this.child(grid))
+                    .when(!is_ultra_compact || w >= 260.0, |this| this.child(clear)),
             )
     }
 

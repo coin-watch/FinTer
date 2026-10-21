@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, App, Context, IntoElement, ParentElement, Render, Styled, Window,
+    prelude::FluentBuilder,
 };
 use gpui_component::{
     h_flex,
@@ -26,6 +27,8 @@ pub struct TickerPanel {
     price_history: Vec<f64>,
     history_rx: Option<tokio::sync::mpsc::Receiver<Vec<f64>>>,
     is_loading: bool,
+    width: f32,
+    height: f32,
 }
 
 impl TickerPanel {
@@ -33,40 +36,16 @@ impl TickerPanel {
         let mut config = BridgeConfig::default_dev(exchange, symbol);
         config.timeframe = "1h".to_string();
         config.ohlcv_limit = 168; // 168 hourly candles = last 7 days (parity with CoinWatch Ticker.svelte)
+        if let Ok(Some(session)) = crate::data::session_store::load_session() {
+            config.access_token = Some(session.access_token);
+        }
         
+        // A ticker panel owns exactly one bridge and consumes only its ticker
+        // stream. Do not merge kline updates into this receiver: kline and
+        // ticker packets arrive at different times and made the displayed
+        // price jump back and forth (which looked like a WebSocket flicker).
         let bridge = Arc::new(Bridge::start(config.clone()).expect("failed to start bridge for ticker"));
-        let mut tick_rx = bridge.subscribe();
-        let mut ohlcv_rx = bridge.subscribe_ohlcv();
-
-        // Listen for either tick updates or kline updates (which carry live close price)
-        let (merged_tx, merged_rx) = tokio::sync::broadcast::channel(64);
-        let m_tx = merged_tx.clone();
-        let ex = exchange.to_string();
-        let sym = symbol.to_string();
-
-        tokio_runtime().spawn(async move {
-            loop {
-                tokio::select! {
-                    Ok(tick) = tick_rx.recv() => {
-                        let _ = m_tx.send(tick);
-                    }
-                    Ok(candles) = ohlcv_rx.recv() => {
-                        if let Some(c) = candles.last() {
-                            let tick = UnifiedTick::new(
-                                &ex,
-                                &sym,
-                                c.close,
-                                c.volume,
-                                crate::data::tick::TradeSide::Unknown,
-                                c.timestamp,
-                            );
-                            let _ = m_tx.send(Arc::new(tick));
-                        }
-                    }
-                    else => break,
-                }
-            }
-        });
+        let tick_rx = bridge.subscribe();
 
         // One-time fetch of 1h historical chart data for sparkline, plus a 24h periodic refresh
         let (history_tx, history_rx) = tokio::sync::mpsc::channel(1);
@@ -86,12 +65,26 @@ impl TickerPanel {
             exchange: exchange.to_string(),
             symbol: symbol.to_string(),
             _bridge: bridge,
-            tick_rx: merged_rx,
+            tick_rx,
             latest_tick: None,
             price_history: Vec::with_capacity(168),
             history_rx: Some(history_rx),
             is_loading: true,
+            width: 300.0,
+            height: 180.0,
         }
+    }
+
+    pub fn set_size(&mut self, width: f32, height: f32) {
+        if (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5 {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+    }
+
+    pub fn has_size(&self, width: f32, height: f32) -> bool {
+        (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
     /// Read any pending ticks to update state before rendering.
@@ -155,72 +148,195 @@ impl Render for TickerPanel {
             colors.bearish
         };
 
-        div()
-            .size_full()
-            .relative()
-            .bg(colors.background)
+        let badge_bg = if is_positive {
+            colors.bullish.opacity(0.14)
+        } else {
+            colors.bearish.opacity(0.14)
+        };
+
+        let arrow = if is_positive { "▲" } else { "▼" };
+
+        let price_str = if price >= 1000.0 {
+            format!("{:.2}", price)
+        } else if price >= 1.0 {
+            format!("{:.4}", price)
+        } else if price >= 0.0001 {
+            format!("{:.6}", price)
+        } else {
+            format!("{:.8}", price)
+        };
+
+        let mut sparkline_data: Vec<(String, f64)> = self
+            .price_history
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (i.to_string(), p))
+            .collect();
+        
+        if !sparkline_data.is_empty() {
+            sparkline_data.push((sparkline_data.len().to_string(), price));
+        }
+
+        let is_compact = self.height < 95.0;
+        let is_spacious = self.height >= 170.0 && self.width >= 240.0;
+
+        let stroke_color = if is_positive {
+            colors.bullish
+        } else {
+            colors.bearish
+        };
+
+        let chart_element = div()
+            .flex_1()
+            .w_full()
+            .min_h_0()
+            .overflow_hidden()
             .child(
-                h_flex()
-                    .absolute()
-                    .top(px(8.0))
-                    .left(px(12.0))
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(colors.foreground)
-                            .child(self.symbol.replace("-", "").to_uppercase()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(colors.foreground)
-                            .child(format!("{:.2}", price)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(color)
-                            .child(format!("{pct_change:+.2}%")),
-                    ),
-            )
-            // LineChart component sparkline
-            .child({
-                let mut data: Vec<(String, f64)> = self
-                    .price_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &p)| (i.to_string(), p))
-                    .collect();
-                
-                // Append current live price to complete the sparkline
-                if !data.is_empty() {
-                    data.push((data.len().to_string(), price));
-                }
+                LineChart::new(sparkline_data)
+                    .x(|(x, _)| x.clone())
+                    .y(|(_, y)| *y)
+                    .stroke(stroke_color)
+                    .show_axes(false)
+                    .show_grid(false)
+                    .include_zero(false)
+                    .natural(),
+            );
 
-                let stroke_color = if is_positive {
-                    colors.bullish
-                } else {
-                    colors.bearish
-                };
+        if is_compact {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .p_2()
+                .bg(colors.background)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .gap(px(6.0))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(colors.foreground)
+                                        .child(self.symbol.replace("-", "").to_uppercase()),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(colors.foreground)
+                                        .child(price_str),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.5))
+                                .rounded_sm()
+                                .bg(badge_bg)
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(color)
+                                .child(format!("{arrow} {pct_change:+.2}%")),
+                        ),
+                )
+                .child(chart_element)
+                .into_any_element()
+        } else {
+            let price_size = (self.width * 0.08).min(self.height * 0.22).clamp(18.0, 36.0);
+            let meta_size = (price_size * 0.42).clamp(10.0, 13.0);
+            let badge_size = (price_size * 0.38).clamp(9.0, 12.0);
 
-                div()
-                    .size_full()
-                    .child(
-                        LineChart::new(data)
-                            .x(|(x, _)| x.clone())
-                            .y(|(_, y)| *y)
-                            .stroke(stroke_color)
-                            .show_axes(false)
-                            .show_grid(false)
-                            .include_zero(false)
-                            .natural()
-                    )
-            })
-            .into_any_element()
+            let high_24h = self.price_history.iter().copied().fold(f64::NEG_INFINITY, f64::max).max(price);
+            let low_24h = self.price_history.iter().copied().fold(f64::INFINITY, f64::min).min(price);
+
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .pt(px(10.0))
+                .px(px(12.0))
+                .pb_1()
+                .bg(colors.background)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap(px(6.0))
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .text_size(px(meta_size))
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(colors.foreground)
+                                                .child(self.symbol.replace("-", "").to_uppercase()),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(5.0))
+                                                .py(px(1.0))
+                                                .rounded_sm()
+                                                .bg(colors.muted)
+                                                .text_size(px(meta_size - 1.0))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(colors.muted_foreground)
+                                                .child(self.exchange.to_uppercase()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded_sm()
+                                        .bg(badge_bg)
+                                        .text_size(px(badge_size))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(color)
+                                        .child(format!("{arrow} {pct_change:+.2}%")),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_baseline()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(price_size))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(colors.foreground)
+                                        .child(price_str),
+                                ),
+                        )
+                        .when(is_spacious && high_24h.is_finite() && low_24h.is_finite(), |this| {
+                            this.child(
+                                h_flex()
+                                    .gap(px(12.0))
+                                    .items_center()
+                                    .text_size(px(10.0))
+                                    .text_color(colors.muted_foreground)
+                                    .child(format!("24h H: {:.2}", high_24h))
+                                    .child(format!("24h L: {:.2}", low_24h)),
+                            )
+                        }),
+                )
+                .child(chart_element)
+                .into_any_element()
+        }
     }
 }

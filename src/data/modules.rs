@@ -210,12 +210,21 @@ impl ApiClient {
         self.create_module(DEFAULT_MODULE_NAME, create_default_module_json())
     }
 
-    /// Create a new empty layout module with a given name.
-    /// Uses the default single-pane chart configuration.
+    /// Create a new dashboard with a single unconfigured pane.
+    /// The module payload uses the PaneNode format consumed by the dashboard renderer.
     ///
     /// Blocking — run from a background thread.
     pub fn create_empty_layout(&self, name: &str) -> Result<Module> {
-        self.create_module(name, create_default_module_json())
+        let tree = crate::data::pane_tree::PaneNode::Pane {
+            id: crate::data::pane_tree::PaneNode::generate_id(),
+            data: crate::data::pane_tree::ModuleData {
+                module_type: Some("Empty".into()),
+                config: serde_json::json!({}),
+            },
+        };
+        let val = serde_json::to_value(tree)
+            .map_err(|e| crate::data::error::CoinWatchError::Deserialization(e.to_string()))?;
+        self.create_module(name, val)
     }
 }
 
