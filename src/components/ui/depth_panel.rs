@@ -39,7 +39,25 @@ pub struct DepthPanel {
 }
 
 impl DepthPanel {
-    pub fn new(feed: OrderBookFeed, title: impl Into<String>, cx: &mut App) -> Self {
+    pub fn new(feed: OrderBookFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        let feed_for_timer = feed.clone();
+        cx.spawn(async move |this, cx| {
+            let mut last = feed_for_timer.snapshot();
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let latest = feed_for_timer.snapshot();
+                let changed = match (&last, &latest) {
+                    (Some(previous), Some(current)) => !std::sync::Arc::ptr_eq(previous, current),
+                    (None, None) => false,
+                    _ => true,
+                };
+                if changed { last = latest; }
+                if this.update(cx, |_, cx| {
+                    if changed { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         Self {
             feed,
             title: title.into(),
@@ -85,9 +103,8 @@ impl DepthPanel {
 }
 
 impl Render for DepthPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Request animation frame for smooth real-time streaming
-        window.request_animation_frame();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+
 
         let theme = cx.theme();
         let colors = &theme.colors;

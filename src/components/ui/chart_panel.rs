@@ -763,8 +763,9 @@ impl ChartPanel {
 // ---------------------------------------------------------------------------
 
 impl Render for ChartPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The feed watcher and interaction handlers notify this entity. Avoid
+        // scheduling an unconditional 60 FPS render loop when the chart is idle.
 
         // Track chart width for dynamic toolbar
         if let Some((w, _)) = self.chart_state.candle_plot_size.get() {
@@ -1485,7 +1486,7 @@ impl Render for ChartPanel {
         };
 
         // Candlestick chart construction
-        let mut chart = CandlestickChart::new(candles.clone())
+        let mut chart = CandlestickChart::new(candles)
             .show_candles(self.show_main_series)
             .subpane_count(subpane_count)
             .show_volume_pane(has_vol)
@@ -1890,7 +1891,7 @@ impl Render for ChartPanel {
                         8.0
                     };
                     let candle_delta = -(dx as f64 / candle_width);
-                    let total = this.feed.snapshot().len();
+                    let total = this.feed.len();
                     this.chart_state.viewport_offset = this.chart_state.drag_start_offset + candle_delta;
                     this.chart_state.clamp_offset(total);
                     this.chart_state.pinned_to_latest = false;
@@ -2105,7 +2106,7 @@ impl Render for ChartPanel {
                 if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
                     return;
                 }
-                let total = this.feed.snapshot().len();
+                let total = this.feed.len();
                 let delta_y = ev.delta.pixel_delta(px(1.0)).y.as_f32();
                 let cursor_frac = this.chart_state.last_cursor_frac.get().clamp(0.0, 1.0);
                 if delta_y > 0.0 {
@@ -2155,13 +2156,13 @@ impl Render for ChartPanel {
                         cx.notify();
                     }
                     "l" => {
-                        let total = this.feed.snapshot().len();
+                        let total = this.feed.len();
                         this.chart_state.scroll_to_latest(total);
                         this.chart_state.pinned_to_latest = true;
                         cx.notify();
                     }
                     "f" => {
-                        let total = this.feed.snapshot().len();
+                        let total = this.feed.len();
                         this.chart_state.reset_view(total);
                         cx.notify();
                     }
@@ -2673,7 +2674,7 @@ impl ChartPanel {
         let reset = toolbar_button("toolbar_reset_view", "icons/undo-2.svg", "Reset")
             .tooltip("Reset view (F)")
             .on_click(cx.listener(|this, _event, _window, cx| {
-                let total = this.feed.snapshot().len();
+                let total = this.feed.len();
                 this.chart_state.reset_view(total);
                 cx.notify();
             }));

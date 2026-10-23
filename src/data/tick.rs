@@ -61,6 +61,17 @@ pub struct UnifiedTick {
     pub side: TradeSide,
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: TimestampMs,
+    /// Rolling 24-hour ticker statistics; absent on individual trades.
+    #[serde(default)]
+    pub change_24h_percent: Option<f64>,
+    #[serde(default)]
+    pub quote_volume_24h: Option<f64>,
+    #[serde(default)]
+    pub open_24h: Option<f64>,
+    #[serde(default)]
+    pub high_24h: Option<f64>,
+    #[serde(default)]
+    pub low_24h: Option<f64>,
 }
 
 impl UnifiedTick {
@@ -80,6 +91,11 @@ impl UnifiedTick {
             amount,
             side,
             timestamp_ms,
+            change_24h_percent: None,
+            quote_volume_24h: None,
+            open_24h: None,
+            high_24h: None,
+            low_24h: None,
         }
     }
 

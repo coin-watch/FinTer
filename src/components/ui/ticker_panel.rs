@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    div, px, App, Context, IntoElement, ParentElement, Render, Styled, Window,
+    div, px, Context, IntoElement, ParentElement, Render, Styled, Window,
     prelude::FluentBuilder,
 };
 use gpui_component::{
@@ -32,14 +32,23 @@ pub struct TickerPanel {
 }
 
 impl TickerPanel {
-    pub fn new(exchange: &str, symbol: &str, _cx: &mut App) -> Self {
+    pub fn new(exchange: &str, symbol: &str, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                if this.update(cx, |panel, cx| {
+                    if panel.pump_events() { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         let mut config = BridgeConfig::default_dev(exchange, symbol);
         config.timeframe = "1h".to_string();
         config.ohlcv_limit = 168; // 168 hourly candles = last 7 days (parity with CoinWatch Ticker.svelte)
         if let Ok(Some(session)) = crate::data::session_store::load_session() {
             config.access_token = Some(session.access_token);
         }
-        
+
         // A ticker panel owns exactly one bridge and consumes only its ticker
         // stream. Do not merge kline updates into this receiver: kline and
         // ticker packets arrive at different times and made the displayed
@@ -88,27 +97,34 @@ impl TickerPanel {
     }
 
     /// Read any pending ticks to update state before rendering.
-    fn pump_events(&mut self) {
+    fn pump_events(&mut self) -> bool {
+        let mut changed = false;
         if let Some(rx) = self.history_rx.as_mut() {
             while let Ok(history) = rx.try_recv() {
+                changed |= self.price_history != history;
                 self.price_history = history;
             }
         }
-        while let Ok(tick) = self.tick_rx.try_recv() {
-            // We no longer append live prices to the sparkline array.
-            // The sparkline is purely the static 1h history over 7 days.
-            self.latest_tick = Some(tick);
-            self.is_loading = false;
+        loop {
+            match self.tick_rx.try_recv() {
+                Ok(tick) => {
+                    changed |= self.latest_tick.as_ref().is_none_or(|last| !Arc::ptr_eq(last, &tick));
+                    self.latest_tick = Some(tick);
+                    self.is_loading = false;
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
         }
+        changed
     }
 }
 
 impl Render for TickerPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.pump_events();
 
-        // Ensure we keep polling ticks
-        window.request_animation_frame();
+
 
         let colors = &cx.theme().colors;
 
@@ -130,7 +146,7 @@ impl Render for TickerPanel {
 
         let tick = self.latest_tick.as_ref().unwrap();
         let price = tick.price;
-        
+
         let mut pct_change = 0.0;
         if !self.price_history.is_empty() {
             let idx_24h_ago = self.price_history.len().saturating_sub(24);
@@ -139,9 +155,9 @@ impl Render for TickerPanel {
                 pct_change = (price - price_24h) / price_24h * 100.0;
             }
         }
-        
+
         let is_positive = pct_change >= 0.0;
-        
+
         let color = if is_positive {
             colors.bullish
         } else {
@@ -172,7 +188,7 @@ impl Render for TickerPanel {
             .enumerate()
             .map(|(i, &p)| (i.to_string(), p))
             .collect();
-        
+
         if !sparkline_data.is_empty() {
             sparkline_data.push((sparkline_data.len().to_string(), price));
         }

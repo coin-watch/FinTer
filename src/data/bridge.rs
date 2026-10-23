@@ -616,7 +616,7 @@ fn handle_message(
                 // Note: ticker push carries 24-hour cumulative market volume,
                 // not an individual trade amount or candle volume.
                 // UnifiedTick.amount represents individual traded amount, so set 0.0 here.
-                let tick = UnifiedTick::new(
+                let mut tick = UnifiedTick::new(
                     msg.exchange.as_deref().unwrap_or(&config.exchange),
                     msg.symbol.as_deref().unwrap_or(&config.symbol),
                     price,
@@ -624,6 +624,45 @@ fn handle_message(
                     TradeSide::Unknown,
                     ts,
                 );
+                let open_24h = target
+                    .get("open")
+                    .or_else(|| target.get("o"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                let high_24h = target
+                    .get("high")
+                    .or_else(|| target.get("h"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                let low_24h = target
+                    .get("low")
+                    .or_else(|| target.get("l"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
+                let change_24h = target
+                    .get("changePercent")
+                    .or_else(|| target.get("percentage"))
+                    .or_else(|| target.get("P"))
+                    .or_else(|| target.get("change_24h"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .or_else(|| {
+                        let open = open_24h?;
+                        if open > 0.0 && price > 0.0 {
+                            Some(((price - open) / open) * 100.0)
+                        } else {
+                            None
+                        }
+                    });
+                let volume_24h = target
+                    .get("quoteVolume")
+                    .or_else(|| target.get("q"))
+                    .or_else(|| target.get("volume"))
+                    .or_else(|| target.get("v"))
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+
+                tick.change_24h_percent = change_24h;
+                tick.quote_volume_24h = volume_24h;
+                tick.open_24h = open_24h;
+                tick.high_24h = high_24h;
+                tick.low_24h = low_24h;
                 let _ = tick_tx.send(Arc::new(tick));
             }
         }

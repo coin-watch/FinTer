@@ -71,6 +71,33 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Package Linux AppImage
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          appdir="$RUNNER_TEMP/FinTer.AppDir"
+          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications"
+          cp "target/${{ matrix.target }}/release/finter" "$appdir/usr/bin/finter"
+          cat > "$appdir/usr/share/applications/finter.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FinTer
+          Comment=FinTer desktop application
+          Exec=finter
+          Terminal=false
+          Categories=Utility;
+          EOF
+          curl -L --fail --retry 3 \
+            -o "$RUNNER_TEMP/appimagetool.AppImage" \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool.AppImage"
+          chmod +x "$appdir/usr/bin/finter"
+          ARCH=x86_64 "$RUNNER_TEMP/appimagetool.AppImage" --appimage-extract-and-run "$appdir" \
+            "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage"
+          sha256sum "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage" \
+            | cut -d ' ' -f 1 > "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage.sha256"
+
       - name: Self-sign macOS binary
         if: runner.os == 'macOS'
         run: codesign -s - target/${{ matrix.target }}/release/finter
@@ -103,3 +130,5 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/finter${{ matrix.extension }}
             target/${{ matrix.target }}/release/finter${{ matrix.extension }}.sha256
+            target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage
+            target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage.sha256

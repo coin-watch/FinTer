@@ -2,7 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use gpui::{
-    div, prelude::FluentBuilder, App, AppContext, BorrowAppContext, Context, ElementId, Entity,
+    div, prelude::FluentBuilder, AppContext, BorrowAppContext, Context, ElementId, Entity,
     InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
     Window, px,
 };
@@ -86,7 +86,16 @@ pub struct NewsfeedPanel {
 }
 
 impl NewsfeedPanel {
-    pub fn new(pane_id: String, priority: String, filter: String, _cx: &mut App) -> Self {
+    pub fn new(pane_id: String, priority: String, filter: String, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                if this.update(cx, |panel, cx| {
+                    if panel.pump() { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         let (tx, rx) = mpsc::channel(64);
         tokio_runtime().spawn(run_feed(tx, priority.clone(), filter.clone()));
         Self {
@@ -166,8 +175,10 @@ impl NewsfeedPanel {
         cx.notify();
     }
 
-    fn pump(&mut self) {
+    fn pump(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(event) = self.rx.try_recv() {
+            changed = true;
             match event {
                 FeedEvent::Loaded(mut articles) => {
                     prioritize(&mut articles);
@@ -196,6 +207,7 @@ impl NewsfeedPanel {
                 }
             }
         }
+        changed
     }
 }
 
@@ -359,7 +371,7 @@ impl Render for NewsfeedPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_input(window, cx);
         self.pump();
-        window.request_animation_frame();
+
         let colors = &cx.theme().colors;
         let input = self.filter_input.as_ref().unwrap().clone();
         let status = if self.connected { "NEWS MONITOR" } else { "RECONNECTING" };

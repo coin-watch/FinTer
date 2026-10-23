@@ -59,7 +59,19 @@ pub struct TapePanel {
 }
 
 impl TapePanel {
-    pub fn new(feed: TickFeed, title: impl Into<String>, cx: &mut App) -> Self {
+    pub fn new(feed: TickFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        let mut last = feed.sequence();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                if this.update(cx, |panel, cx| {
+                    let sequence = panel.feed.sequence();
+                    if sequence != last && !panel.is_paused { cx.notify(); }
+                    last = sequence;
+                }).is_err() { break; }
+            }
+        }).detach();
         Self {
             feed,
             title: title.into(),
@@ -172,10 +184,10 @@ fn classify_audio_batch(ticks: &[Arc<UnifiedTick>]) -> Option<Tone> {
 }
 
 impl Render for TapePanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_paused {
             self.process_new_audio();
-            window.request_animation_frame();
+    
         }
 
         let theme = cx.theme();

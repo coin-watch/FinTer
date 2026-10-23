@@ -37,6 +37,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 rodio = { version = "0.19", default-features = false, features = ["wav"] }
 
 [patch.crates-io]
+gpui = { path = "gpui-patched" }
 gpui-component = { path = "gpui-component-patched" }
 
 [build-dependencies]

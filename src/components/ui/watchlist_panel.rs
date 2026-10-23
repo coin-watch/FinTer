@@ -3,7 +3,7 @@
 /// Shows starred symbols by default and searches the catalog on demand.
 /// Supports interactive column sorting (Asset, Price, 24h %, Volume)
 /// and real-time market prices.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
@@ -34,6 +34,17 @@ pub enum SortColumn {
     Volume24h,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchlistFilter {
+    All,
+    Favorites,
+    L1,
+    Defi,
+    Meme,
+    Gainers,
+    Losers,
+}
+
 #[derive(Clone)]
 pub struct WatchlistEntry {
     pub symbol: String,
@@ -41,9 +52,13 @@ pub struct WatchlistEntry {
     pub name: String,
     pub exchange: String,
     pub category: &'static str,
+    pub quote: String,
     pub initial_price: f64,
-    pub change_24h: f64,
-    pub volume_24h_usd: f64,
+    pub open_24h: Option<f64>,
+    pub high_24h: Option<f64>,
+    pub low_24h: Option<f64>,
+    pub change_24h: Option<f64>,
+    pub volume_24h_usd: Option<f64>,
     pub feed: Option<TickFeed>,
     pub sparkline: Vec<f64>,
 }
@@ -62,6 +77,7 @@ pub struct WatchlistPanel {
     search_input: Option<Entity<InputState>>,
     sort_column: SortColumn,
     sort_ascending: bool,
+    filter: WatchlistFilter,
     favorites: HashSet<String>,
     last_catalog_refresh: Option<std::time::Instant>,
     tracked: Arc<Mutex<HashSet<String>>>,
@@ -71,11 +87,12 @@ pub struct WatchlistPanel {
 impl WatchlistPanel {
     pub fn new(title: impl Into<String>, cx: &mut App) -> Self {
         let default_entries = Arc::new(Mutex::new(Self::initial_catalog()));
-        let mut favorites = HashSet::new();
-        // Default favorites
-        favorites.insert("binance:BTC/USDT".to_string());
-        favorites.insert("binance:ETH/USDT".to_string());
-        favorites.insert("binance:SOL/USDT".to_string());
+        let favorites = if Self::favorites_path().is_some_and(|path| path.exists()) {
+            Self::load_favorites()
+        } else {
+            ["binance:BTC/USDT", "binance:ETH/USDT", "binance:SOL/USDT"]
+                .into_iter().map(str::to_string).collect()
+        };
 
         let tracked = Arc::new(Mutex::new(favorites.clone()));
         let cancel_token = CancellationToken::new();
@@ -97,6 +114,7 @@ impl WatchlistPanel {
             search_input: None,
             sort_column: SortColumn::Volume24h,
             sort_ascending: false,
+            filter: WatchlistFilter::Favorites,
             favorites,
             tracked,
             last_catalog_refresh: None,
@@ -115,6 +133,42 @@ impl WatchlistPanel {
 
     fn favorite_key(exchange: &str, symbol: &str) -> String {
         format!("{}:{}", exchange.to_lowercase(), symbol.to_uppercase())
+    }
+
+    fn favorites_path() -> Option<std::path::PathBuf> {
+        dirs::config_dir().map(|mut path| {
+            path.push("finter");
+            path.push("watchlist_favorites.json");
+            path
+        })
+    }
+
+    fn load_favorites() -> HashSet<String> {
+        let Some(path) = Self::favorites_path() else { return HashSet::new() };
+        let Ok(data) = std::fs::read_to_string(path) else { return HashSet::new() };
+        let Ok(values) = serde_json::from_str::<Vec<String>>(&data) else { return HashSet::new() };
+        values.into_iter().map(|value| {
+            if value.contains(':') { value } else { Self::favorite_key("binance", &value) }
+        }).collect()
+    }
+
+    fn save_favorites(&self) {
+        let Some(path) = Self::favorites_path() else { return };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string(&self.favorites.iter().collect::<Vec<_>>()) {
+            let _ = std::fs::write(path, data);
+        }
+    }
+
+    fn category_for(base: &str) -> &'static str {
+        match base.to_ascii_uppercase().as_str() {
+            "BTC" | "ETH" | "SOL" | "BNB" | "AVAX" | "SUI" | "NEAR" | "ADA" | "DOT" => "L1",
+            "UNI" | "AAVE" | "LINK" | "MKR" | "CRV" | "LDO" | "SNX" => "DeFi",
+            "DOGE" | "SHIB" | "PEPE" | "WIF" | "BONK" | "FLOKI" => "Meme",
+            _ => "Infra",
+        }
     }
 
     pub fn is_favorite(&self, exchange: &str, symbol: &str) -> bool {
@@ -141,6 +195,7 @@ impl WatchlistPanel {
                 t.insert(key);
             }
         }
+        self.save_favorites();
     }
 
     fn ensure_search_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -155,6 +210,19 @@ impl WatchlistPanel {
             }
         }).detach();
         self.search_input = Some(input);
+        // Coalesce live prices and catalog arrivals instead of rebuilding the
+        // entire watchlist on every display frame. Weak entity access stops the
+        // task as soon as the panel is closed.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }).detach();
     }
 
     pub fn toggle_sort(&mut self, col: SortColumn) {
@@ -180,12 +248,16 @@ impl WatchlistPanel {
                 entries.push(WatchlistEntry {
                     symbol: info.symbol,
                     base: base.clone(),
-                    name: base,
+                    name: base.clone(),
                     exchange: exchange.clone(),
-                    category: "Market",
+                    category: Self::category_for(&base),
+                    quote: info.quote.clone(),
                     initial_price: 0.0,
-                    change_24h: 0.0,
-                    volume_24h_usd: 0.0,
+                    open_24h: None,
+                    high_24h: None,
+                    low_24h: None,
+                    change_24h: None,
+                    volume_24h_usd: None,
                     feed: None,
                     sparkline: Vec::new(),
                 });
@@ -219,12 +291,16 @@ impl WatchlistPanel {
                 refreshed.push(WatchlistEntry {
                     symbol: info.symbol,
                     base: base.clone(),
-                    name: base,
+                    name: base.clone(),
                     exchange: exchange.clone(),
-                    category: "Market",
+                    category: Self::category_for(&base),
+                    quote: if info.quote.is_empty() { info.quote_asset.unwrap_or_default() } else { info.quote },
                     initial_price: 0.0,
-                    change_24h: 0.0,
-                    volume_24h_usd: 0.0,
+                    open_24h: None,
+                    high_24h: None,
+                    low_24h: None,
+                    change_24h: None,
+                    volume_24h_usd: None,
                     feed: None,
                     sparkline: Vec::new(),
                 });
@@ -261,9 +337,22 @@ impl WatchlistPanel {
 
 impl Render for WatchlistPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+        // Live updates are delivered by the syncer; don't force a 60 FPS repaint
+        // while the panel is idle. Input/sort/favorite events still notify GPUI.
         self.ensure_search_input(window, cx);
-        if self.last_catalog_refresh.map_or(true, |last| last.elapsed() >= std::time::Duration::from_secs(2)) {
+        let needs_refresh = match self.last_catalog_refresh {
+            None => true,
+            Some(last) => {
+                let is_small = self.entries.lock().map_or(false, |e| e.len() < 20);
+                let interval = if is_small {
+                    std::time::Duration::from_secs(5)
+                } else {
+                    std::time::Duration::from_secs(120)
+                };
+                last.elapsed() >= interval
+            }
+        };
+        if needs_refresh {
             self.refresh_catalog();
             self.last_catalog_refresh = Some(std::time::Instant::now());
         }
@@ -276,28 +365,30 @@ impl Render for WatchlistPanel {
 
         // Filter items: watchlist table only lists starred symbols
         let query = self.search_query.trim().to_lowercase();
-        let entries = self.entries.lock().unwrap().clone();
-        let mut filtered: Vec<WatchlistEntry> = entries
-            .iter()
-            .filter(|item| self.is_favorite(&item.exchange, &item.symbol))
-            .cloned()
-            .collect();
-
-        let mut search_matches: Vec<WatchlistEntry> = if query.is_empty() {
-            Vec::new()
-        } else {
-            let words: Vec<&str> = query.split_whitespace().collect();
-            entries
+        let (mut filtered, mut search_matches) = {
+            let guard = self.entries.lock().unwrap();
+            let favs = guard
                 .iter()
-                .filter(|item| {
-                    words.iter().all(|w| {
-                        item.symbol.to_lowercase().contains(w)
-                            || item.base.to_lowercase().contains(w)
-                            || item.exchange.to_lowercase().contains(w)
-                    })
-                })
+                .filter(|item| self.is_favorite(&item.exchange, &item.symbol))
                 .cloned()
-                .collect()
+                .collect::<Vec<_>>();
+            let search = if query.is_empty() {
+                Vec::new()
+            } else {
+                let words: Vec<&str> = query.split_whitespace().collect();
+                guard
+                    .iter()
+                    .filter(|item| {
+                        words.iter().all(|w| {
+                            item.symbol.to_lowercase().contains(w)
+                                || item.base.to_lowercase().contains(w)
+                                || item.exchange.to_lowercase().contains(w)
+                        })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            (favs, search)
         };
         search_matches.sort_by(|a, b| {
             let a_fav = self.is_favorite(&a.exchange, &a.symbol);
@@ -313,8 +404,8 @@ impl Render for WatchlistPanel {
             let ordering = match self.sort_column {
                 SortColumn::Asset => a.symbol.cmp(&b.symbol),
                 SortColumn::Price => a.initial_price.partial_cmp(&b.initial_price).unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Change24h => a.change_24h.partial_cmp(&b.change_24h).unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Volume24h => a.volume_24h_usd.partial_cmp(&b.volume_24h_usd).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Change24h => a.change_24h.unwrap_or(f64::NEG_INFINITY).partial_cmp(&b.change_24h.unwrap_or(f64::NEG_INFINITY)).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Volume24h => a.volume_24h_usd.unwrap_or(f64::NEG_INFINITY).partial_cmp(&b.volume_24h_usd.unwrap_or(f64::NEG_INFINITY)).unwrap_or(std::cmp::Ordering::Equal),
             };
             if self.sort_ascending {
                 ordering
@@ -514,7 +605,7 @@ impl WatchlistPanel {
     ) -> gpui::Stateful<gpui::Div> {
         let colors = &cx.theme().colors;
         let is_fav = self.is_favorite(&item.exchange, &item.symbol);
-        let is_positive = item.change_24h >= 0.0;
+        let is_positive = item.change_24h.map_or(false, |c| c >= 0.0);
 
         let row_bg = if idx.is_multiple_of(2) {
             colors.table_even
@@ -608,30 +699,19 @@ impl WatchlistPanel {
                             .px_1p5()
                             .py(px(0.5))
                             .rounded(px(3.0))
-                            .bg(if item.initial_price > 0.0 {
-                                if is_positive {
-                                    colors.bullish.opacity(0.15)
-                                } else {
-                                    colors.bearish.opacity(0.15)
-                                }
-                            } else {
-                                colors.muted.opacity(0.2)
+                            .bg(match item.change_24h {
+                                Some(_) => if is_positive { colors.bullish.opacity(0.15) } else { colors.bearish.opacity(0.15) },
+                                None => colors.muted.opacity(0.2),
                             })
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(if item.initial_price > 0.0 {
-                                if is_positive {
-                                    colors.bullish
-                                } else {
-                                    colors.bearish
-                                }
-                            } else {
-                                colors.muted_foreground
+                            .text_color(match item.change_24h {
+                                Some(_) => if is_positive { colors.bullish } else { colors.bearish },
+                                None => colors.muted_foreground,
                             })
-                            .child(if item.initial_price > 0.0 {
-                                format!("{}{:.2}%", if is_positive { "+" } else { "" }, item.change_24h)
-                            } else {
-                                "—".to_string()
+                            .child(match item.change_24h {
+                                Some(change) => format!("{}{:.2}%", if is_positive { "+" } else { "" }, change),
+                                None => "—".to_string(),
                             }),
                     ),
             )
@@ -644,10 +724,9 @@ impl WatchlistPanel {
                         .text_size(px(10.5))
                         .font_weight(FontWeight::NORMAL)
                         .text_color(colors.muted_foreground)
-                        .child(if item.volume_24h_usd > 0.0 {
-                            Self::fmt_vol(item.volume_24h_usd)
-                        } else {
-                            "—".to_string()
+                        .child(match item.volume_24h_usd {
+                            Some(volume) => Self::fmt_vol(volume),
+                            None => "—".to_string(),
                         }),
                 )
             })
@@ -659,53 +738,80 @@ impl WatchlistPanel {
 // ---------------------------------------------------------------------------
 
 async fn run_watchlist_syncer(entries: Arc<Mutex<Vec<WatchlistEntry>>>, tracked: Arc<Mutex<HashSet<String>>>, cancel: CancellationToken) {
-    let client = reqwest::Client::new();
-    let base = crate::data::client::service_base_url();
+    type Stream = (Arc<crate::data::bridge::Bridge>, tokio::sync::broadcast::Receiver<Arc<crate::data::tick::UnifiedTick>>);
+    let mut streams: HashMap<String, Stream> = HashMap::new();
+
     loop {
-        let mut changed = false;
-        let targets = {
-            let tracked_set = tracked.lock().unwrap().clone();
-            let all = entries.lock().unwrap().clone();
-            all.into_iter()
-                .filter(|e| {
-                    let key = format!("{}:{}", e.exchange.to_lowercase(), e.symbol.to_uppercase());
-                    tracked_set.contains(&key)
-                        || tracked_set.contains(&e.symbol)
-                        || (e.exchange.eq_ignore_ascii_case("binance") && tracked_set.contains(&e.symbol))
+        if cancel.is_cancelled() { return; }
+
+        let target_pairs: Vec<(String, String, String)> = {
+            let tracked_set = tracked.lock().unwrap();
+            let guard = entries.lock().unwrap();
+            guard
+                .iter()
+                .filter_map(|entry| {
+                    let key = WatchlistPanel::favorite_key(&entry.exchange, &entry.symbol);
+                    if tracked_set.contains(&key) || tracked_set.contains(&entry.symbol) {
+                        Some((key, entry.exchange.clone(), entry.symbol.clone()))
+                    } else {
+                        None
+                    }
                 })
-                .collect::<Vec<_>>()
+                .collect()
         };
-        for entry in targets {
-            if cancel.is_cancelled() { return; }
-            let url = format!("{base}/api/v1/ticker?exchange={}&symbol={}", entry.exchange, entry.symbol);
-            let mut req = client.get(&url).header("Accept", "application/json");
+
+        let target_keys: HashSet<&str> = target_pairs.iter().map(|(k, _, _)| k.as_str()).collect();
+        streams.retain(|key, _| target_keys.contains(key.as_str()));
+
+        for (key, exchange, symbol) in target_pairs {
+            if streams.contains_key(&key) { continue; }
+            let mut config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
             if let Ok(Some(session)) = crate::data::session_store::load_session() {
-                req = req.bearer_auth(session.access_token);
+                config.access_token = Some(session.access_token);
             }
-            if let Ok(response) = req.send().await {
-                if let Ok(value) = response.json::<serde_json::Value>().await {
-                    let price = value.get("last").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if price > 0.0 {
-                        let change = value.get("changePercent").or_else(|| value.get("percentage")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let volume = value.get("quoteVolume").or_else(|| value.get("volume")).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        if let Ok(mut current) = entries.lock() {
-                            if let Some(row) = current.iter_mut().find(|row| row.symbol == entry.symbol && row.exchange == entry.exchange) {
-                                row.initial_price = price;
-                                row.change_24h = change;
-                                row.volume_24h_usd = volume;
-                                row.sparkline.push(price);
+            if let Ok(bridge) = crate::data::bridge::Bridge::start(config) {
+                let bridge = Arc::new(bridge);
+                let rx = bridge.subscribe();
+                streams.insert(key, (bridge, rx));
+            }
+        }
+
+        let mut updates: HashMap<String, Vec<Arc<crate::data::tick::UnifiedTick>>> = HashMap::new();
+        for (key, (_, rx)) in streams.iter_mut() {
+            while let Ok(tick) = rx.try_recv() {
+                updates.entry(key.clone()).or_default().push(tick);
+            }
+        }
+
+        if !updates.is_empty() {
+            if let Ok(mut current) = entries.lock() {
+                for row in current.iter_mut() {
+                    let key = WatchlistPanel::favorite_key(&row.exchange, &row.symbol);
+                    if let Some(ticks) = updates.get(&key) {
+                        for tick in ticks {
+                            if tick.price > 0.0 {
+                                row.initial_price = tick.price;
+                                row.sparkline.push(tick.price);
                                 if row.sparkline.len() > 60 { row.sparkline.remove(0); }
-                                changed = true;
                             }
+                            if let Some(change) = tick.change_24h_percent {
+                                row.change_24h = Some(change);
+                            }
+                            if let Some(volume) = tick.quote_volume_24h {
+                                row.volume_24h_usd = Some(volume);
+                            }
+                            if tick.open_24h.is_some() { row.open_24h = tick.open_24h; }
+                            if tick.high_24h.is_some() { row.high_24h = tick.high_24h; }
+                            if tick.low_24h.is_some() { row.low_24h = tick.low_24h; }
                         }
                     }
                 }
             }
         }
-        if changed { /* next GPUI frame reads the shared snapshot */ }
+
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
     }
 }

@@ -23,12 +23,26 @@ pub struct ExecutionPanel {
     margin: f64,
 }
 impl ExecutionPanel {
-    pub fn new(feed: TickFeed, title: impl Into<String>, symbol: impl Into<String>, cx: &mut App) -> Self {
+    pub fn new(feed: TickFeed, title: impl Into<String>, symbol: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        let feed_for_timer = feed.clone();
+        cx.spawn(async move |this, cx| {
+            let mut last = feed_for_timer.sequence();
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let sequence = feed_for_timer.sequence();
+                let changed = sequence != last;
+                last = sequence;
+                if this.update(cx, |_, cx| {
+                    if changed { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         Self { feed, title: title.into(), symbol: symbol.into(), focus_handle: cx.focus_handle(), width: 0.0, height: 0.0, side: Side::Long, leverage: 10, margin: 100.0 }
     }
     pub fn set_size(&mut self, width: f32, height: f32) { self.width = width; self.height = height; }
     pub fn has_size(&self, width: f32, height: f32) -> bool { (self.width-width).abs() < 0.5 && (self.height-height).abs() < 0.5 }
-    fn price(&self) -> Option<f64> { self.feed.snapshot().last().map(|t| t.price).filter(|p| p.is_finite() && *p > 0.0) }
+    fn price(&self) -> Option<f64> { self.feed.latest().map(|t| t.price).filter(|p| p.is_finite() && *p > 0.0) }
     fn fmt(v: f64) -> String { if v >= 1000.0 { format!("{v:.2}") } else if v >= 1.0 { format!("{v:.4}") } else { format!("{v:.6}") } }
     fn side_button(&self, side: Side, label: &'static str, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
         let c = &cx.theme().colors;
@@ -54,8 +68,8 @@ impl ExecutionPanel {
     }
 }
 impl Render for ExecutionPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+
         let c = &cx.theme().colors;
         let mark = self.price();
         let narrow = self.width < 310.0;

@@ -21,16 +21,12 @@ use crate::data::version::UpdateState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, StyleRefinement, Styled, Timer, Window, WindowControlArea, div, px,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, WindowControlArea, div, px,
 };
 use gpui_component::button::ButtonVariants;
 use gpui_component::Sizable;
 use gpui_component::theme::ActiveTheme;
 use std::sync::Arc;
-use std::time::Duration;
-
-/// Auto-save interval in seconds
-const AUTO_SAVE_INTERVAL_SECS: u64 = 5;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Page {
@@ -144,9 +140,6 @@ pub struct MainView {
     user_settings: Option<SettingsData>,
     /// Currently active cloud module (if any)
     active_module: Option<Module>,
-    /// Timer handle for auto-save
-    auto_save_timer_started: bool,
-    token_refresh_timer_started: bool,
     /// Pending dialog action to execute in render phase
     pending_dialog_action: Option<PendingDialogAction>,
     /// Pending module load to execute after HomePage is created
@@ -182,8 +175,6 @@ impl MainView {
             is_restoring: false,
             user_settings: None,
             active_module: None,
-            auto_save_timer_started: false,
-            token_refresh_timer_started: false,
             pending_dialog_action: None,
             pending_module_load: None,
             dashboard_modules: Vec::new(),
@@ -328,10 +319,6 @@ impl MainView {
             return;
         }
         self.is_restoring = true;
-
-        // Start auto-save timer immediately for all users (authenticated or local-only)
-        self.start_auto_save_timer(cx);
-        self.start_token_refresh_timer(cx);
 
         // Synchronously load guest settings cache on initial startup
         let startup_settings_path = Self::guest_settings_path().or_else(Self::cloud_settings_path);
@@ -1384,81 +1371,6 @@ impl MainView {
         }
     }
 
-    /// Start the token refresh timer to keep the session alive
-    fn start_token_refresh_timer(&mut self, cx: &mut Context<Self>) {
-        if self.token_refresh_timer_started {
-            return;
-        }
-        self.token_refresh_timer_started = true;
-        let client = self.api_client.clone();
-        
-        cx.spawn(async move |this, cx| {
-            loop {
-                // Check every 2 minutes
-                gpui::Timer::after(std::time::Duration::from_secs(120)).await;
-                
-                let is_auth = this.update(cx, |this, _| this.is_authenticated).unwrap_or(false);
-                if !is_auth { continue; }
-                
-                // clone client for blocking task
-                let client_clone = client.clone();
-                let rt = crate::data::client::tokio_runtime();
-                let _ = rt.spawn_blocking(move || {
-                    let mut needs_refresh = false;
-                    if let Some(session) = client_clone.get_session() {
-                        if let Some(exp) = session.expires_at {
-                            use std::time::{SystemTime, UNIX_EPOCH};
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-                            // Refresh if expiring within 10 minutes (600s)
-                            if exp <= now + 600 {
-                                needs_refresh = true;
-                            }
-                        } else {
-                            // No expiry, maybe refresh anyway just in case? Or rely on default token validity
-                        }
-                    }
-                    if needs_refresh {
-                        tracing::info!("Token expiring soon, refreshing in background...");
-                        if let Err(e) = client_clone.refresh_token() {
-                            tracing::warn!("Background token refresh failed: {}", e);
-                        }
-                    }
-                }).await;
-            }
-        }).detach();
-    }
-
-    /// Start the auto-save timer that checks for dirty layouts periodically
-    fn start_auto_save_timer(&mut self, cx: &mut Context<Self>) {
-        if self.auto_save_timer_started {
-            return;
-        }
-        self.auto_save_timer_started = true;
-
-        cx.spawn(async move |this, cx| {
-            loop {
-                // Wait for the interval
-                Timer::after(Duration::from_secs(AUTO_SAVE_INTERVAL_SECS)).await;
-
-                // Check and save dirty layouts (works for both authenticated and local-only users)
-                let should_continue = this.update(cx, |this, cx| {
-                    this.check_and_save_dirty_layouts(cx);
-                    true
-                });
-
-                if should_continue.is_err() || !should_continue.unwrap_or(false) {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Check for dirty layouts and save them to the database
-    fn check_and_save_dirty_layouts(&mut self, _cx: &mut Context<Self>) {
-        tracing::debug!("check_and_save_dirty_layouts called (pane grid removed)");
-    }
-
     /// Save the current layout immediately (called on LayoutModified events)
     fn save_current_layout_immediately(&mut self, cx: &mut Context<Self>) {
         if let Some(home) = &self.home_page {
@@ -1536,7 +1448,6 @@ impl MainView {
                 this.dashboard_page = None;
                 this.user_settings = None;
                 this.active_module = None;
-                this.auto_save_timer_started = false;
                 this.load_guest_layout(cx);
                 cx.notify();
             });
@@ -1628,7 +1539,12 @@ impl MainView {
                 // Header with title and search (draggable)
                 div()
                     .id("secondary-sidebar-header")
-                    .window_control_area(WindowControlArea::Drag)
+                    // GPUI's Linux client-decoration hit-test path is not active;
+                    // use the explicit compositor move there. Other platforms use
+                    // the native drag region to avoid competing drag handlers.
+                    .when(!cfg!(target_os = "linux"), |this| {
+                        this.window_control_area(WindowControlArea::Drag)
+                    })
                     .when(cfg!(target_os = "linux"), |this| {
                         this.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                             window.start_window_move();

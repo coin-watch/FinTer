@@ -6,7 +6,7 @@
 //! - On Linux: Renders custom window controls with client-side decorations
 
 use gpui::{
-    AnyElement, App, ClickEvent, Decorations, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, App, ClickEvent, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Pixels, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled,
     Window, WindowControlArea, div, prelude::FluentBuilder as _, px,
 };
@@ -94,7 +94,6 @@ impl ParentElement for FinTerTitleBar {
 
 impl RenderOnce for FinTerTitleBar {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let is_client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
         let is_linux = cfg!(target_os = "linux");
         let is_macos = cfg!(target_os = "macos");
 
@@ -164,8 +163,13 @@ impl RenderOnce for FinTerTitleBar {
                                 .id("title-bar-drag-spacer")
                                 .flex_1()
                                 .h_full()
-                                .window_control_area(WindowControlArea::Drag)
-                                .when(is_linux && is_client_decorated, |this| {
+                                // Linux GPUI's WindowControlArea is not wired to the X11 /
+                                // Wayland hit-test callbacks, so keep the explicit compositor
+                                // move there. Other platforms use GPUI's native drag region.
+                                .when(!is_linux, |this| {
+                                    this.window_control_area(WindowControlArea::Drag)
+                                })
+                                .when(is_linux, |this| {
                                     this.on_mouse_down(MouseButton::Left, |_, window, _| {
                                         window.start_window_move();
                                     })

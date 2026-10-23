@@ -105,7 +105,21 @@ pub struct PositionsPanel {
 }
 
 impl PositionsPanel {
-    pub fn new(positions: Vec<Position>, title: impl Into<String>, cx: &mut App) -> Self {
+    pub fn new(positions: Vec<Position>, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        // Coalesce external updates; weak access ends the task on panel close.
+        let feeds: Vec<_> = positions.iter().map(|position| position.feed.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            let mut last: Vec<u64> = feeds.iter().map(TickFeed::sequence).collect();
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let current: Vec<u64> = feeds.iter().map(TickFeed::sequence).collect();
+                let changed = current != last;
+                last = current;
+                if this.update(cx, |_, cx| {
+                    if changed { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         Self {
             positions,
             title: title.into(),
@@ -393,9 +407,8 @@ impl PositionsPanel {
 }
 
 impl Render for PositionsPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Schedule a repaint on the next frame for live P&L updates.
-        window.request_animation_frame();
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+
         let colors = &cx.theme().colors;
 
         v_flex()

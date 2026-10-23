@@ -95,8 +95,12 @@ impl TickFeed {
     }
 
     pub fn sequence(&self) -> u64 {
-        let _buffer = self.inner.lock().expect("TickFeed mutex poisoned");
         self.sequence.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return the newest tick without cloning the full ring buffer.
+    pub fn latest(&self) -> Option<Arc<UnifiedTick>> {
+        self.inner.lock().expect("TickFeed mutex poisoned").back().cloned()
     }
 
     /// Number of ticks currently in the ring buffer.

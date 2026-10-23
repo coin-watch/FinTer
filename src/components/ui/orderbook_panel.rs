@@ -41,7 +41,26 @@ pub struct OrderBookPanel {
 }
 
 impl OrderBookPanel {
-    pub fn new(feed: OrderBookFeed, title: impl Into<String>, cx: &mut App) -> Self {
+    pub fn new(feed: OrderBookFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
+        // Weak entity updates stop polling when the panel is closed.
+        let feed_for_timer = feed.clone();
+        cx.spawn(async move |this, cx| {
+            let mut last = feed_for_timer.snapshot();
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                let latest = feed_for_timer.snapshot();
+                let changed = match (&last, &latest) {
+                    (Some(previous), Some(current)) => !std::sync::Arc::ptr_eq(previous, current),
+                    (None, None) => false,
+                    _ => true,
+                };
+                if changed { last = latest; }
+                // Always touch the weak entity so this task ends after panel close.
+                if this.update(cx, |_, cx| {
+                    if changed { cx.notify(); }
+                }).is_err() { break; }
+            }
+        }).detach();
         Self {
             feed,
             title: title.into(),
@@ -376,10 +395,7 @@ impl OrderBookPanel {
 }
 
 impl Render for OrderBookPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Keep repainting at 60 FPS.
-        window.request_animation_frame();
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = self.feed.snapshot();
         let qty_w = if self.width < 220.0 { 60.0 } else { 80.0 };
         let font_size = if self.width < 220.0 { 10.5 } else { 11.5 };
