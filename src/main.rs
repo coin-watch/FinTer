@@ -44,7 +44,7 @@ fn main() {
         // Register pane grid keyboard bindings
 
         cx.spawn(async move |cx| {
-            cx.open_window(
+            let main_window = cx.open_window(
                 WindowOptions {
                     #[cfg(target_os = "linux")]
                     titlebar: None,
@@ -63,6 +63,20 @@ fn main() {
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )?;
+
+            // Observe actual removal, not just native close requests: the custom
+            // title bar closes windows directly with Window::remove_window().
+            cx.update(move |cx| {
+                cx.on_window_closed(move |cx| {
+                    let main_is_open = cx.windows().iter().any(|window| {
+                        window.window_id() == main_window.window_id()
+                    });
+                    if !main_is_open {
+                        cx.quit();
+                    }
+                })
+                .detach();
+            })?;
 
             Ok::<_, anyhow::Error>(())
         })

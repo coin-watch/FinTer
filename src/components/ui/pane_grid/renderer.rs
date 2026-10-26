@@ -690,32 +690,46 @@ impl PaneGridRenderer {
             ("feargreed", "Fear & Greed", "Crypto market sentiment index", "icons/chart-pie.svg"),
         ];
 
-        let is_spacious = width >= 380.0 && height >= 220.0;
-        let is_compact = !is_spacious && (width >= 240.0 && height >= 140.0);
+        // Only show a grid when all of its rows fit inside the pane. Otherwise
+        // use denser columns, or the dropdown for very small panes.
+        let spacious_columns = if width >= 540.0 && height >= 340.0 {
+            Some(3)
+        } else if width >= 380.0 && height >= 500.0 {
+            Some(2)
+        } else {
+            None
+        };
+        let compact_columns = if width >= 400.0 && height >= 200.0 {
+            Some(3)
+        } else if width >= 280.0 && height >= 290.0 {
+            Some(2)
+        } else if width >= 180.0 && height >= 550.0 {
+            Some(1)
+        } else {
+            None
+        };
 
-        if is_spacious {
-            let use_3_cols = width >= 540.0;
-            let rows: Vec<Vec<(&str, &str, &str, &str)>> = if use_3_cols {
-                modules.chunks(3).map(|c| c.to_vec()).collect()
-            } else {
-                modules.chunks(2).map(|c| c.to_vec()).collect()
-            };
+        if let Some(columns) = spacious_columns {
+            let rows: Vec<Vec<(&str, &str, &str, &str)>> =
+                modules.chunks(columns).map(|row| row.to_vec()).collect();
 
-            let mut grid_div = div().flex().flex_col().gap(px(8.0)).w_full().max_w(px(580.0));
+            let mut grid_div = div().flex_1().min_h_0().flex().flex_col().gap(px(6.0)).w_full().max_w(px(580.0));
 
             for row in rows {
-                let mut row_div = div().flex().flex_row().gap(px(8.0)).w_full();
+                let mut row_div = div().flex_1().min_h_0().flex().flex_row().gap(px(6.0)).w_full();
                 for (mod_id, label, desc, icon_path) in row {
                     let target_pane_id = pane_id.to_string();
                     let mod_id_str = mod_id.to_string();
                     let card = div()
                         .id(ElementId::Name(format!("placeholder-card-{pane_id}-{mod_id}").into()))
                         .flex_1()
+                        .h_full()
                         .min_w_0()
+                        .min_h_0()
                         .flex()
                         .items_center()
                         .gap(px(10.0))
-                        .p(px(10.0))
+                        .p(px(8.0))
                         .rounded_md()
                         .border_1()
                         .border_color(colors.border)
@@ -793,15 +807,16 @@ impl PaneGridRenderer {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .p(px(16.0))
+                .p(px(8.0))
                 .bg(colors.background)
                 .child(
                     div()
+                        .flex_shrink_0()
                         .flex()
                         .flex_col()
                         .items_center()
-                        .gap(px(4.0))
-                        .mb(px(14.0))
+                        .gap(px(2.0))
+                        .mb(px(8.0))
                         .child(
                             div()
                                 .px(px(6.0))
@@ -823,30 +838,28 @@ impl PaneGridRenderer {
                 )
                 .child(grid_div)
                 .into_any_element()
-        } else if is_compact {
-            let use_2_cols = width >= 280.0;
-            let rows: Vec<Vec<(&str, &str, &str, &str)>> = if use_2_cols {
-                modules.chunks(2).map(|c| c.to_vec()).collect()
-            } else {
-                modules.iter().map(|&m| vec![m]).collect()
-            };
+        } else if let Some(columns) = compact_columns {
+            let rows: Vec<Vec<(&str, &str, &str, &str)>> =
+                modules.chunks(columns).map(|row| row.to_vec()).collect();
 
-            let mut list_div = div().flex().flex_col().gap(px(4.0)).w_full().max_w(px(380.0));
+            let mut list_div = div().flex_1().min_h_0().flex().flex_col().gap(px(3.0)).w_full().max_w(px(580.0));
 
             for row in rows {
-                let mut row_div = div().flex().flex_row().gap(px(4.0)).w_full();
+                let mut row_div = div().flex_1().min_h_0().flex().flex_row().gap(px(3.0)).w_full();
                 for (mod_id, label, _, icon_path) in row {
                     let target_pane_id = pane_id.to_string();
                     let mod_id_str = mod_id.to_string();
                     let item = div()
                         .id(ElementId::Name(format!("compact-pick-{pane_id}-{mod_id}").into()))
                         .flex_1()
+                        .h_full()
                         .min_w_0()
+                        .min_h_0()
                         .flex()
                         .items_center()
                         .gap(px(6.0))
-                        .px(px(8.0))
-                        .py(px(5.0))
+                        .px(px(6.0))
+                        .py(px(4.0))
                         .rounded_sm()
                         .border_1()
                         .border_color(colors.border)
@@ -899,14 +912,15 @@ impl PaneGridRenderer {
                 .flex_col()
                 .items_center()
                 .justify_center()
-                .p(px(8.0))
+                .p(px(6.0))
                 .bg(colors.background)
                 .child(
                     div()
+                        .flex_shrink_0()
                         .text_size(px(10.5))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(colors.muted_foreground)
-                        .mb(px(6.0))
+                        .mb(px(4.0))
                         .child("Select Module")
                 )
                 .child(list_div)
@@ -963,8 +977,8 @@ impl PaneGridRenderer {
             PaneNode::Pane { id, data } => {
                 let theme = cx.theme().clone();
                 let module_type = data.module_type.as_deref().unwrap_or("Empty");
-                let content_w = (current_size.width - 8.0).max(10.0);
-                let content_h = (current_size.height - 8.0 - 33.0).max(10.0);
+                let content_w = (current_size.width - 6.0).max(10.0);
+                let content_h = (current_size.height - 6.0 - 33.0).max(10.0);
 
                 let is_empty = module_type.eq_ignore_ascii_case("empty") || module_type.is_empty();
                 let pane_id = id.clone();
@@ -1023,7 +1037,7 @@ impl PaneGridRenderer {
                 div()
                     .id(ElementId::Name(format!("pane-wrapper-{pane_id}").into()))
                     .size_full()
-                    .p(px(4.0))
+                    .p(px(3.0))
                     .when(is_dragged, |this| {
                         this.child(
                             div()
@@ -1759,7 +1773,8 @@ impl PaneGridRenderer {
                                     let config = data.config.as_object();
                                     let exchange = config_str(config, "exchange", "binance");
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
-                                    let timeframe = config_str(config, "interval", "1m");
+                                    // Older FinTer layouts used `timeframe`; web layouts use `interval`.
+                                    let timeframe = config_str(config, "interval", &config_str(config, "timeframe", "1m"));
                                     let chart_type = config_str(config, "type", "candle_solid");
 
                                     let mut chart_map = self.chart_views.borrow_mut();
@@ -1783,6 +1798,14 @@ impl PaneGridRenderer {
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
                                         bridge_config.timeframe = timeframe.clone();
+                                        bridge_config.trades = false;
+                                        bridge_config.orderbook = false;
+                                        bridge_config.ticker = false;
+                                        if timeframe == "1s" {
+                                            bridge_config.fetch_history = false;
+                                            bridge_config.kline = false;
+                                            bridge_config.ticker = true;
+                                        }
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -1797,13 +1820,22 @@ impl PaneGridRenderer {
                                                 
                                                 let bc = bridge_config_clone;
                                                 let feed_clone = feed.clone();
-                                                let load_more: std::sync::Arc<dyn Fn(i64) + Send + Sync> = std::sync::Arc::new(move |until: i64| {
+                                                let load_more: std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync> = std::sync::Arc::new(move |until: i64, done: std::sync::mpsc::Sender<()>| {
                                                     let bc = bc.clone();
                                                     let feed = feed_clone.clone();
                                                     crate::data::client::tokio_runtime().spawn(async move {
-                                                        if let Ok(history) = crate::data::bridge::fetch_ohlcv_history(&bc, Some(until)).await {
-                                                            feed.prepend_history(&history);
+                                                        match crate::data::bridge::fetch_ohlcv_history(&bc, Some(until)).await {
+                                                            Ok(history) if !history.is_empty() => {
+                                                                feed.prepend_history(&history);
+                                                            }
+                                                            Ok(_) => {
+                                                                tracing::warn!("chart: historical request returned no candles through {}", until);
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::error!("chart: historical request failed through {}: {}", until, e);
+                                                            }
                                                         }
+                                                        let _ = done.send(());
                                                     });
                                                 });
                                                 
@@ -1891,6 +1923,10 @@ impl PaneGridRenderer {
 
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        bridge_config.ticker = false;
+                                        bridge_config.trades = false;
+                                        bridge_config.kline = false;
+                                        bridge_config.fetch_history = false;
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -1935,6 +1971,11 @@ impl PaneGridRenderer {
 
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        bridge_config.ticker = false;
+                                        bridge_config.trades = false;
+                                        bridge_config.kline = false;
+                                        bridge_config.fetch_history = false;
+                                         bridge_config.snapshot = Some(("orderbook", 100, "Depth"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -1977,6 +2018,11 @@ impl PaneGridRenderer {
 
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        bridge_config.ticker = false;
+                                        bridge_config.orderbook = false;
+                                        bridge_config.kline = false;
+                                        bridge_config.fetch_history = false;
+                                         bridge_config.snapshot = Some(("trades", 60, "Trades"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -2040,6 +2086,10 @@ impl PaneGridRenderer {
                                     };
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+                                        bridge_config.trades = false;
+                                        bridge_config.orderbook = false;
+                                        bridge_config.kline = false;
+                                        bridge_config.fetch_history = false;
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -2076,8 +2126,14 @@ impl PaneGridRenderer {
                                         }
                                         ent
                                     } else {
+                                        let config = data.config.as_object();
+                                        let market = config.and_then(|c| {
+                                            let exchange = c.get("exchange")?.as_str()?;
+                                            let symbol = c.get("symbol")?.as_str()?;
+                                            Some((exchange, symbol))
+                                        });
                                         let entity = cx.new(|cx| {
-                                            let mut p = crate::components::ui::watchlist_panel::WatchlistPanel::new("Watchlist", cx);
+                                            let mut p = crate::components::ui::watchlist_panel::WatchlistPanel::new_with_market("Watchlist", market, cx);
                                             p.set_size(content_w, content_h);
                                             p
                                         });

@@ -271,17 +271,7 @@ impl MainView {
             None
         };
 
-        let tree = tree.unwrap_or_else(|| PaneNode::Pane {
-            id: PaneNode::generate_id(),
-            data: ModuleData {
-                module_type: Some("Chart".into()),
-                config: serde_json::json!({
-                    "exchange": "binance",
-                    "symbol": "BTC/USDT",
-                    "timeframe": "1m"
-                }),
-            },
-        });
+        let tree = tree.unwrap_or_else(crate::data::modules::default_workspace);
 
         if let Ok(tree_value) = serde_json::to_value(&tree) {
             let module = Module {

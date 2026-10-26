@@ -22,21 +22,32 @@ pub struct PaneData {
 /// Default module name for new users
 pub const DEFAULT_MODULE_NAME: &str = "Default Layout";
 
-/// Create a default single empty pane layout JSON for new users.
-/// This creates a simple layout with one empty panel that the user can configure.
-///
-/// The format matches Configuration<PaneData> which serializes as:
-/// `{ "Pane": { "name": "...", "module_type": "...", ... } }`
+/// Starter workspace, used only when creating a default layout, never on reload.
+pub fn default_workspace() -> crate::data::pane_tree::PaneNode {
+    use crate::data::pane_tree::{Axis, ModuleData, PaneNode};
+    let pane = |kind: &str, config| PaneNode::Pane {
+        id: PaneNode::generate_id(),
+        data: ModuleData { module_type: Some(kind.into()), config },
+    };
+    PaneNode::Split {
+        id: PaneNode::generate_id(), axis: Axis::Vertical, ratio: 0.7,
+        a: Box::new(pane("chart", serde_json::json!({
+            "exchange": "binance", "symbol": "BTC/USDT", "interval": "1h", "type": "candle_solid"
+        }))),
+        b: Box::new(PaneNode::Split {
+            id: PaneNode::generate_id(), axis: Axis::Horizontal, ratio: 0.5,
+            a: Box::new(pane("trades", serde_json::json!({
+                "exchange": "binance", "symbol": "BTC/USDT"
+            }))),
+            b: Box::new(pane("watchlist", serde_json::json!({
+                "exchange": "binance", "symbol": "BTC/USDT"
+            }))),
+        }),
+    }
+}
+
 pub fn create_default_module_json() -> serde_json::Value {
-    serde_json::json!({
-        "Pane": {
-            "name": "Empty",
-            "module_type": "Empty",
-            "exchange": "",
-            "symbol": "",
-            "timeframe": ""
-        }
-    })
+    serde_json::to_value(default_workspace()).expect("starter workspace serializes")
 }
 
 /// Create a simple single-pane layout JSON with custom settings.
@@ -232,8 +243,7 @@ impl ApiClient {
 mod tests {
     use super::*;
     use crate::data::models::{CreateModuleRequest, UpdateModuleRequest};
-    use crate::data::modules::PaneData;
-    use gpui_component::pane_grid::Configuration;
+    use crate::data::pane_tree::PaneNode;
 
     #[test]
     fn test_create_module_request_serialization() {
@@ -261,15 +271,15 @@ mod tests {
     #[test]
     fn test_default_module_json_structure() {
         let json = create_default_module_json();
-        // Should be Configuration::Pane format with "Pane" key
-        assert!(json.get("Pane").is_some());
-        let content = &json["Pane"];
-        assert_eq!(content["name"], "Empty");
-        assert_eq!(content["module_type"], "Empty");
-        // Empty pane has empty strings for exchange/symbol/timeframe
-        assert_eq!(content["exchange"], "");
-        assert_eq!(content["symbol"], "");
-        assert_eq!(content["timeframe"], "");
+        let tree: PaneNode = serde_json::from_value(json).expect("starter workspace should parse");
+        assert!(matches!(tree, PaneNode::Split { .. }));
+        let serialized = serde_json::to_value(tree).unwrap();
+        let text = serialized.to_string();
+        assert!(text.contains("\"chart\""));
+        assert!(text.contains("\"trades\""));
+        assert!(text.contains("\"watchlist\""));
+        assert!(text.contains("\"1h\""));
+        assert!(text.contains("BTC/USDT"));
     }
 
     #[test]
@@ -295,18 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_module_json_parses_as_configuration() {
-        // Verify the JSON can be parsed as Configuration<PaneData>
+    fn test_default_module_json_parses_as_pane_tree() {
         let json = create_default_module_json();
-        let config: Configuration<PaneData> = serde_json::from_value(json)
-            .expect("Default module JSON should parse as Configuration<PaneData>");
-
-        match config {
-            Configuration::Pane(content) => {
-                assert_eq!(content.name, "Empty");
-                assert_eq!(content.module_type, "Empty");
-            }
-            _ => panic!("Expected Configuration::Pane variant"),
-        }
+        let tree: PaneNode = serde_json::from_value(json)
+            .expect("Default module JSON should parse as PaneNode");
+        assert_eq!(tree.collect_exchanges(), vec!["binance"]);
     }
 }

@@ -18,6 +18,11 @@ pub enum CoinWatchError {
     #[error("API error ({status}): {message}")]
     Api { status: u16, message: String },
 
+    /// CoinWatch market-data request was rejected because the account balance
+    /// is below the endpoint's credit cost.
+    #[error("Insufficient credits: {message} (balance {balance}, required {required})")]
+    InsufficientCredits { message: String, balance: i64, required: i64 },
+
     #[error("Deserialization error: {0}")]
     Deserialization(String),
 

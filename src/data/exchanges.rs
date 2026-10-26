@@ -245,6 +245,7 @@ impl ApiClient {
                     ("symbol", symbol.as_str()),
                     ("timeframe", timeframe.as_str()),
                     ("limit", &limit.to_string()),
+                    ("module", &format!("FinTer Chart · {} ({})", symbol, timeframe)),
                 ]);
 
             if let Some(since) = since {

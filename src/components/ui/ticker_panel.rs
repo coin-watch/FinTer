@@ -44,7 +44,14 @@ impl TickerPanel {
         }).detach();
         let mut config = BridgeConfig::default_dev(exchange, symbol);
         config.timeframe = "1h".to_string();
-        config.ohlcv_limit = 168; // 168 hourly candles = last 7 days (parity with CoinWatch Ticker.svelte)
+        // CoinWatch's ticker sparkline reuses the standard 500-candle snapshot.
+        config.ohlcv_limit = 500;
+        config.trades = false;
+        config.orderbook = false;
+        config.kline = false;
+        // The explicit task below owns this snapshot; do not fetch it again as
+        // a side effect of starting the ticker's WebSocket bridge.
+        config.fetch_history = false;
         if let Ok(Some(session)) = crate::data::session_store::load_session() {
             config.access_token = Some(session.access_token);
         }

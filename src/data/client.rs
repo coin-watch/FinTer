@@ -284,6 +284,18 @@ pub async fn parse_api_response<T: serde::de::DeserializeOwned>(
     let envelope: std::result::Result<crate::data::models::ApiResponse<T>, _> =
         serde_json::from_str(&body);
 
+    if status == 402 {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+            if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+                return Err(CoinWatchError::InsufficientCredits {
+                    message: value.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits").to_string(),
+                    balance: value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0),
+                    required: value.get("required").and_then(|v| v.as_i64()).unwrap_or(0),
+                });
+            }
+        }
+    }
+
     match envelope {
         Ok(resp) => {
             if resp.success {

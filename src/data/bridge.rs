@@ -11,7 +11,9 @@
 /// chart has data immediately; live kline updates then merge on top.
 ///
 /// Dropping the handle cancels the supervision loop and closes the connection.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
@@ -40,6 +42,19 @@ const OHLCV_BROADCAST_CAPACITY: usize = 64;
 
 /// Delay between WebSocket reconnection attempts (ms).
 const RECONNECT_DELAY_MS: u64 = 3_000;
+const HISTORY_CACHE_MAX_ENTRIES: usize = 200;
+
+#[derive(Clone)]
+struct HistoryCacheEntry {
+    candles: Vec<OhlcvCandle>,
+    expires_at: Instant,
+}
+
+static HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, HistoryCacheEntry>>> = OnceLock::new();
+
+fn history_request_cache() -> &'static Mutex<HashMap<String, HistoryCacheEntry>> {
+    HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -63,6 +78,14 @@ pub struct BridgeConfig {
     pub ohlcv_limit: u32,
     /// Optional CoinWatch API bearer token for protected REST endpoints.
     pub access_token: Option<String>,
+    /// Only subscribe to channels required by the owning dashboard pane.
+    pub ticker: bool,
+    pub trades: bool,
+    pub orderbook: bool,
+    pub kline: bool,
+    pub fetch_history: bool,
+    /// Optional initial REST snapshot channel and its CoinWatch dashboard limit.
+    pub snapshot: Option<(&'static str, u32, &'static str)>,
 }
 
 impl BridgeConfig {
@@ -75,6 +98,12 @@ impl BridgeConfig {
             timeframe: "1m".to_string(),
             ohlcv_limit: 500,
             access_token: None,
+            ticker: true,
+            trades: true,
+            orderbook: true,
+            kline: true,
+            fetch_history: true,
+            snapshot: None,
         }
     }
 
@@ -128,12 +157,13 @@ impl BridgeConfig {
 
     pub fn ohlcv_history_url(&self, until: Option<i64>) -> String {
         let mut url = format!(
-            "{}/api/v1/ohlcv?exchange={}&symbol={}&timeframe={}&limit={}",
+            "{}/api/v1/ohlcv?exchange={}&symbol={}&timeframe={}&limit={}&module={}&source=native",
             self.rest_base_url,
             urlencoding::encode(&self.exchange),
             urlencoding::encode(&self.symbol),
             urlencoding::encode(&self.timeframe),
             self.ohlcv_limit,
+            urlencoding::encode(&format!("Chart · {} ({})", self.symbol, self.timeframe)),
         );
         if let Some(u) = until {
             // SvelteKit routes to proxyToLive if either 'since' or 'until' is present
@@ -261,6 +291,7 @@ async fn supervision_loop(
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
 ) {
+    let mut initial_snapshot_done = false;
     loop {
         if cancel_token.is_cancelled() {
             info!("gateway: supervision loop cancelled");
@@ -282,12 +313,14 @@ async fn supervision_loop(
             &ohlcv_tx,
             &cancel_token,
             &history_cache,
+            !initial_snapshot_done,
         )
         .await
         {
             Ok(_) => info!("gateway: WebSocket closed cleanly"),
             Err(e) => error!("gateway: WebSocket error: {e}"),
         }
+        initial_snapshot_done = true;
 
         if cancel_token.is_cancelled() {
             return;
@@ -404,29 +437,108 @@ async fn connect_and_stream(
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    should_fetch_initial_snapshot: bool,
 ) -> anyhow::Result<()> {
-    // Fetch full OHLCV history via REST before opening the WebSocket so the
-    // chart has something to show immediately.
-    info!(
-        "gateway: fetching {} historical candles for {} {} {}",
-        config.ohlcv_limit, config.exchange, config.symbol, config.timeframe
-    );
-    match fetch_ohlcv_history(config, None).await {
-        Ok(candles) if !candles.is_empty() => {
-            info!("gateway: {} candles fetched", candles.len());
-            let arc = Arc::new(candles);
-            if let Ok(mut cache) = history_cache.lock() {
-                *cache = Some(Arc::clone(&arc));
+    // Only chart and ticker panes ask CoinWatch for an OHLCV REST snapshot.
+    // Other panes are stream-only; requesting chart history for each of them
+    // produced traffic (and credit deductions) the web dashboard never makes.
+    if config.fetch_history && should_fetch_initial_snapshot {
+        info!(
+            "gateway: fetching {} historical candles for {} {} {}",
+            config.ohlcv_limit, config.exchange, config.symbol, config.timeframe
+        );
+        match fetch_ohlcv_history(config, None).await {
+            Ok(candles) if !candles.is_empty() => {
+                info!("gateway: {} candles fetched", candles.len());
+                let arc = Arc::new(candles);
+                if let Ok(mut cache) = history_cache.lock() {
+                    *cache = Some(Arc::clone(&arc));
+                }
+                if ohlcv_tx.receiver_count() > 0 {
+                    let _ = ohlcv_tx.send(arc);
+                }
             }
-            if ohlcv_tx.receiver_count() > 0 {
-                let _ = ohlcv_tx.send(arc);
-            }
+            Ok(_) => warn!("gateway: OHLCV history returned empty"),
+            Err(e) => error!("gateway: OHLCV history fetch failed: {e}"),
         }
-        Ok(_) => warn!("gateway: OHLCV history returned empty"),
-        Err(e) => error!("gateway: OHLCV history fetch failed: {e}"),
     }
 
-    // Connect WebSocket.
+    // REST seeds a bridge once, not once per socket connection. In particular,
+    // trades reconnects must not replay a paid limit-60 snapshot into the tape.
+    if should_fetch_initial_snapshot {
+        if let Some((channel, limit, module)) = config.snapshot {
+            match channel {
+            "orderbook" => {
+                let url = format!("{}/api/v1/orderbook?exchange={}&symbol={}&limit={}&module={}&source=native",
+                    config.rest_base_url,
+                    urlencoding::encode(&config.exchange.to_lowercase()),
+                    urlencoding::encode(&config.symbol),
+                    limit,
+                    urlencoding::encode(&format!("{} · {} (limit {})", module, config.symbol, limit)),
+                );
+                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
+                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
+                if let Some(t) = token { req = req.bearer_auth(t); }
+                if let Ok(resp) = req.send().await {
+                    if let Ok(val) = resp.json::<serde_json::Value>().await {
+                        let bids = val.get("bids").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|row| {
+                                let r = row.as_array()?;
+                                Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
+                            }).collect()
+                        }).unwrap_or_default();
+                        let asks = val.get("asks").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|row| {
+                                let r = row.as_array()?;
+                                Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
+                            }).collect()
+                        }).unwrap_or_default();
+                        let book = Arc::new(OrderBook::new(
+                            config.exchange.clone(),
+                            config.symbol.clone(),
+                            bids,
+                            asks,
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
+                        ));
+                        let _ = ob_tx.send(book);
+                    }
+                }
+            }
+            "trades" => {
+                let url = format!("{}/api/v1/trades?exchange={}&symbol={}&limit={}&module={}&source=native",
+                    config.rest_base_url,
+                    urlencoding::encode(&config.exchange.to_lowercase()),
+                    urlencoding::encode(&config.symbol),
+                    limit,
+                    urlencoding::encode(&format!("{} · {} (limit {})", module, config.symbol, limit)),
+                );
+                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
+                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
+                if let Some(t) = token { req = req.bearer_auth(t); }
+                if let Ok(resp) = req.send().await {
+                    if let Ok(val) = resp.json::<serde_json::Value>().await {
+                        let trades = val.get("trades").and_then(|v| v.as_array()).or_else(|| val.as_array());
+                        if let Some(arr) = trades {
+                            for item in arr.iter().rev() {
+                                if let (Some(p), Some(a)) = (
+                                    item.get("price").and_then(|v| v.as_f64()),
+                                    item.get("amount").and_then(|v| v.as_f64()),
+                                ) {
+                                    let raw_side = item.get("side").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                    let side = if raw_side.contains("buy") { TradeSide::Buy } else if raw_side.contains("sell") { TradeSide::Sell } else { TradeSide::Unknown };
+                                    let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let tick = UnifiedTick::new(&config.exchange, &config.symbol, p, a, side, ts);
+                                    let _ = trade_tx.send(Arc::new(tick));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+                _ => {}
+            }
+        }
+    }
     let url = config.ws_url();
     let (ws_stream, _) = connect_async(&url).await?;
     info!("gateway: WebSocket connected to {url}");
@@ -436,36 +548,20 @@ async fn connect_and_stream(
     // Gateway handles subscription control messages serially. Sending several
     // messages before it acknowledges each one silently drops later channels.
     let ws_symbol = config.ws_symbol();
-    for msg in [
-        SubscribeMsg {
-            action: "subscribe",
-            channel: "ticker",
-            exchange: &config.exchange,
-            symbol: &ws_symbol,
-            timeframe: None,
-        },
-        SubscribeMsg {
-            action: "subscribe",
-            channel: "kline",
-            exchange: &config.exchange,
-            symbol: &ws_symbol,
-            timeframe: Some(&config.timeframe),
-        },
-        SubscribeMsg {
-            action: "subscribe",
-            channel: "orderbook",
-            exchange: &config.exchange,
-            symbol: &ws_symbol,
-            timeframe: None,
-        },
-        SubscribeMsg {
-            action: "subscribe",
-            channel: "trades",
-            exchange: &config.exchange,
-            symbol: &ws_symbol,
-            timeframe: None,
-        },
-    ] {
+    let mut subscriptions = Vec::new();
+    if config.ticker {
+        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "ticker", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+    }
+    if config.kline {
+        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "kline", exchange: &config.exchange, symbol: &ws_symbol, timeframe: Some(&config.timeframe) });
+    }
+    if config.orderbook {
+        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "orderbook", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+    }
+    if config.trades {
+        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "trades", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+    }
+    for msg in subscriptions {
         write.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         loop {
             match read.next().await {
@@ -501,12 +597,15 @@ async fn connect_and_stream(
     loop {
         tokio::select! {
             _ = heartbeat_interval.tick() => {
+                if !config.ticker && !config.kline && !config.orderbook && !config.trades {
+                    continue;
+                }
                 let heartbeat = SubscribeMsg {
                     action: "subscribe",
-                    channel: "ticker",
+                    channel: if config.ticker { "ticker" } else if config.kline { "kline" } else if config.orderbook { "orderbook" } else { "trades" },
                     exchange: &config.exchange,
                     symbol: &ws_symbol,
-                    timeframe: None,
+                    timeframe: if config.kline && !config.ticker { Some(&config.timeframe) } else { None },
                 };
                 if let Ok(json) = serde_json::to_string(&heartbeat) {
                     if let Err(e) = write.send(Message::Text(json)).await {
@@ -853,21 +952,47 @@ fn parse_kline_payload(data: &serde_json::Value) -> Vec<OhlcvCandle> {
 
 pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> anyhow::Result<Vec<OhlcvCandle>> {
     let url = config.ohlcv_history_url(until);
-    debug!("gateway: GET {url}");
+    // CoinWatch meters REST snapshots. Reuse immutable history briefly (and the
+    // latest chart bootstrap longer) so reconnects or multiple panes do not
+    // generate duplicate billable requests. Scope keys by credential digest:
+    // users must never share a metered response/cache entry.
+    let token = crate::data::session_store::load_session()
+        .ok()
+        .flatten()
+        .map(|session| session.access_token)
+        .or_else(|| config.access_token.clone());
+    let token_digest = token.as_deref().map(|value| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(value.as_bytes()))
+    }).unwrap_or_else(|| "anonymous".to_string());
+    let cache_key = format!("{token_digest}:{url}");
+    if let Ok(mut cache) = history_request_cache().lock() {
+        cache.retain(|_, entry| entry.expires_at > Instant::now());
+        if let Some(entry) = cache.get(&cache_key) {
+            return Ok(entry.candles.clone());
+        }
+    }
+    debug!("gateway: GET {}", url.split('?').next().unwrap_or(&url));
 
     let mut req = reqwest::Client::new()
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .header("Origin", &config.rest_base_url)
         .header("Referer", format!("{}/", &config.rest_base_url));
-    if let Ok(Some(session)) = crate::data::session_store::load_session() {
-        req = req.bearer_auth(session.access_token);
-    } else if let Some(token) = &config.access_token {
+    if let Some(token) = token {
         req = req.bearer_auth(token);
     }
-    let response = req.send().await?;
+    let response = req.timeout(Duration::from_secs(30)).send().await?;
     if !response.status().is_success() {
-        anyhow::bail!("OHLCV history fetch failed: HTTP {}", response.status());
+        let status = response.status();
+        let error: serde_json::Value = response.json().await.unwrap_or_default();
+        let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Market data request failed");
+        if status.as_u16() == 402 {
+            anyhow::bail!("Insufficient credits: {} (balance {}, required {}). Manage credits at {}/account/credits", message,
+                error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0),
+                error.get("required").and_then(|v| v.as_i64()).unwrap_or(0), config.rest_base_url);
+        }
+        anyhow::bail!("OHLCV history fetch failed: HTTP {}: {}", status, message);
     }
 
     let value: serde_json::Value = response.json().await?;
@@ -900,12 +1025,48 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
                 });
             }
         }
-    } else if let Ok(parsed) = serde_json::from_value::<Vec<OhlcvCandle>>(
-        value.get("data").cloned().unwrap_or_else(|| value.get("candles").cloned().unwrap_or(value.clone())),
-    ) {
-        candles = parsed;
+    } else {
+        let raw = value.get("data").cloned()
+            .or_else(|| value.get("candles").cloned())
+            .unwrap_or_else(|| value.clone());
+        // CoinWatch also returns compact tuple candles: [timestamp, open, high, low, close, volume].
+        if let Some(rows) = raw.as_array() {
+            candles = rows.iter().filter_map(|row| {
+                let values = row.as_array()?;
+                if values.len() < 6 { return None; }
+                let number = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+                let raw_timestamp = values[0].as_i64()
+                    .or_else(|| values[0].as_u64().map(|v| v as i64))
+                    .or_else(|| values[0].as_str().and_then(|s| s.parse().ok()))?;
+                let timestamp = if raw_timestamp > 0 && raw_timestamp < 10_000_000_000 { raw_timestamp * 1000 } else { raw_timestamp };
+                Some(OhlcvCandle {
+                    timestamp,
+                    open: number(&values[1])?,
+                    high: number(&values[2])?,
+                    low: number(&values[3])?,
+                    close: number(&values[4])?,
+                    volume: number(&values[5])?,
+                })
+            }).collect();
+        }
+        if candles.is_empty() {
+            if let Ok(parsed) = serde_json::from_value::<Vec<OhlcvCandle>>(raw) {
+                candles = parsed;
+            }
+        }
     }
 
+    // A normal latest snapshot can be reused for five minutes; time-bounded
+    // chart gap-recovery history is intentionally kept for only 15 seconds.
+    let ttl = if until.is_some() { Duration::from_secs(15) } else { Duration::from_secs(300) };
+    if let Ok(mut cache) = history_request_cache().lock() {
+        if cache.len() >= HISTORY_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.expires_at).map(|(key, _)| key.clone()) {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(cache_key, HistoryCacheEntry { candles: candles.clone(), expires_at: Instant::now() + ttl });
+    }
     Ok(candles)
 }
 
@@ -926,6 +1087,12 @@ mod tests {
             timeframe: "1m".to_string(),
             ohlcv_limit: 500,
             access_token: None,
+            ticker: true,
+            trades: true,
+            orderbook: true,
+            kline: true,
+            fetch_history: true,
+            snapshot: None,
         }
     }
 

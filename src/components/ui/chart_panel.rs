@@ -115,9 +115,12 @@ pub struct ChartPanel {
     focus_handle: FocusHandle,
     /// Interactive viewport + crosshair state.
     chart_state: ChartState,
-    pub on_load_more: Option<std::sync::Arc<dyn Fn(i64) + Send + Sync>>,
+    pub on_load_more: Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
+    history_completion: Option<std::sync::mpsc::Receiver<()>>,
+    history_retry_at: Option<std::time::Instant>,
     oldest_loaded_ts: i64,
     is_loading_more: bool,
+    load_more_attempts: u8,
     show_main_series: bool,
 
     // Parameterized Indicators
@@ -232,8 +235,11 @@ impl ChartPanel {
             pane_width: 800.0,
             pane_height: 500.0,
             on_load_more: None,
+            history_completion: None,
+            history_retry_at: None,
             oldest_loaded_ts: 0,
             is_loading_more: false,
+            load_more_attempts: 0,
             show_main_series: true,
 
             // Parameterized indicators & cache
@@ -791,12 +797,31 @@ impl Render for ChartPanel {
             }
             self.oldest_loaded_ts = current_oldest;
             self.is_loading_more = false;
+            self.history_completion = None;
+            self.history_retry_at = None;
+            self.load_more_attempts = 0;
         }
 
-        if !self.is_loading_more && current_oldest > 0 && self.chart_state.viewport_offset <= 0.0 {
+        if let Some(completion) = &self.history_completion {
+            if !matches!(completion.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                self.is_loading_more = false;
+                self.history_completion = None;
+                self.history_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+            }
+        }
+
+        if !self.is_loading_more
+            && self.history_retry_at.is_none_or(|at| std::time::Instant::now() >= at)
+            && self.load_more_attempts < 3
+            && current_oldest > 0
+            && self.chart_state.viewport_offset <= 0.0
+        {
             if let Some(on_load_more) = &self.on_load_more {
+                let (tx, rx) = std::sync::mpsc::channel();
                 self.is_loading_more = true;
-                on_load_more(current_oldest - 1);
+                self.history_completion = Some(rx);
+                self.load_more_attempts = self.load_more_attempts.saturating_add(1);
+                on_load_more(current_oldest - 1, tx);
             }
         }
 

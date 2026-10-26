@@ -86,8 +86,16 @@ pub struct WatchlistPanel {
 
 impl WatchlistPanel {
     pub fn new(title: impl Into<String>, cx: &mut App) -> Self {
+        Self::new_with_market(title, None, cx)
+    }
+
+    /// A configured pane seeds its own tracked market before the syncer starts.
+    /// This does not rewrite the user's global favorites file.
+    pub fn new_with_market(title: impl Into<String>, market: Option<(&str, &str)>, cx: &mut App) -> Self {
         let default_entries = Arc::new(Mutex::new(Self::initial_catalog()));
-        let favorites = if Self::favorites_path().is_some_and(|path| path.exists()) {
+        let favorites = if let Some((exchange, symbol)) = market {
+            [Self::favorite_key(exchange, symbol)].into_iter().collect()
+        } else if Self::favorites_path().is_some_and(|path| path.exists()) {
             Self::load_favorites()
         } else {
             ["binance:BTC/USDT", "binance:ETH/USDT", "binance:SOL/USDT"]
@@ -766,6 +774,10 @@ async fn run_watchlist_syncer(entries: Arc<Mutex<Vec<WatchlistEntry>>>, tracked:
         for (key, exchange, symbol) in target_pairs {
             if streams.contains_key(&key) { continue; }
             let mut config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
+            config.trades = false;
+            config.orderbook = false;
+            config.kline = false;
+            config.fetch_history = false;
             if let Ok(Some(session)) = crate::data::session_store::load_session() {
                 config.access_token = Some(session.access_token);
             }
