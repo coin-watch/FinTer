@@ -134,6 +134,9 @@ pub struct MainView {
     dashboard_manager: Option<Entity<crate::components::ui::dashboard_manager::DashboardManager>>,
     api_client: ApiClient,
     is_authenticated: bool,
+    /// Redacted account snapshot for the native Profile page.
+    account_summary: Option<serde_json::Value>,
+    account_summary_loading: bool,
     /// True while the background session-restore task is running.
     is_restoring: bool,
     /// User settings from database
@@ -172,6 +175,8 @@ impl MainView {
             dashboard_manager: None,
             api_client,
             is_authenticated: false,
+            account_summary: None,
+            account_summary_loading: false,
             is_restoring: false,
             user_settings: None,
             active_module: None,
@@ -362,6 +367,8 @@ impl MainView {
                     this.load_settings_then_modules(cx);
                 } else {
                     this.is_authenticated = false;
+                    this.account_summary = None;
+                    this.account_summary_loading = false;
                     this.is_restoring = false;
                     this.current_page = Page::Home;
                     this.load_guest_layout(cx);
@@ -374,6 +381,27 @@ impl MainView {
 
     pub fn switch_page(&mut self, page: Page) {
         self.current_page = page;
+    }
+
+    fn load_account_summary(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated || self.account_summary_loading {
+            return;
+        }
+        self.account_summary_loading = true;
+        let client = self.api_client.clone();
+        let rt = crate::data::client::tokio_runtime();
+        cx.spawn(async move |this, cx| {
+            let result = rt.spawn_blocking(move || client.get_account_summary()).await;
+            let _ = this.update(cx, |view, cx| {
+                view.account_summary_loading = false;
+                match result {
+                    Ok(Ok(summary)) => view.account_summary = Some(summary),
+                    Ok(Err(error)) => tracing::warn!("profile summary unavailable: {error}"),
+                    Err(error) => tracing::warn!("profile summary task failed: {error}"),
+                }
+                cx.notify();
+            });
+        }).detach();
     }
 
     /// Return to home page from Settings/Profile
@@ -2166,6 +2194,9 @@ impl Render for MainView {
 
         // If on Settings or Profile page, show full-screen with sidebar
         if current_page == Page::Settings || current_page == Page::Profile {
+            if current_page == Page::Profile && self.account_summary.is_none() && !self.account_summary_loading {
+                self.load_account_summary(cx);
+            }
             if self.settings_page.is_none() {
                 let settings_data = self.user_settings.clone().unwrap_or_default();
                 let settings_entity = entity.clone();
@@ -2221,7 +2252,13 @@ impl Render for MainView {
                     }
                 })
                 .when(current_page == Page::Profile, |this| {
-                    this.child(ProfilePage::build_element())
+                    this.child(ProfilePage::build_element(
+                        self.api_client.get_session(),
+                        self.user_settings.clone(),
+                        self.account_summary.clone(),
+                        self.account_summary_loading,
+                        self.is_authenticated,
+                    ))
                 });
 
             if is_macos {

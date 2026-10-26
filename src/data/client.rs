@@ -208,6 +208,23 @@ impl ApiClient {
     // ── Authenticated request helpers ───────────────
 
     /// Build a GET request with Bearer auth (if logged in).
+    /// Fetch the redacted account snapshot used by the native Profile page.
+    pub fn get_account_summary(&self) -> Result<serde_json::Value> {
+        let rt = tokio_runtime();
+        let response = rt.block_on(self.auth_get("/api/account-summary").send())?;
+        let status = response.status();
+        let body = rt.block_on(response.text())?;
+        if !status.is_success() {
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| body.chars().take(240).collect());
+            return Err(CoinWatchError::Auth(format!("Account summary request failed ({status}): {detail}")));
+        }
+        serde_json::from_str(&body)
+            .map_err(|error| CoinWatchError::Deserialization(error.to_string()))
+    }
+
     pub fn auth_get(&self, path: &str) -> reqwest::RequestBuilder {
         let mut req = self
             .http
