@@ -1,82 +1,74 @@
 use crate::data::models::{AuthSession, SettingsData};
+use gpui::prelude::*;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{ActiveTheme, button::{Button, ButtonVariants}};
 use serde_json::Value;
 
 pub struct ProfilePage;
 
-fn text(value: &Value) -> String {
+fn value(data: &Value, path: &[&str]) -> String {
+    let value = path.iter().fold(data, |value, key| &value[*key]);
     match value {
-        Value::Null => "Not available".into(),
-        Value::String(value) if value.is_empty() => "Not set".into(),
+        Value::Null => "—".into(),
+        Value::String(value) if value.is_empty() => "—".into(),
         Value::String(value) => value.clone(),
         Value::Bool(value) => if *value { "Yes" } else { "No" }.into(),
         _ => value.to_string(),
     }
 }
 
-fn row(title: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
+fn metric_card(
+    label: &'static str,
+    amount: String,
+    detail: &'static str,
+    featured: bool,
+    cx: &App,
+) -> Div {
+    let colors = &cx.theme().colors;
+    let background = if featured { colors.primary.opacity(0.08) } else { colors.group_box };
+    let border = if featured { colors.primary.opacity(0.28) } else { colors.border };
+
+    div()
+        .min_w(px(0.))
+        .flex_1()
+        .p(px(20.))
+        .bg(background)
+        .border_1()
+        .border_color(border)
+        .child(div().text_sm().text_color(colors.muted_foreground).child(label))
+        .child(
+            div()
+                .mt(px(7.))
+                .text_3xl()
+                .font_weight(FontWeight::BOLD)
+                .child(amount),
+        )
+        .child(
+            div()
+                .mt(px(8.))
+                .text_xs()
+                .text_color(colors.muted_foreground)
+                .child(detail),
+        )
+}
+
+fn detail_row(label: &'static str, content: String, last: bool, cx: &App) -> Div {
+    let colors = &cx.theme().colors;
     div()
         .flex()
-        .flex_wrap()
+        .items_center()
         .justify_between()
-        .gap(px(12.))
-        .py(px(9.))
-        .border_b_1()
-        .border_color(rgb(0x2a3835))
+        .gap(px(16.))
+        .py(px(10.))
+        .when(!last, |this| this.border_b_1().border_color(colors.border))
+        .child(div().text_sm().text_color(colors.muted_foreground).child(label))
         .child(
             div()
                 .text_sm()
-                .text_color(rgb(0x9eafa6))
-                .child(title.into()),
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colors.foreground)
+                .child(content),
         )
-        .child(div().text_sm().child(value.into()))
-}
-
-fn section(title: &'static str, rows: Vec<Div>) -> Div {
-    div()
-        .w_full()
-        .p(px(22.))
-        .rounded(px(8.))
-        .bg(rgb(0x17201f))
-        .border_1()
-        .border_color(rgb(0x2a3835))
-        .child(
-            div()
-                .mb(px(12.))
-                .text_lg()
-                .font_weight(FontWeight::BOLD)
-                .child(title),
-        )
-        .children(rows)
-}
-
-fn records(summary: &Value, key: &str, fields: &'static [(&'static str, &'static str)]) -> Vec<Div> {
-    let Some(items) = summary[key].as_array() else {
-        return vec![row("Status", "Not available")];
-    };
-    if items.is_empty() {
-        return vec![row("Status", "No records")];
-    }
-    items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            div()
-                .mb(px(14.))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xd7a84b))
-                        .child(format!("RECORD {:02}", index + 1)),
-                )
-                .children(
-                    fields
-                        .iter()
-                        .map(|(key, label)| row(*label, text(&item[*key]))),
-                )
-        })
-        .collect()
 }
 
 impl ProfilePage {
@@ -86,186 +78,139 @@ impl ProfilePage {
         summary: Option<Value>,
         loading: bool,
         authenticated: bool,
+        cx: &App,
     ) -> impl IntoElement {
+        let colors = &cx.theme().colors;
         let data = summary.unwrap_or(Value::Null);
         let name = data["user"]["name"]
             .as_str()
+            .filter(|name| !name.is_empty())
             .map(str::to_owned)
-            .or_else(|| session.as_ref().and_then(|s| s.name.clone()))
-            .unwrap_or_else(|| {
-                if authenticated {
-                    "Your account"
-                } else {
-                    "Guest workspace"
-                }
-                .into()
-            });
+            .or_else(|| session.as_ref().and_then(|session| session.name.clone()))
+            .unwrap_or_else(|| if authenticated { "Your account" } else { "Guest workspace" }.into());
         let email = if authenticated {
-            session
-                .as_ref()
-                .map(|s| s.email.clone())
-                .unwrap_or_default()
+            session.as_ref().map(|session| session.email.clone()).unwrap_or_else(|| "Email unavailable".into())
         } else {
-            "Local workspace • no cloud account".into()
+            "Local preferences only".into()
         };
-        let mut sections = vec![];
-        if authenticated && !data.is_null() {
-            sections.push(section(
-                "01 / Identity",
-                vec![
-                    row("Account ID", text(&data["user"]["id"])),
-                    row("Email", text(&data["user"]["email"])),
-                    row("Name", text(&data["user"]["name"])),
-                    row("MFA enabled", text(&data["security"]["mfa_enabled"])),
-                    row(
-                        "Verified factors",
-                        text(&data["security"]["verified_mfa_factors"]),
-                    ),
-                ],
-            ));
-            sections.push(section(
-                "02 / Credits & subscription",
-                vec![
-                    row("Credit balance", text(&data["credits"]["balance"])),
-                    row(
-                        "Monthly free remaining",
-                        text(&data["credits"]["monthly_free_remaining"]),
-                    ),
-                    row(
-                        "Monthly free period",
-                        text(&data["credits"]["monthly_free_period"]),
-                    ),
-                    row("Credits last updated", text(&data["credits"]["updated_at"])),
-                    row(
-                        "Plan",
-                        if data["subscription"].is_null() {
-                            "No subscription".into()
-                        } else {
-                            text(&data["subscription"]["status"])
-                        },
-                    ),
-                    row(
-                        "Current period ends",
-                        text(&data["subscription"]["current_period_end"]),
-                    ),
-                    row(
-                        "Cancels at period end",
-                        text(&data["subscription"]["cancel_at_period_end"]),
-                    ),
-                ],
-            ));
-            sections.push(section(
-                "03 / Workspace",
-                vec![
-                    row("Saved dashboards", text(&data["stats"]["modules"])),
-                    row("Saved indicators", text(&data["stats"]["indicators"])),
-                ],
-            ));
-            sections.push(section(
-                "04 / Recent dashboards · latest 5",
-                records(
-                    &data,
-                    "recent_modules",
-                    &[
-                        ("module_name", "Name"),
-                        ("created_at", "Created"),
-                        ("updated_at", "Updated"),
-                    ],
-                ),
-            ));
-            sections.push(section(
-                "05 / Recent indicators · latest 5",
-                records(
-                    &data,
-                    "recent_indicators",
-                    &[
-                        ("indicator_name", "Name"),
-                        ("type", "Type"),
-                        ("public", "Public"),
-                        ("created_at", "Created"),
-                    ],
-                ),
-            ));
-            sections.push(section(
-                "06 / Recent activity · latest 10",
-                records(
-                    &data,
-                    "recent_activity",
-                    &[("activity_type", "Activity"), ("created_at", "Time")],
-                ),
-            ));
-            sections.push(section(
-                "07 / API keys · metadata only",
-                records(
-                    &data,
-                    "api_keys",
-                    &[
-                        ("key_name", "Name"),
-                        ("permissions", "Permissions"),
-                        ("is_active", "Active"),
-                        ("last_used_at", "Last used"),
-                        ("expires_at", "Expires"),
-                        ("created_at", "Created"),
-                    ],
-                ),
-            ));
-        }
-        let settings = if authenticated {
+        let balance = value(&data, &["credits", "balance"]);
+        let free_allowance = value(&data, &["credits", "monthly_free_remaining"]);
+        let subscription_credits = if data["subscription"].is_null() {
+            "—".into()
+        } else {
+            value(&data, &["subscription", "status"])
+        };
+        let plan = if data["subscription"].is_null() { "Free".into() } else { value(&data, &["subscription", "status"]) };
+        let workspace_count = value(&data, &["stats", "modules"]);
+        let indicator_count = value(&data, &["stats", "indicators"]);
+        let preferences = if authenticated {
             data["settings"].clone()
         } else {
             serde_json::to_value(settings.unwrap_or_default()).unwrap_or(Value::Null)
         };
-        let settings_rows = settings
-            .as_object()
-            .map(|object| {
-                object
-                    .iter()
-                    .filter(|(_, value)| !value.is_null())
-                    .map(|(key, value)| row(key.clone(), text(value)))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![row("Status", "Not available")]);
-        sections.push(section("08 / Saved preferences", settings_rows));
+        let theme = preferences["theme"].as_str().unwrap_or("Current app theme").to_owned();
+        let status = if loading {
+            "Syncing latest account data…"
+        } else if authenticated && data.is_null() {
+            "Account data is currently unavailable"
+        } else if authenticated {
+            "Live account snapshot"
+        } else {
+            "Local workspace"
+        };
+
         div()
-            .id("profile-scroll")
+            .id("profile-page")
             .size_full()
-            .overflow_y_scroll()
-            .bg(rgb(0x101715))
-            .text_color(rgb(0xe8f0e7))
+            .overflow_hidden()
+            .bg(colors.background)
+            .text_color(colors.foreground)
             .child(
                 div()
-                    .max_w(px(980.))
+                    .size_full()
+                    .max_w(px(1120.))
                     .mx_auto()
-                    .w_full()
-                    .p(px(28.))
+                    .px(px(28.))
+                    .py(px(24.))
                     .flex()
                     .flex_col()
                     .gap(px(18.))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0xd7a84b))
-                            .child("FINTER / ACCOUNT RECORD"),
+                            .flex()
+                            .items_end()
+                            .justify_between()
+                            .gap(px(20.))
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .mb(px(7.))
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(colors.primary)
+                                            .child("ACCOUNT / USAGE"),
+                                    )
+                                    .child(div().text_3xl().font_weight(FontWeight::SEMIBOLD).child("Profile & credits"))
+                                    .child(div().mt(px(5.)).text_sm().text_color(colors.muted_foreground).child("Your market-data balance, plan, and workspace at a glance.")),
+                            )
+                            .when(authenticated, |this| this.child(
+                                Button::new("profile-billing")
+                                    .label("Manage billing")
+                                    .primary()
+                                    .on_click(|_, _, _| { let _ = webbrowser::open("https://coinwat.ch/account/credits"); }),
+                            )),
                     )
-                    .child(div().text_3xl().font_weight(FontWeight::BOLD).child(name))
-                    .child(div().text_sm().text_color(rgb(0x9eafa6)).child(email))
-                    .child(div().text_sm().child(if loading {
-                        "Loading your database records…"
-                    } else if authenticated && data.is_null() {
-                        "Account data is unavailable. The server must support /api/account-summary."
-                    } else if authenticated {
-                        "Database snapshot • sensitive credentials are never displayed"
-                    } else {
-                        "Guest mode • preferences are stored on this device"
-                    }))
-                    .children(sections)
                     .child(
-                        Button::new("profile-billing")
-                            .label("Manage billing on CoinWatch")
-                            .primary()
-                            .on_click(|_, _, _| {
-                                let _ = webbrowser::open("https://coinwat.ch/account/credits");
-                            }),
+                        div()
+                            .flex()
+                            .gap(px(12.))
+                            .child(metric_card("Available balance", balance, "Credits available for market-data requests.", true, cx))
+                            .child(metric_card("Free allowance", free_allowance, "Resets with your monthly free period.", false, cx))
+                            .child(metric_card("Current plan", subscription_credits, "Subscription status and rollover eligibility.", false, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(12.))
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex_1()
+                                    .p(px(20.))
+                                    .bg(colors.group_box)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Account"))
+                                    .child(div().mt(px(3.)).text_sm().text_color(colors.muted_foreground).child(email))
+                                    .child(div().mt(px(14.)).child(detail_row("Plan", plan, false, cx)))
+                                    .child(detail_row("Security", value(&data, &["security", "mfa_enabled"]), false, cx))
+                                    .child(detail_row("Status", status.into(), true, cx)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .flex_1()
+                                    .p(px(20.))
+                                    .bg(colors.group_box)
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Workspace"))
+                                    .child(div().mt(px(3.)).text_sm().text_color(colors.muted_foreground).child(name))
+                                    .child(div().mt(px(14.)).child(detail_row("Saved dashboards", workspace_count, false, cx)))
+                                    .child(detail_row("Saved indicators", indicator_count, false, cx))
+                                    .child(detail_row("Selected theme", theme, true, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pt(px(2.))
+                            .text_xs()
+                            .text_color(colors.muted_foreground)
+                            .child("This page refreshes automatically while open. View detailed credit activity in Coinwatch."),
                     ),
             )
     }

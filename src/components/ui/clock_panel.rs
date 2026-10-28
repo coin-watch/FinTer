@@ -13,8 +13,17 @@ impl ClockPanel {
     pub fn new(_pane_id: String, timezone: String, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
             loop {
+                // Align refreshes to UTC second boundaries instead of sleeping
+                // for 1000 ms from an arbitrary start time. This prevents the
+                // displayed clock from slowly drifting away from real seconds.
+                let now = std::time::SystemTime::now();
+                let elapsed = now
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let nanos_into_second = elapsed.subsec_nanos() as u64;
+                let nanos_until_next_second = 1_000_000_000u64 - nanos_into_second;
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(1000))
+                    .timer(std::time::Duration::from_nanos(nanos_until_next_second))
                     .await;
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
@@ -126,7 +135,6 @@ impl Render for ClockPanel {
                             div()
                                 .px(px(6.0))
                                 .py(px(2.0))
-                                .rounded_sm()
                                 .bg(colors.muted)
                                 .text_size(px(meta_size))
                                 .font_weight(gpui::FontWeight::MEDIUM)
@@ -186,7 +194,6 @@ impl Render for ClockPanel {
                             div()
                                 .px(px(8.0))
                                 .py(px(2.0))
-                                .rounded_full()
                                 .bg(colors.muted.opacity(0.8))
                                 .border_1()
                                 .border_color(colors.border.opacity(0.5))

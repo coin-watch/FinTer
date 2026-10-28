@@ -127,12 +127,10 @@ impl Render for UpdateBanner {
                             .flex_1()
                             .h(px(4.0))
                             .bg(rgb(0x1e293b))
-                            .rounded(px(2.0))
                             .child(
                                 div()
                                     .h_full()
                                     .bg(rgb(0x3b82f6))
-                                    .rounded(px(2.0))
                                     .w(gpui::relative(progress as f32)),
                             ),
                     )

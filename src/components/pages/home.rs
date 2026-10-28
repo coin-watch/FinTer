@@ -45,7 +45,19 @@ impl HomePage {
         _module_id: String,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(tree) = serde_json::from_value::<PaneNode>(module_json.clone()) {
+        if let Ok(mut tree) = serde_json::from_value::<PaneNode>(module_json.clone()) {
+            // Migrate removed Depth panes to the replacement Agent module.
+            fn migrate_depth(node: &mut PaneNode) {
+                match node {
+                    PaneNode::Pane { data, .. } => {
+                        if data.module_type.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("depth")) {
+                            data.module_type = Some("agent".into());
+                        }
+                    }
+                    PaneNode::Split { a, b, .. } => { migrate_depth(a); migrate_depth(b); }
+                }
+            }
+            migrate_depth(&mut tree);
             tracing::info!("Successfully parsed PaneNode tree!");
             self.pane_grid.update(cx, |grid, cx| {
                 grid.set_tree(tree, cx);

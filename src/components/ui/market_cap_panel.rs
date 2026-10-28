@@ -393,7 +393,6 @@ impl MarketCapPanel {
             .id(ElementId::Name(format!("mode-btn-{label}").into()))
             .px_2()
             .py(px(1.0))
-            .rounded(px(3.0))
             .cursor_pointer()
             .bg(if is_selected {
                 colors.primary
@@ -521,7 +520,6 @@ impl MarketCapPanel {
                     .size_full()
                     .overflow_hidden()
                     .p(px(if is_large { 6.0 } else if is_medium { 3.0 } else { 0.0 }))
-                    .rounded(px(2.0))
                     .bg(bg_color)
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.88))

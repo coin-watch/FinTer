@@ -32,6 +32,15 @@ pub struct FearGreedPanel {
 }
 
 impl FearGreedPanel {
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "value": self.value,
+            "classification": self.classification.as_ref().map(|s| s.to_string()),
+            "updated_at": self.updated_at.map(|dt| dt.to_rfc3339()),
+            "loading": self.is_loading
+        })
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             value: None,
@@ -169,7 +178,6 @@ impl Render for FearGreedPanel {
                         .w_full()
                         .h(px(h_track))
                         .flex()
-                        .rounded_full()
                         .overflow_hidden()
                         .child(div().w(gpui::relative(0.25)).h_full().bg(gpui::rgba(0xe85d38ff)))
                         .child(div().w(gpui::relative(0.20)).h_full().bg(gpui::rgba(0xf18545ff)))
@@ -189,7 +197,6 @@ impl Render for FearGreedPanel {
                         .bg(gpui::white())
                         .border_1()
                         .border_color(gpui::rgba(0x00000044))
-                        .rounded_sm()
                         .shadow_md(),
                 )
         };
@@ -224,7 +231,6 @@ impl Render for FearGreedPanel {
                             div()
                                 .px(px(6.0))
                                 .py(px(1.5))
-                                .rounded_sm()
                                 .bg(sentiment_color.opacity(0.15))
                                 .text_size(px(10.0))
                                 .font_weight(gpui::FontWeight::BOLD)
@@ -293,7 +299,6 @@ impl Render for FearGreedPanel {
                             div()
                                 .px(px(8.0))
                                 .py(px(2.0))
-                                .rounded_sm()
                                 .bg(sentiment_color.opacity(0.14))
                                 .text_size(px(class_size))
                                 .font_weight(gpui::FontWeight::BOLD)

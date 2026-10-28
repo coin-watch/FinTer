@@ -59,6 +59,14 @@ pub struct TapePanel {
 }
 
 impl TapePanel {
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        let ticks = self.feed.snapshot();
+        serde_json::json!({
+            "ticks": ticks.iter().rev().take(30).rev().cloned().collect::<Vec<_>>(),
+            "loading": ticks.is_empty()
+        })
+    }
+
     pub fn new(feed: TickFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
         // Coalesce external updates; weak access ends the task on panel close.
         let mut last = feed.sequence();
@@ -268,7 +276,6 @@ impl Render for TapePanel {
                                             .gap_1()
                                             .px_1p5()
                                             .py(px(2.0))
-                                            .rounded(px(3.0))
                                             .bg(if self.is_paused {
                                                 colors.warning.opacity(0.15)
                                             } else {
@@ -283,7 +290,6 @@ impl Render for TapePanel {
                                             .child(
                                                 div()
                                                     .size(px(6.0))
-                                                    .rounded_full()
                                                     .bg(if self.is_paused {
                                                         colors.warning
                                                     } else {
@@ -324,7 +330,6 @@ impl Render for TapePanel {
                                     .id("tape-pause-btn")
                                     .px_2()
                                     .py(px(2.0))
-                                    .rounded(px(3.0))
                                     .bg(colors.muted.opacity(0.4))
                                     .border_1()
                                     .border_color(colors.border)
@@ -371,7 +376,6 @@ impl Render for TapePanel {
                                             div()
                                                 .w(px(70.0))
                                                 .h(px(4.0))
-                                                .rounded(px(2.0))
                                                 .overflow_hidden()
                                                 .bg(colors.bearish.opacity(0.85))
                                                 .child(
@@ -520,7 +524,6 @@ impl TapePanel {
             .justify_center()
             .flex_shrink_0()
             .size(px(22.0))
-            .rounded(px(3.0))
             .bg(bg_color)
             .border_1()
             .border_color(border_color)
@@ -549,7 +552,6 @@ impl TapePanel {
             .id(ElementId::Name(format!("filter-btn-{label}").into()))
             .px_1p5()
             .py(px(1.0))
-            .rounded(px(3.0))
             .cursor_pointer()
             .bg(if is_selected {
                 colors.primary
@@ -711,7 +713,6 @@ impl TapePanel {
                             div()
                                 .px_1()
                                 .py(px(0.5))
-                                .rounded(px(2.0))
                                 .bg(colors.warning.opacity(0.18))
                                 .text_size(px(9.0))
                                 .font_weight(FontWeight::BOLD)
@@ -721,7 +722,6 @@ impl TapePanel {
                             div()
                                 .px_1()
                                 .py(px(0.5))
-                                .rounded(px(2.0))
                                 .bg(colors.muted.opacity(0.4))
                                 .text_size(px(9.0))
                                 .font_weight(FontWeight::BOLD)

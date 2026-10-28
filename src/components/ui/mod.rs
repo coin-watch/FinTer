@@ -3,7 +3,7 @@ pub mod clock_panel;
 pub mod chart_panel;
 pub mod dashboard_manager;
 pub mod delete_dashboard_dialog;
-pub mod depth_panel;
+pub mod agent_panel;
 pub mod execution_panel;
 pub mod fear_greed_panel;
 pub mod market_cap_panel;

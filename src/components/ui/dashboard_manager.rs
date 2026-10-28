@@ -191,7 +191,6 @@ impl Render for DashboardManager {
                                     div()
                                         .w(px(5.0))
                                         .h(px(5.0))
-                                        .rounded(px(2.5))
                                         .bg(colors.muted_foreground.opacity(0.4)),
                                 )
                             }),
@@ -211,7 +210,6 @@ impl Render for DashboardManager {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded(px(3.0))
                                     .cursor_pointer()
                                     .hover(|style| {
                                         style
@@ -308,7 +306,6 @@ impl Render for DashboardManager {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .rounded(px(3.0))
                                     .cursor_pointer()
                                     .hover(|style| {
                                         style
@@ -449,7 +446,6 @@ impl Render for DashboardManager {
                                 div()
                                     .px(px(6.0))
                                     .py(px(1.0))
-                                    .rounded(px(8.0))
                                     .bg(colors.border.opacity(0.3))
                                     .text_size(px(10.0))
                                     .text_color(colors.muted_foreground)
@@ -538,7 +534,6 @@ impl Render for DashboardManager {
                                 div()
                                     .px(px(6.0))
                                     .py(px(1.0))
-                                    .rounded(px(8.0))
                                     .bg(colors.border.opacity(0.3))
                                     .text_size(px(10.0))
                                     .text_color(colors.muted_foreground)
@@ -579,7 +574,6 @@ impl Render for DashboardManager {
                             div()
                                 .m(px(10.0))
                                 .p(px(8.0))
-                                .rounded(px(4.0))
                                 .bg(colors.danger.opacity(0.1))
                                 .border_1()
                                 .border_color(colors.danger.opacity(0.3))

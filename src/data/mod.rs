@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod auth;
 pub mod bridge;
 pub mod candle_feed;

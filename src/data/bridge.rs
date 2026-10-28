@@ -155,6 +155,16 @@ impl BridgeConfig {
         }
     }
 
+    pub fn ticker_snapshot_url(&self, module: &str) -> String {
+        format!(
+            "{}/api/v1/ticker?exchange={}&symbol={}&module={}&source=native",
+            self.rest_base_url,
+            urlencoding::encode(&self.exchange.to_lowercase()),
+            urlencoding::encode(&self.symbol),
+            urlencoding::encode(&format!("{} · {}", module, self.symbol)),
+        )
+    }
+
     pub fn ohlcv_history_url(&self, until: Option<i64>) -> String {
         let mut url = format!(
             "{}/api/v1/ohlcv?exchange={}&symbol={}&timeframe={}&limit={}&module={}&source=native",
@@ -468,6 +478,30 @@ async fn connect_and_stream(
     if should_fetch_initial_snapshot {
         if let Some((channel, limit, module)) = config.snapshot {
             match channel {
+            "ticker" => {
+                let url = config.ticker_snapshot_url(module);
+                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
+                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
+                if let Some(t) = token { req = req.bearer_auth(t); }
+                // A failed bootstrap is intentionally non-fatal: the live WS ticker
+                // subscription below remains the source of subsequent updates.
+                if let Ok(resp) = req.send().await {
+                    if resp.status().is_success() {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            let envelope = serde_json::json!({
+                                "type": "data",
+                                "channel": "ticker",
+                                "exchange": config.exchange,
+                                "symbol": config.symbol,
+                                "data": data,
+                            });
+                            handle_message(&envelope.to_string(), config, tick_tx, trade_tx, ob_tx, ohlcv_tx, history_cache);
+                        }
+                    } else {
+                        warn!("gateway: ticker bootstrap returned HTTP {}", resp.status());
+                    }
+                }
+            }
             "orderbook" => {
                 let url = format!("{}/api/v1/orderbook?exchange={}&symbol={}&limit={}&module={}&source=native",
                     config.rest_base_url,
@@ -1119,11 +1153,93 @@ mod tests {
     }
 
     #[test]
+    fn ticker_snapshot_url_is_metered_and_attributed_to_native_watchlist() {
+        let url = base_cfg().ticker_snapshot_url("Watchlist");
+        assert!(url.contains("/api/v1/ticker?"), "url={url}");
+        assert!(url.contains("exchange=binance"), "url={url}");
+        assert!(url.contains("symbol=BTC%2FUSDT"), "url={url}");
+        assert!(url.contains("module=Watchlist%20%C2%B7%20BTC%2FUSDT"), "url={url}");
+        assert!(url.ends_with("source=native"), "url={url}");
+    }
+
+    #[test]
     fn ohlcv_history_url() {
         let url = base_cfg().ohlcv_history_url(None);
         assert!(url.contains("timeframe=1m"), "url={url}");
         assert!(url.contains("limit=500"), "url={url}");
         assert!(url.contains("symbol=BTC%2FUSDT"), "url={url}");
+    }
+
+    #[tokio::test]
+    async fn ticker_bootstrap_seeds_feed_and_is_skipped_on_reconnect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = base_cfg();
+        cfg.rest_base_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.fetch_history = false;
+        cfg.snapshot = Some(("ticker", 0, "Watchlist"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /api/v1/ticker?"));
+            let body = r#"{"last":110,"open":100,"high":120,"low":90,"quoteVolume":1234,"percentage":10}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            drop(socket);
+            // Close incoming WebSocket attempts immediately; connect_and_stream fails cleanly
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let (ticks, mut rx) = broadcast::channel(8);
+        let (trades, _) = broadcast::channel(8);
+        let (books, _) = broadcast::channel(8);
+        let (candles, _) = broadcast::channel(8);
+        let cache = Arc::new(std::sync::Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, true).await;
+        server.await.unwrap();
+        let tick = rx.try_recv().expect("REST response must seed the watchlist feed");
+        assert_eq!(tick.price, 110.0);
+        assert_eq!(tick.open_24h, Some(100.0));
+        assert_eq!(tick.high_24h, Some(120.0));
+        assert_eq!(tick.low_24h, Some(90.0));
+        assert_eq!(tick.quote_volume_24h, Some(1234.0));
+        assert_eq!(tick.change_24h_percent, Some(10.0));
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, false).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ticker_bootstrap_failure_continues_to_ws() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = base_cfg();
+        cfg.rest_base_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.fetch_history = false;
+        cfg.snapshot = Some(("ticker", 0, "Watchlist"));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /api/v1/ticker?"));
+            let body = r#"{"error":"service_unavailable"}"#;
+            socket.write_all(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            drop(socket);
+            if let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let (ticks, mut rx) = broadcast::channel(8);
+        let (trades, _) = broadcast::channel(8);
+        let (books, _) = broadcast::channel(8);
+        let (candles, _) = broadcast::channel(8);
+        let cache = Arc::new(std::sync::Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, true).await;
+        server.await.unwrap();
+        // Since REST returned 500, no tick was seeded from REST, but connect_and_stream finished without panicking
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

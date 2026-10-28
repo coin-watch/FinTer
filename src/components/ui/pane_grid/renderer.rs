@@ -40,11 +40,8 @@ pub struct OrderBookViewState {
     pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
 }
 
-pub struct DepthViewState {
-    pub exchange: String,
-    pub symbol: String,
-    pub entity: Entity<crate::components::ui::depth_panel::DepthPanel>,
-    pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
+pub struct AgentViewState {
+    pub entity: Entity<crate::components::ui::agent_panel::AgentPanel>,
 }
 
 pub struct TapeViewState {
@@ -90,7 +87,7 @@ pub struct PaneGridRenderer {
     pub chart_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ChartViewState>>>,
     pub ticker_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, TickerViewState>>>,
     pub orderbook_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, OrderBookViewState>>>,
-    pub depth_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, DepthViewState>>>,
+    pub agent_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, AgentViewState>>>,
     pub tape_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, TapeViewState>>>,
     pub execution_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ExecutionViewState>>>,
     pub positions_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, gpui::Entity<crate::components::ui::positions_panel::PositionsPanel>>>>,
@@ -99,6 +96,8 @@ pub struct PaneGridRenderer {
     pub newsfeed_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, NewsfeedViewState>>>,
     pub clock_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, ClockViewState>>>,
     pub fear_greed_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, FearGreedViewState>>>,
+    /// Latest cross-dashboard snapshot, retained so Agent panes created after refresh receive it.
+    agent_context: Option<serde_json::Value>,
     pub timezone: String,
     /// Global setting; individual panels cannot bypass it.
     pub sound_alerts_enabled: bool,
@@ -120,6 +119,15 @@ pub struct ResizingState {
 
 
 impl gpui::EventEmitter<PaneGridEvent> for gpui_component::popover::PopoverState {}
+
+/// Cache only module contents, not the dashboard shell. GPUI invalidates this
+/// cache on entity/descendant notifications, bounds changes and window refreshes.
+/// A full-size layout keeps each module constrained to its allocated pane.
+fn cached_panel<V: Render>(panel: Entity<V>) -> AnyElement {
+    AnyView::from(panel)
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
+}
 
 fn config_str(config: Option<&serde_json::Map<String, serde_json::Value>>, key: &str, default: &str) -> String {
     config
@@ -599,7 +607,7 @@ impl PaneGridRenderer {
             chart_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             ticker_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             orderbook_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
-            depth_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            agent_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             tape_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             execution_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             positions_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
@@ -608,8 +616,40 @@ impl PaneGridRenderer {
             newsfeed_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             clock_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             fear_greed_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            agent_context: None,
             timezone: "UTC".into(),
             sound_alerts_enabled: true,
+        }
+    }
+
+    /// Bounded serializable market snapshots from every loaded module in this dashboard.
+    pub fn agent_market_snapshot(&self, cx: &App) -> serde_json::Value {
+        let tickers = self.ticker_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "ticker", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        let charts = self.chart_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "chart", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        let order_books = self.orderbook_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "orderbook", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        let tapes = self.tape_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "tape", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        let news = self.newsfeed_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "newsfeed", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        let fear_greed = self.fear_greed_views.borrow().iter().map(|(pane_id, state)| {
+            serde_json::json!({"pane_id": pane_id, "type": "fear_greed", "data": state.entity.read(cx).agent_snapshot()})
+        }).collect::<Vec<_>>();
+        serde_json::json!({"tickers": tickers, "charts": charts, "order_books": order_books, "tapes": tapes, "news": news, "fear_greed": fear_greed})
+    }
+
+    pub fn set_agent_context(&mut self, context: serde_json::Value, cx: &mut Context<Self>) {
+        self.agent_context = Some(context);
+        let snapshot = self.agent_context.clone().unwrap_or(serde_json::Value::Null);
+        for state in self.agent_views.borrow().values() {
+            state.entity.update(cx, |panel, _| panel.set_context(snapshot.clone()));
         }
     }
 
@@ -637,7 +677,7 @@ impl PaneGridRenderer {
         self.chart_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "chart"));
         self.ticker_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "ticker"));
         self.orderbook_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "orderbook"));
-        self.depth_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "depth"));
+        self.agent_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "agent"));
         self.tape_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "trades" || m == "tape"));
         self.watchlist_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "watchlist"));
         self.market_cap_views.borrow_mut().retain(|id, _| modules.get(id).is_some_and(|m| m == "marketcap"));
@@ -679,7 +719,7 @@ impl PaneGridRenderer {
             ("chart", "Chart", "Candlestick & technical indicators", "icons/chart-candlestick.svg"),
             ("ticker", "Ticker", "Live price, stats & sparkline", "icons/trending-up.svg"),
             ("orderbook", "Order Book", "Level 2 market depth & ladder", "icons/sort-descending.svg"),
-            ("depth", "Depth", "Stepped cumulative market depth curve", "icons/sort-descending.svg"),
+            ("agent", "Agent", "AI market assistant & cross-dashboard analysis", "icons/cpu.svg"),
             ("trades", "Trades / Tape", "Real-time executed market tape", "icons/trending-up.svg"),
             ("positions", "Positions", "Open positions and unrealized P&L", "icons/crosshair.svg"),
             ("execution", "Trade Desk", "Read-only order ticket preview", "icons/crosshair.svg"),
@@ -730,7 +770,7 @@ impl PaneGridRenderer {
                         .items_center()
                         .gap(px(10.0))
                         .p(px(8.0))
-                        .rounded_md()
+                        
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.muted.opacity(0.2))
@@ -762,7 +802,7 @@ impl PaneGridRenderer {
                                 .flex_shrink_0()
                                 .w(px(32.0))
                                 .h(px(32.0))
-                                .rounded_sm()
+                                
                                 .bg(colors.primary.opacity(0.12))
                                 .flex()
                                 .items_center()
@@ -821,7 +861,7 @@ impl PaneGridRenderer {
                             div()
                                 .px(px(6.0))
                                 .py(px(1.5))
-                                .rounded_sm()
+                                
                                 .bg(colors.primary.opacity(0.12))
                                 .text_size(px(9.5))
                                 .font_weight(FontWeight::BOLD)
@@ -860,7 +900,7 @@ impl PaneGridRenderer {
                         .gap(px(6.0))
                         .px(px(6.0))
                         .py(px(4.0))
-                        .rounded_sm()
+                        
                         .border_1()
                         .border_color(colors.border)
                         .bg(colors.muted.opacity(0.2))
@@ -1020,7 +1060,7 @@ impl PaneGridRenderer {
 
                 let is_market_module = matches!(
                     module_type.to_lowercase().as_str(),
-                    "chart" | "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk"
+                    "chart" | "ticker" | "orderbook" | "trades" | "tape" | "execution" | "tradedesk"
                 );
                 if is_market_module {
                     crate::data::gateway_registry::GatewayRegistry::global()
@@ -1028,7 +1068,7 @@ impl PaneGridRenderer {
                 }
                 let suffix = match module_type.to_lowercase().as_str() {
                     "orderbook" => Some("OB"),
-                    "depth" => Some("DEPTH"),
+                    "agent" => None,
                     "trades" | "tape" => Some("TRADES"),
                     "execution" | "tradedesk" => Some("DESK"),
                     _ => None,
@@ -1037,6 +1077,11 @@ impl PaneGridRenderer {
                 div()
                     .id(ElementId::Name(format!("pane-wrapper-{pane_id}").into()))
                     .size_full()
+                    // Account for this wrapper's horizontal padding so a maximized pane
+                    // remains inside the pane-grid bounds after response remeasurement.
+                    .w(px(content_w))
+                    .max_w_full()
+                    .flex_none()
                     .p(px(3.0))
                     .when(is_dragged, |this| {
                         this.child(
@@ -1046,13 +1091,15 @@ impl PaneGridRenderer {
                                 .border_dashed()
                                 .border_color(theme.colors.border.opacity(0.5))
                                 .bg(theme.colors.muted.opacity(0.2))
-                                .rounded_sm(),
+                                ,
                         )
                     })
                     .when(!is_dragged, |this| {
                         this.child(
                             div()
                                 .id(ElementId::Name(format!("pane-container-{pane_id}").into()))
+                            .w_full()
+                            .min_w_0()
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _event, _win, cx| {
@@ -1062,6 +1109,10 @@ impl PaneGridRenderer {
                                 }),
                             )
                             .size_full()
+                            // `pane-wrapper` has 3px padding on each side; use its inner width.
+                            .w(px(content_w))
+                            .max_w_full()
+                            .flex_none()
                             .bg(theme.colors.background)
                             .border_2()
                             .border_color(border_color)
@@ -1073,7 +1124,12 @@ impl PaneGridRenderer {
                                 // Unified Title Bar
                         div()
                             .id(ElementId::Name(format!("titlebar-{pane_id}").into()))
+                            // Keep this row at the pane width even when response content
+                            // causes a new intrinsic-size measurement.
                             .w_full()
+                            .min_w_full()
+                            .flex_none()
+                            .flex_shrink_0()
                             .h(px(33.0))
                             .px(px(8.0))
                             .flex()
@@ -1103,7 +1159,7 @@ impl PaneGridRenderer {
                                         "chart" => self.chart_views.borrow().get(&pane_id).map(|s| DragContent::Chart(s.entity.clone())),
                                         "ticker" => self.ticker_views.borrow().get(&pane_id).map(|s| DragContent::Ticker(s.entity.clone())),
                                         "orderbook" => self.orderbook_views.borrow().get(&pane_id).map(|s| DragContent::Orderbook(s.entity.clone())),
-                                        "depth" => self.depth_views.borrow().get(&pane_id).map(|s| DragContent::Depth(s.entity.clone())),
+                                        "agent" => self.agent_views.borrow().get(&pane_id).map(|s| DragContent::Agent(s.entity.clone())),
                                         "trades" | "tape" => self.tape_views.borrow().get(&pane_id).map(|s| DragContent::Tape(s.entity.clone())),
                                         "execution" | "tradedesk" => self.execution_views.borrow().get(&pane_id).map(|s| DragContent::Execution(s.entity.clone())),
                                         "positions" => self.positions_views.borrow().get(&pane_id).map(|s| DragContent::Positions(s.clone())),
@@ -1159,7 +1215,7 @@ impl PaneGridRenderer {
                                                         .flex_shrink_0()
                                                         .px(px(4.0))
                                                         .py(px(1.0))
-                                                        .rounded(px(3.0))
+                                                        
                                                         .bg(theme.colors.muted.opacity(0.5))
                                                         .border_1()
                                                         .border_color(theme.colors.border.opacity(0.4))
@@ -1178,7 +1234,9 @@ impl PaneGridRenderer {
                                                 .text_sm()
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(
-                                                    if is_empty {
+                                                    if module_type.eq_ignore_ascii_case("agent") {
+                                                        "Agent".to_string()
+                                                    } else if is_empty {
                                                         "Select Module".to_string()
                                                     } else if module_type.to_lowercase() == "time" || module_type.to_lowercase() == "clock" {
                                                         current_timezone.replace('/', ", ").replace('_', " ")
@@ -1419,6 +1477,7 @@ impl PaneGridRenderer {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_shrink_0()
                                     .items_center()
                                     .gap(px(2.0))
                                     .child(
@@ -1565,12 +1624,13 @@ impl PaneGridRenderer {
                                                 let current_exchange = current_exchange.clone();
                                                 let current_symbol = current_symbol.clone();
                                                 let current_timezone = current_timezone.clone();
-                                                move |mut menu, _window, _cx| {
+                                                let agent_views = self.agent_views.clone();
+                                                move |mut menu, _window, cx| {
                                                     let module_types = [
                                                         ("chart", "Chart"),
                                                         ("ticker", "Ticker"),
                                                         ("orderbook", "Order Book"),
-                                                        ("depth", "Depth"),
+                                                        ("agent", "Agent"),
                                                         ("trades", "Trades / Tape"),
                                                         ("positions", "Positions"),
                                                         ("execution", "Trade Desk · Read Only"),
@@ -1617,7 +1677,54 @@ impl PaneGridRenderer {
                                                                 );
                                                             }
                                                         }
-                                                        "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk" => {
+                                                        "agent" => {
+                                                            menu = menu.separator().label("Conversations");
+                                                            let current_conv_id = agent_views.borrow().get(&pane_id_cfg).and_then(|s| s.entity.read(cx).current_conversation_id());
+                                                            let is_new = current_conv_id.is_none();
+                                                            let agent_view = agent_views.borrow().get(&pane_id_cfg).map(|s| s.entity.clone());
+
+                                                            {
+                                                                let agent_view = agent_view.clone();
+                                                                menu = menu.item(
+                                                                    gpui_component::menu::PopupMenuItem::new("New conversation")
+                                                                        .checked(is_new)
+                                                                        .on_click(move |_event, _window, cx| {
+                                                                            if let Some(agent) = &agent_view {
+                                                                                agent.update(cx, |panel, cx| panel.start_new_conversation(cx));
+                                                                            }
+                                                                        }),
+                                                                );
+                                                            }
+
+                                                            let saved = crate::data::agent::load_all_conversations();
+                                                            if saved.is_empty() {
+                                                                menu = menu.item(
+                                                                    gpui_component::menu::PopupMenuItem::new("No past conversations")
+                                                                        .disabled(true),
+                                                                );
+                                                            } else {
+                                                                for conv in saved {
+                                                                    let conv_id = conv.id.clone();
+                                                                    let is_selected = current_conv_id.as_deref() == Some(&conv_id);
+                                                                    let label = if conv.title.trim().is_empty() {
+                                                                        format!("Chat ({})", conv.updated_at)
+                                                                    } else {
+                                                                        format!("{} ({})", conv.title, conv.updated_at)
+                                                                    };
+                                                                    let agent_view = agent_view.clone();
+                                                                    menu = menu.item(
+                                                                        gpui_component::menu::PopupMenuItem::new(label)
+                                                                            .checked(is_selected)
+                                                                            .on_click(move |_event, _window, cx| {
+                                                                                if let Some(agent) = &agent_view {
+                                                                                    agent.update(cx, |panel, cx| panel.load_conversation(&conv_id, cx));
+                                                                                }
+                                                                            }),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        "ticker" | "orderbook" | "trades" | "tape" | "execution" | "tradedesk" => {
                                                             menu = menu.separator().label("Exchange");
                                                             for exchange in exchange_choices() {
                                                                 let pane_id = pane_id_cfg.clone();
@@ -1861,7 +1968,7 @@ impl PaneGridRenderer {
                                                     _bridge: std::sync::Arc::new(bridge),
                                                 };
                                                 chart_map.insert(pane_id.clone(), state);
-                                                chart_panel.into_any_element()
+                                                cached_panel(chart_panel)
                                             }
                                             Err(e) => {
                                                 div().size_full().flex().items_center().justify_center().child(format!("Error starting chart: {e}")).into_any_element()
@@ -1873,7 +1980,7 @@ impl PaneGridRenderer {
                                         if !ent.read(cx).has_size(content_w, content_h) {
                                             ent.update(cx, |chart, _| chart.set_size(content_w, content_h));
                                         }
-                                        ent.into_any_element()
+                                        cached_panel(ent)
                                     }
                                 }
                                 "ticker" => {
@@ -1907,7 +2014,7 @@ impl PaneGridRenderer {
                                         }
                                         ent
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "orderbook" => {
                                     let config = data.config.as_object();
@@ -1947,7 +2054,7 @@ impl PaneGridRenderer {
                                                     _bridge: std::sync::Arc::new(bridge),
                                                 };
                                                 orderbook_map.insert(pane_id.clone(), state);
-                                                panel.into_any_element()
+                                                cached_panel(panel)
                                             }
                                             Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting orderbook: {e}")).into_any_element(),
                                         }
@@ -1956,55 +2063,23 @@ impl PaneGridRenderer {
                                         if !ent.read(cx).has_size(content_w, content_h) {
                                             ent.update(cx, |p, _| p.set_size(content_w, content_h));
                                         }
-                                        ent.into_any_element()
+                                        cached_panel(ent)
                                     }
                                 }
-                                "depth" => {
-                                    let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
-                                    let symbol = config_str(config, "symbol", "BTC/USDT");
-                                    let mut depth_map = self.depth_views.borrow_mut();
-                                    let needs_recreate = match depth_map.get(&pane_id) {
-                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
-                                        None => true,
-                                    };
-
-                                    if needs_recreate {
-                                        let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
-                                        bridge_config.ticker = false;
-                                        bridge_config.trades = false;
-                                        bridge_config.kline = false;
-                                        bridge_config.fetch_history = false;
-                                         bridge_config.snapshot = Some(("orderbook", 100, "Depth"));
-                                        if let Ok(Some(session)) = crate::data::session_store::load_session() {
-                                            bridge_config.access_token = Some(session.access_token);
+                                "depth" | "agent" => {
+                                    let mut agent_map = self.agent_views.borrow_mut();
+                                    if !agent_map.contains_key(&pane_id) {
+                                        let panel = cx.new(|cx| crate::components::ui::agent_panel::AgentPanel::new(cx));
+                                        if let Some(context) = self.agent_context.clone() {
+                                            panel.update(cx, |agent, _| agent.set_context(context));
                                         }
-                                        match crate::data::bridge::Bridge::start(bridge_config) {
-                                            Ok(bridge) => {
-                                                let feed = crate::data::orderbook_feed::OrderBookFeed::new(bridge.subscribe_orderbook());
-                                                let title = format!("{} {} Depth", exchange.to_uppercase(), symbol);
-                                                let panel = cx.new(|cx| {
-                                                    let mut p = crate::components::ui::depth_panel::DepthPanel::new(feed, title, cx);
-                                                    p.set_size(content_w, content_h);
-                                                    p
-                                                });
-                                                depth_map.insert(pane_id.clone(), DepthViewState {
-                                                    exchange: exchange.clone(),
-                                                    symbol: symbol.clone(),
-                                                    entity: panel.clone(),
-                                                    _bridge: std::sync::Arc::new(bridge),
-                                                });
-                                                panel.into_any_element()
-                                            }
-                                            Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting depth: {e}")).into_any_element(),
-                                        }
-                                    } else {
-                                        let ent = depth_map.get(&pane_id).unwrap().entity.clone();
-                                        if !ent.read(cx).has_size(content_w, content_h) {
-                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
-                                        }
-                                        ent.into_any_element()
+                                        agent_map.insert(pane_id.clone(), AgentViewState { entity: panel });
                                     }
+                                    let ent = agent_map.get(&pane_id).unwrap().entity.clone();
+                                    if !ent.read(cx).has_size(content_w, content_h) {
+                                        ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                    }
+                                    cached_panel(ent)
                                 }
                                 "trades" | "tape" => {
                                     let config = data.config.as_object();
@@ -2043,7 +2118,7 @@ impl PaneGridRenderer {
                                                     entity: panel.clone(),
                                                     _bridge: std::sync::Arc::new(bridge),
                                                 });
-                                                panel.into_any_element()
+                                                cached_panel(panel)
                                             }
                                             Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting trades: {e}")).into_any_element(),
                                         }
@@ -2052,7 +2127,7 @@ impl PaneGridRenderer {
                                         if !ent.read(cx).has_size(content_w, content_h) {
                                             ent.update(cx, |p, _| p.set_size(content_w, content_h));
                                         }
-                                        ent.into_any_element()
+                                        cached_panel(ent)
                                     }
                                 }
                                 "positions" => {
@@ -2073,7 +2148,7 @@ impl PaneGridRenderer {
                                         positions_map.insert(pane_id.clone(), entity.clone());
                                         entity
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "execution" | "tradedesk" => {
                                     let config = data.config.as_object();
@@ -2105,7 +2180,7 @@ impl PaneGridRenderer {
                                                 execution_map.insert(pane_id.clone(), ExecutionViewState {
                                                     exchange, symbol, entity: panel.clone(), _bridge: std::sync::Arc::new(bridge),
                                                 });
-                                                panel.into_any_element()
+                                                cached_panel(panel)
                                             }
                                             Err(e) => div().size_full().flex().items_center().justify_center().child(format!("Error starting trade desk price feed: {e}")).into_any_element(),
                                         }
@@ -2114,7 +2189,7 @@ impl PaneGridRenderer {
                                         if !entity.read(cx).has_size(content_w, content_h) {
                                             entity.update(cx, |panel, _| panel.set_size(content_w, content_h));
                                         }
-                                        entity.into_any_element()
+                                        cached_panel(entity)
                                     }
                                 }
                                 "watchlist" => {
@@ -2140,7 +2215,7 @@ impl PaneGridRenderer {
                                         watchlist_map.insert(pane_id.clone(), WatchlistViewState { entity: entity.clone() });
                                         entity
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "marketcap" => {
                                     let mut market_cap_map = self.market_cap_views.borrow_mut();
@@ -2159,7 +2234,7 @@ impl PaneGridRenderer {
                                         market_cap_map.insert(pane_id.clone(), MarketCapViewState { entity: entity.clone() });
                                         entity
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "feargreed" => {
                                     let mut fg_map = self.fear_greed_views.borrow_mut();
@@ -2178,7 +2253,7 @@ impl PaneGridRenderer {
                                         }
                                         ent
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "newsfeed" => {
                                     let config = data.config.as_object();
@@ -2208,11 +2283,18 @@ impl PaneGridRenderer {
                                     } else {
                                         let ent = newsfeed_map.get(id).unwrap().entity.clone();
                                         if !ent.read(cx).has_size(content_w, content_h) {
-                                            ent.update(cx, |p, _| p.set_size(content_w, content_h));
+                                            // A maximize transition changes the pane dimensions
+                                            // outside the newsfeed entity. Notify it explicitly
+                                            // so its header relayouts immediately instead of
+                                            // waiting for a subsequent drag interaction.
+                                            ent.update(cx, |p, cx| {
+                                                p.set_size(content_w, content_h);
+                                                cx.notify();
+                                            });
                                         }
                                         ent
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 "time" | "clock" => {
                                     let config = data.config.as_object();
@@ -2256,7 +2338,7 @@ impl PaneGridRenderer {
                                         });
                                         ent
                                     };
-                                    panel.into_any_element()
+                                    cached_panel(panel)
                                 }
                                 _ => {
                                     if is_empty {
@@ -2473,16 +2555,35 @@ impl Render for PaneGridRenderer {
 
         if let Some(tree) = &self.tree {
             let mut root = div().size_full().bg(theme.colors.background).p(px(4.0));
+
+            // The root padding remains present while maximized, so pass the
+            // usable inner dimensions to the pane. Passing the raw viewport
+            // makes the pane's flex measurement stale until a later drag
+            // forces a new layout pass.
+            let root_size = gpui::Size {
+                width: (current_size.width - 8.0).max(0.0),
+                height: (current_size.height - 8.0).max(0.0),
+            };
             
             // If a pane is maximized, we want to extract just that pane node
-            // and render it using current_size
+            // and render it using the root's usable dimensions
             if let Some(max_id) = &self.maximized_pane {
                 let mut max_node = None;
                 tree.find_node(max_id, &mut |node| {
                     max_node = Some(node.clone());
                 });
                 if let Some(node) = max_node {
-                    return root.child(self.render_node(&node, current_size, cx)).into_any_element();
+                    return root
+                        .child(
+                            div()
+                                .size_full()
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .flex_none()
+                                .child(self.render_node(&node, root_size, cx)),
+                        )
+                        .into_any_element();
                 }
             }
             
@@ -2512,6 +2613,9 @@ impl Render for PaneGridRenderer {
                     }));
             }
             
+            // Each module is its own entity. Render those entities through GPUI's
+            // retained-view cache so an update in one live module does not rebuild
+            // and repaint every idle sibling in a populated dashboard.
             root.child(self.render_node(tree, current_size, cx)).into_any_element()
         } else {
             div()

@@ -78,6 +78,7 @@ fn finter_timezones() -> Vec<(SharedString, SharedString)> {
     .collect()
 }
 
+#[derive(Clone)]
 pub struct AppSettings {
     pub server_url: SharedString,
     pub dark_mode: bool,
@@ -96,6 +97,9 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     pub sync_dashboard_tabs: bool,
     pub default_timezone: gpui::SharedString,
+    /// Local-only Agent configuration; never included in SettingsData.
+    pub agent_base_url: SharedString,
+    pub agent_api_key: SharedString,
 }
 
 impl Default for AppSettings {
@@ -118,6 +122,8 @@ impl Default for AppSettings {
             auto_check_updates: true,
             sync_dashboard_tabs: true,
             default_timezone: "UTC".into(),
+            agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
+            agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
         }
     }
 }
@@ -162,6 +168,8 @@ impl AppSettings {
                 .unwrap_or_else(|| "UTC".into())
                 .into(),
             auto_check_updates: data.auto_check_updates.unwrap_or(true),
+            agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
+            agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
         }
     }
 
@@ -196,6 +204,7 @@ impl AppSettings {
 
 pub struct SettingsPage {
     settings: Entity<AppSettings>,
+    committed: Entity<AppSettings>,
     on_change: OnChangeFn,
 }
 
@@ -203,6 +212,7 @@ impl SettingsPage {
     pub fn new(cx: &mut App) -> Self {
         Self {
             settings: cx.new(|_| AppSettings::default()),
+            committed: cx.new(|_| AppSettings::default()),
             on_change: None,
         }
     }
@@ -210,6 +220,7 @@ impl SettingsPage {
     pub fn new_with_data(data: &SettingsData, cx: &mut App) -> Self {
         Self {
             settings: cx.new(|_| AppSettings::from_settings_data(data)),
+            committed: cx.new(|_| AppSettings::from_settings_data(data)),
             on_change: None,
         }
     }
@@ -231,7 +242,7 @@ impl SettingsPage {
     }
 
     pub fn get_settings_data(&self, cx: &App) -> SettingsData {
-        self.settings.read(cx).to_settings_data()
+        self.committed.read(cx).to_settings_data()
     }
 
     fn build_settings(&self, _cx: &App) -> Settings {
@@ -242,11 +253,37 @@ impl SettingsPage {
             .sidebar_width(px(220.))
             .page(self.build_appearance_page(settings.clone(), on_change.clone()))
             .page(self.build_network_page(settings.clone(), on_change.clone()))
+            .page(self.build_agent_page(settings.clone()))
             .page(self.build_trading_page(settings.clone(), on_change.clone()))
             .page(self.build_alerts_page(settings.clone(), on_change.clone()))
             .page(self.build_performance_page(settings.clone(), on_change.clone()))
             .page(self.build_layout_page(settings.clone(), on_change.clone()))
             .page(self.build_updates_page(settings.clone(), on_change.clone()))
+    }
+
+    fn save_section(&self, section: &'static str, draft: Entity<AppSettings>, callback: OnChangeFn) -> SettingGroup {
+        let committed = self.committed.clone();
+        SettingGroup::new().item(SettingItem::render(move |_, _, _| {
+            let draft=draft.clone(); let committed=committed.clone(); let callback=callback.clone();
+            gpui_component::button::Button::new(SharedString::from(format!("save-{section}")))
+                .label("Save Section")
+                .on_click(move |_, _, cx| {
+                    let values=draft.read(cx).clone();
+                    committed.update(cx, |saved, _| {
+                        match section {
+                            "network" => { saved.server_url = values.server_url.clone(); },
+                            "appearance" => { saved.theme = values.theme.clone(); saved.dark_mode = values.dark_mode.clone(); saved.enable_animations = values.enable_animations.clone(); },
+                            "trading" => { saved.default_exchange = values.default_exchange.clone(); saved.default_trading_pair = values.default_trading_pair.clone(); },
+                            "alerts" => { saved.enable_price_alerts = values.enable_price_alerts.clone(); saved.enable_sound_alerts = values.enable_sound_alerts.clone(); saved.enable_desktop_notifications = values.enable_desktop_notifications.clone(); },
+                            "performance" => { saved.max_fps = values.max_fps.clone(); saved.data_update_frequency = values.data_update_frequency.clone(); },
+                            "layout" => { saved.sync_dashboard_tabs = values.sync_dashboard_tabs.clone(); saved.default_timezone = values.default_timezone.clone(); saved.auto_save_dashboard = values.auto_save_dashboard.clone(); },
+                            "updates" => { saved.auto_check_updates = values.auto_check_updates.clone(); },
+                            _ => {}
+                        }
+                    });
+                    if let Some(cb)=&callback { cb(cx); }
+                })
+        }))
     }
 
     fn build_network_page(
@@ -274,9 +311,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.server_url = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -285,6 +319,44 @@ impl SettingsPage {
                         .description("URL of your API backend (defaults to https://coinwat.ch). Override for local development or custom endpoints."),
                     ),
             )
+            .group(self.save_section("network", settings.clone(), on_change.clone()))
+    }
+
+    fn build_agent_page(&self, settings: Entity<AppSettings>) -> SettingPage {
+        let url_settings = settings.clone();
+        let key_settings = settings.clone();
+        let save_settings = settings.clone();
+        SettingPage::new("AI Agent")
+            .description("Configure the OpenAI-compatible provider. These values remain local and are never saved to the database.")
+            .group(SettingGroup::new().title("Provider")
+                .item(SettingItem::new("Base URL", SettingField::input(
+                    { let s=url_settings.clone(); move |cx| s.read(cx).agent_base_url.clone() },
+                    { let s=url_settings.clone(); move |v, cx| s.update(cx, |x,_| x.agent_base_url=v) },
+                )))
+                .item(SettingItem::new("API Key", SettingField::input(
+                    { let s=key_settings.clone(); move |cx| s.read(cx).agent_api_key.clone() },
+                    { let s=key_settings.clone(); move |v, cx| s.update(cx, |x,_| x.agent_api_key=v) },
+                )).description("Saved only on this machine; never sent to the FinTer database."))
+                .item(SettingItem::render(move |_, _, cx| {
+                    let s=save_settings.clone();
+                    gpui_component::button::Button::new("save-agent-settings").label("Save Agent Settings")
+                        .on_click(move |_, _, cx| {
+                            let values=s.read(cx);
+                            let config = crate::data::agent::LocalConfig {
+                                base_url: values.agent_base_url.to_string(),
+                                api_key: values.agent_api_key.to_string(),
+                            };
+                            if let Err(error) = crate::data::agent::save_provider_config(&config) {
+                                tracing::error!(?error, "Failed to save local Agent settings");
+                            }
+                            // SAFETY: GPUI mutates this process environment on its UI thread.
+                            unsafe {
+                                std::env::set_var("FINTER_AI_BASE_URL", values.agent_base_url.as_ref());
+                                std::env::set_var("FINTER_AI_API_KEY", values.agent_api_key.as_ref());
+                            }
+                            cx.refresh_windows();
+                        })
+                })))
     }
 
     fn build_appearance_page(
@@ -327,10 +399,7 @@ impl SettingsPage {
                                     move |value: SharedString, cx| {
                                         let dark_mode = settings.read(cx).dark_mode;
                                         settings.update(cx, |s, _| s.theme = value.clone());
-                                        theme::apply_theme(&value, dark_mode, cx);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
+
                                     }
                                 },
                             )
@@ -352,10 +421,7 @@ impl SettingsPage {
                                     move |value, cx| {
                                         let theme_name = settings.read(cx).theme.clone();
                                         settings.update(cx, |s, _| s.dark_mode = value);
-                                        theme::apply_theme(&theme_name, value, cx);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
+
                                     }
                                 },
                             )
@@ -376,9 +442,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_animations = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -387,6 +450,7 @@ impl SettingsPage {
                         .description("Enable smooth UI animations"),
                     ),
             )
+            .group(self.save_section("appearance", settings.clone(), on_change.clone()))
     }
 
     fn build_trading_page(
@@ -422,9 +486,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.default_exchange = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -445,9 +506,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.default_trading_pair = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -456,6 +514,7 @@ impl SettingsPage {
                         .description("Default symbol to load on startup"),
                     ),
             )
+            .group(self.save_section("trading", settings.clone(), on_change.clone()))
     }
 
     fn build_alerts_page(
@@ -484,9 +543,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_price_alerts = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -507,9 +563,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_sound_alerts = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -533,9 +586,6 @@ impl SettingsPage {
                                 move |value, cx| {
                                     settings
                                         .update(cx, |s, _| s.enable_desktop_notifications = value);
-                                    if let Some(ref cb) = on_change {
-                                        cb(cx);
-                                    }
                                 }
                             },
                         )
@@ -544,6 +594,7 @@ impl SettingsPage {
                     .description("Show system notifications for alerts"),
                 ),
             )
+            .group(self.save_section("alerts", settings.clone(), on_change.clone()))
     }
 
     fn build_performance_page(
@@ -576,9 +627,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.max_fps = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -604,9 +652,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.data_update_frequency = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -615,6 +660,7 @@ impl SettingsPage {
                         .description("How often to refresh market data (50-1000ms)"),
                     ),
             )
+            .group(self.save_section("performance", settings.clone(), on_change.clone()))
     }
 
     fn build_layout_page(
@@ -640,9 +686,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.sync_dashboard_tabs = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -664,9 +707,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.default_timezone = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -687,9 +727,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.auto_save_dashboard = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -698,6 +735,7 @@ impl SettingsPage {
                         .description("Automatically save dashboard changes on exit"),
                     ),
             )
+            .group(self.save_section("layout", settings.clone(), on_change.clone()))
     }
 
     fn build_updates_page(
@@ -726,9 +764,6 @@ impl SettingsPage {
                                     let on_change = on_change.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.auto_check_updates = value);
-                                        if let Some(ref cb) = on_change {
-                                            cb(cx);
-                                        }
                                     }
                                 },
                             )
@@ -737,6 +772,7 @@ impl SettingsPage {
                         .description("Automatically check for new versions every 24 hours"),
                     ),
             )
+            .group(self.save_section("updates", settings.clone(), on_change.clone()))
     }
 }
 

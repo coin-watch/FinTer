@@ -674,7 +674,6 @@ impl WatchlistPanel {
                         h.child(
                             div()
                                 .px_1()
-                                .rounded(px(2.0))
                                 .bg(colors.muted.opacity(0.4))
                                 .text_size(px(8.5))
                                 .font_weight(FontWeight::BOLD)
@@ -706,7 +705,6 @@ impl WatchlistPanel {
                         div()
                             .px_1p5()
                             .py(px(0.5))
-                            .rounded(px(3.0))
                             .bg(match item.change_24h {
                                 Some(_) => if is_positive { colors.bullish.opacity(0.15) } else { colors.bearish.opacity(0.15) },
                                 None => colors.muted.opacity(0.2),
@@ -778,6 +776,7 @@ async fn run_watchlist_syncer(entries: Arc<Mutex<Vec<WatchlistEntry>>>, tracked:
             config.orderbook = false;
             config.kline = false;
             config.fetch_history = false;
+            config.snapshot = Some(("ticker", 0, "Watchlist"));
             if let Ok(Some(session)) = crate::data::session_store::load_session() {
                 config.access_token = Some(session.access_token);
             }

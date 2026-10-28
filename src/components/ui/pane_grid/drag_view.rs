@@ -8,7 +8,7 @@ pub enum DragContent {
     Chart(Entity<crate::components::ui::chart_panel::ChartPanel>),
     Ticker(Entity<crate::components::ui::ticker_panel::TickerPanel>),
     Orderbook(Entity<crate::components::ui::orderbook_panel::OrderBookPanel>),
-    Depth(Entity<crate::components::ui::depth_panel::DepthPanel>),
+    Agent(Entity<crate::components::ui::agent_panel::AgentPanel>),
     Tape(Entity<crate::components::ui::tape_panel::TapePanel>),
     Execution(Entity<crate::components::ui::execution_panel::ExecutionPanel>),
     Positions(Entity<crate::components::ui::positions_panel::PositionsPanel>),
@@ -26,7 +26,7 @@ impl DragContent {
             Self::Chart(entity) => entity.clone().into_any_element(),
             Self::Ticker(entity) => entity.clone().into_any_element(),
             Self::Orderbook(entity) => entity.clone().into_any_element(),
-            Self::Depth(entity) => entity.clone().into_any_element(),
+            Self::Agent(entity) => entity.clone().into_any_element(),
             Self::Tape(entity) => entity.clone().into_any_element(),
             Self::Execution(entity) => entity.clone().into_any_element(),
             Self::Positions(entity) => entity.clone().into_any_element(),
@@ -69,11 +69,11 @@ impl Render for DragView {
         let theme = cx.theme();
         let is_market_module = matches!(
             self.module_type.to_lowercase().as_str(),
-            "chart" | "ticker" | "orderbook" | "depth" | "trades" | "tape" | "execution" | "tradedesk"
+            "chart" | "ticker" | "orderbook" | "agent" | "trades" | "tape" | "execution" | "tradedesk"
         );
         let suffix = match self.module_type.to_lowercase().as_str() {
             "orderbook" => Some("OB"),
-            "depth" => Some("DEPTH"),
+            "agent" => Some("AGENT"),
             "trades" | "tape" => Some("TRADES"),
             "execution" | "tradedesk" => Some("DESK"),
             _ => None,
@@ -124,7 +124,7 @@ impl Render for DragView {
                                                     .flex_shrink_0()
                                                     .px(px(4.0))
                                                     .py(px(1.0))
-                                                    .rounded(px(3.0))
+                                                    
                                                     .bg(theme.colors.background.opacity(0.2))
                                                     .border_1()
                                                     .border_color(theme.colors.primary_foreground.opacity(0.4))
@@ -147,7 +147,7 @@ impl Render for DragView {
                                                 div()
                                                     .px(px(8.0))
                                                     .py(px(1.0))
-                                                    .rounded(px(4.0))
+                                                    
                                                     .bg(theme.colors.background)
                                                     .text_color(theme.colors.primary)
                                                     .text_size(px(11.0))

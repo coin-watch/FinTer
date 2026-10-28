@@ -41,6 +41,16 @@ pub struct OrderBookPanel {
 }
 
 impl OrderBookPanel {
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        let snap = self.feed.snapshot();
+        serde_json::json!({
+            "bids": snap.as_ref().map(|b| b.bids.iter().take(20).collect::<Vec<_>>()),
+            "asks": snap.as_ref().map(|b| b.asks.iter().take(20).collect::<Vec<_>>()),
+            "timestamp_ms": snap.as_ref().map(|b| b.timestamp_ms),
+            "loading": snap.is_none()
+        })
+    }
+
     pub fn new(feed: OrderBookFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
         // Weak entity updates stop polling when the panel is closed.
         let feed_for_timer = feed.clone();

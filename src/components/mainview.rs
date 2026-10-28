@@ -21,7 +21,7 @@ use crate::data::version::UpdateState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, StyleRefinement, Styled, Window, WindowControlArea, div, px,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, WindowControlArea, div, px,
 };
 use gpui_component::button::ButtonVariants;
 use gpui_component::Sizable;
@@ -137,6 +137,9 @@ pub struct MainView {
     /// Redacted account snapshot for the native Profile page.
     account_summary: Option<serde_json::Value>,
     account_summary_loading: bool,
+    account_refresh_task: Option<Task<()>>,
+    /// Periodically republishes live panel data to every Agent pane.
+    agent_context_task: Option<Task<()>>,
     /// True while the background session-restore task is running.
     is_restoring: bool,
     /// User settings from database
@@ -177,6 +180,8 @@ impl MainView {
             is_authenticated: false,
             account_summary: None,
             account_summary_loading: false,
+            account_refresh_task: None,
+            agent_context_task: None,
             is_restoring: false,
             user_settings: None,
             active_module: None,
@@ -383,6 +388,27 @@ impl MainView {
         self.current_page = page;
     }
 
+    fn start_account_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.account_refresh_task.is_some() {
+            return;
+        }
+        self.account_refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(15)).await;
+                if this.update(cx, |view, cx| {
+                    if view.current_page != Page::Profile || !view.is_authenticated {
+                        return false;
+                    }
+                    view.load_account_summary(cx);
+                    true
+                }).unwrap_or(false) == false {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, _| view.account_refresh_task = None);
+        }));
+    }
+
     fn load_account_summary(&mut self, cx: &mut Context<Self>) {
         if !self.is_authenticated || self.account_summary_loading {
             return;
@@ -458,6 +484,41 @@ impl MainView {
                 })
                 .detach();
             }
+        }
+    }
+
+    fn start_agent_context_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.agent_context_task.is_some() { return; }
+        self.agent_context_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+                if this.update(cx, |view, cx| view.refresh_agent_context(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Share a bounded, read-only snapshot of all loaded/open dashboard layouts.
+    fn refresh_agent_context(&self, cx: &mut Context<Self>) {
+        let mut homes = self.dashboard_views.clone();
+        if let Some(home) = &self.home_page {
+            let id = self.active_module.as_ref().and_then(|m| m.id.clone())
+                .unwrap_or_else(|| "local-workspace".to_string());
+            homes.entry(id).or_insert_with(|| home.clone());
+        }
+        let dashboards: Vec<serde_json::Value> = homes.iter()
+            .filter(|(id, _)| !self.closed_dashboard_tabs.contains(*id))
+            .map(|(id, home)| {
+                let grid = home.read(cx).pane_grid.read(cx);
+                let name = self.dashboard_modules.iter().find(|m| m.id.as_ref() == Some(id))
+                    .map(|m| m.module_name.as_str()).unwrap_or("Dashboard");
+                serde_json::json!({"id": id, "name": name, "layout": grid.tree, "market_data": grid.agent_market_snapshot(cx)})
+            }).collect();
+        let context = serde_json::json!({"captured_at": chrono::Utc::now().to_rfc3339(), "dashboards": dashboards});
+        for home in homes.values() {
+            let grid = home.read(cx).pane_grid.clone();
+            grid.update(cx, |grid, cx| grid.set_agent_context(context.clone(), cx));
         }
     }
 
@@ -597,7 +658,6 @@ impl MainView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(3.0))
                             .cursor_pointer()
                             .hover(move |style| style.bg(sec_hover).text_color(fg_active))
                             .text_color(fg_muted)
@@ -619,7 +679,6 @@ impl MainView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded(px(3.0))
                             .cursor_pointer()
                             .hover(move |style| style.bg(sec_hover).text_color(fg_active))
                             .text_color(fg_muted)
@@ -1299,13 +1358,16 @@ impl MainView {
             settings.current_dashboard
         );
 
-        // Update appropriate cache (guest or cloud)
-        if let Some(path) = self.active_settings_path() {
+        // Always keep a local cache, including when authenticated. This lets settings
+        // survive offline startup and keeps local preferences available on this machine.
+        for path in [Self::guest_settings_path(), Self::cloud_settings_path()].into_iter().flatten() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Ok(json) = serde_json::to_string(&settings) {
-                let _ = std::fs::write(&path, json);
+                if let Err(error) = std::fs::write(&path, json) {
+                    tracing::error!(?error, ?path, "Failed to save local settings cache");
+                }
             }
         }
 
@@ -1517,6 +1579,7 @@ impl MainView {
             self.home_page = Some(home);
             self.closed_dashboard_tabs.remove(&module_id);
             self.active_module = Some(module.clone());
+            self.refresh_agent_context(cx);
             if let Some(dm) = &self.dashboard_manager {
                 dm.update(cx, |manager, cx| manager.set_active_module(module_id.clone(), cx));
             }
@@ -1802,7 +1865,6 @@ fn build_content_card(
     div()
         .p(px(12.0))
         .bg(theme.colors.sidebar_accent)
-        .rounded(px(8.0))
         .child(
             div()
                 .text_sm()
@@ -1836,7 +1898,6 @@ fn build_feed_item(
     div()
         .p(px(12.0))
         .bg(theme.colors.sidebar_accent)
-        .rounded(px(8.0))
         .border_l_2()
         .border_color(if is_bullish {
             gpui::rgb(0x22c55e)
@@ -1877,7 +1938,6 @@ fn build_chat_message(
     div()
         .p(px(12.0))
         .bg(theme.colors.sidebar_accent)
-        .rounded(px(8.0))
         .child(
             div()
                 .text_sm()
@@ -1904,7 +1964,6 @@ fn build_notification_item(
     div()
         .p(px(12.0))
         .bg(theme.colors.sidebar_accent)
-        .rounded(px(8.0))
         .child(
             div()
                 .text_sm()
@@ -1931,7 +1990,6 @@ fn build_settings_item(
     div()
         .p(px(12.0))
         .bg(theme.colors.sidebar_accent)
-        .rounded(px(8.0))
         .cursor_pointer()
         .hover(|style: StyleRefinement| style.bg(gpui::rgb(0x3a3a4e)))
         .child(
@@ -1952,6 +2010,7 @@ fn build_settings_item(
 
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.start_agent_context_refresh(cx);
         let theme = cx.theme().clone();
         let current_page = self.current_page;
         let entity = cx.weak_entity();
@@ -2194,8 +2253,13 @@ impl Render for MainView {
 
         // If on Settings or Profile page, show full-screen with sidebar
         if current_page == Page::Settings || current_page == Page::Profile {
-            if current_page == Page::Profile && self.account_summary.is_none() && !self.account_summary_loading {
-                self.load_account_summary(cx);
+            if current_page == Page::Profile && self.is_authenticated {
+                if self.account_refresh_task.is_none() {
+                    self.load_account_summary(cx);
+                    self.start_account_refresh(cx);
+                }
+            } else {
+                self.account_refresh_task = None;
             }
             if self.settings_page.is_none() {
                 let settings_data = self.user_settings.clone().unwrap_or_default();
@@ -2258,6 +2322,7 @@ impl Render for MainView {
                         self.account_summary.clone(),
                         self.account_summary_loading,
                         self.is_authenticated,
+                        cx,
                     ))
                 });
 

@@ -103,6 +103,17 @@ impl TickerPanel {
         (self.width - width).abs() < 0.5 && (self.height - height).abs() < 0.5
     }
 
+    /// A bounded, serializable live snapshot for read-only Agent analysis.
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "ticker": self.latest_tick,
+            "recent_closes": self.price_history.iter().rev().take(120).rev().copied().collect::<Vec<_>>(),
+            "loading": self.is_loading
+        })
+    }
+
     /// Read any pending ticks to update state before rendering.
     fn pump_events(&mut self) -> bool {
         let mut changed = false;
@@ -261,7 +272,6 @@ impl Render for TickerPanel {
                             div()
                                 .px(px(6.0))
                                 .py(px(1.5))
-                                .rounded_sm()
                                 .bg(badge_bg)
                                 .text_size(px(10.0))
                                 .font_weight(gpui::FontWeight::BOLD)
@@ -313,7 +323,6 @@ impl Render for TickerPanel {
                                             div()
                                                 .px(px(5.0))
                                                 .py(px(1.0))
-                                                .rounded_sm()
                                                 .bg(colors.muted)
                                                 .text_size(px(meta_size - 1.0))
                                                 .font_weight(gpui::FontWeight::MEDIUM)
@@ -325,7 +334,6 @@ impl Render for TickerPanel {
                                     div()
                                         .px(px(6.0))
                                         .py(px(2.0))
-                                        .rounded_sm()
                                         .bg(badge_bg)
                                         .text_size(px(badge_size))
                                         .font_weight(gpui::FontWeight::BOLD)

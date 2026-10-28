@@ -190,6 +190,15 @@ pub struct ChartPanel {
 }
 
 impl ChartPanel {
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        let candles = self.feed.snapshot();
+        serde_json::json!({
+            "exchange": self.exchange, "symbol": self.symbol, "timeframe": self.timeframe,
+            "candles": &candles[candles.len().saturating_sub(120)..],
+            "last_update_ms": self.feed.last_update_ms(), "loading": candles.is_empty()
+        })
+    }
+
     pub fn new(
         feed: CandleFeed,
         title: impl Into<String>,
@@ -197,12 +206,27 @@ impl ChartPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let f = feed.clone();
+        // The countdown is painted from wall-clock time, independent of feed
+        // updates. Invalidate the retained panel once per second even on quiet
+        // markets; keep coalescing feed updates at the existing 250 ms cadence.
         cx.spawn(async move |this, cx| {
             let mut last_ms = 0;
+            let mut last_countdown_second = u64::MAX;
             loop {
                 let ms = f.last_update_ms();
-                if ms != last_ms {
+                // Use the absolute Unix second as the invalidation key. The
+                // chart renderer derives the remaining time from the same wall
+                // clock, so every displayed second changes exactly once.
+                let countdown_second = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                let feed_changed = ms != last_ms;
+                let countdown_changed = countdown_second != last_countdown_second;
+
+                if feed_changed || countdown_changed {
                     last_ms = ms;
+                    last_countdown_second = countdown_second;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -722,7 +746,7 @@ impl ChartPanel {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(div().w(px(40.0)).h(px(2.0)).rounded_full().bg(colors.primary))
+            .child(div().w(px(40.0)).h(px(2.0)).bg(colors.primary))
             .child(
                 div()
                     .text_sm()
@@ -746,7 +770,7 @@ impl ChartPanel {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(div().w(px(40.0)).h(px(2.0)).rounded_full().bg(colors.bearish))
+            .child(div().w(px(40.0)).h(px(2.0)).bg(colors.bearish))
             .child(
                 div()
                     .text_sm()
@@ -1419,7 +1443,6 @@ impl Render for ChartPanel {
                 .left(px(self.settings_panel_x))
                 .w(px(260.0))
                 .p(px(10.0))
-                .rounded(px(8.0))
                 .border_1()
                 .border_color(cx.theme().colors.border)
                 .bg(cx.theme().colors.background)
@@ -2329,7 +2352,6 @@ impl ChartPanel {
                 div()
                     .w(px(10.0))
                     .h(px(10.0))
-                    .rounded_full()
                     .bg(parsed_color)
                     .border_1()
                     .border_color(colors.foreground.opacity(0.7)),
@@ -2404,7 +2426,6 @@ impl ChartPanel {
                                     .w(px(38.0))
                                     .h(px(38.0))
                                     .flex_shrink_0()
-                                    .rounded(px(10.0))
                                     .bg(selected_color)
                                     .border_1()
                                     .border_color(theme.foreground.opacity(0.45)),
@@ -2443,7 +2464,6 @@ impl ChartPanel {
                             .relative()
                             .w(px(204.0))
                             .h(px(154.0))
-                            .rounded(px(8.0))
                             .overflow_hidden()
                             .border_1()
                             .border_color(theme.border)
@@ -2523,7 +2543,6 @@ impl ChartPanel {
                                     .top(px(marker_y))
                                     .w(px(12.0))
                                     .h(px(12.0))
-                                    .rounded_full()
                                     .border_2()
                                     .border_color(gpui::Hsla::white())
                                     .bg(hue_color.opacity(0.2))
@@ -2537,7 +2556,6 @@ impl ChartPanel {
                             .relative()
                             .w(px(204.0))
                             .h(px(16.0))
-                            .rounded(px(5.0))
                             .overflow_hidden()
                             .border_1()
                             .border_color(theme.border)
@@ -2610,7 +2628,6 @@ impl ChartPanel {
                                     .top(px(1.0))
                                     .w(px(4.0))
                                     .h(px(14.0))
-                                    .rounded(px(2.0))
                                     .border_1()
                                     .border_color(gpui::Hsla::white())
                                     .bg(gpui::Hsla::transparent_black()),
@@ -2641,7 +2658,6 @@ impl ChartPanel {
                                     .cursor_pointer()
                                     .w(px(22.0))
                                     .h(px(22.0))
-                                    .rounded(px(6.0))
                                     .bg(swatch_color)
                                     .border_1()
                                     .border_color(if is_active {
@@ -2817,7 +2833,6 @@ impl ChartPanel {
             .left(px(self.library_x))
             .w(px(self.library_w))
             .h(px(self.library_h))
-            .rounded(px(8.0))
             .border_1()
             .border_color(colors.border)
             .bg(colors.background)
@@ -2891,7 +2906,6 @@ impl ChartPanel {
                             .cursor_pointer()
                             .px(px(6.0))
                             .py(px(2.0))
-                            .rounded(px(4.0))
                             .hover(|s| s.bg(colors.muted.opacity(0.2)))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -2920,7 +2934,6 @@ impl ChartPanel {
                             .cursor_pointer()
                             .px(px(8.0))
                             .py(px(2.0))
-                            .rounded(px(4.0))
                             .bg(if is_active {
                                 colors.primary.opacity(0.14)
                             } else {
@@ -2985,7 +2998,6 @@ impl ChartPanel {
                                     .flex()
                                     .flex_col()
                                     .p(px(6.0))
-                                    .rounded(px(4.0))
                                     .bg(colors.muted.opacity(0.15))
                                     .child(
                                         div()
@@ -3090,7 +3102,6 @@ impl ChartPanel {
                                                             div()
                                                                 .px(px(6.0))
                                                                 .py(px(2.0))
-                                                                .rounded(px(3.0))
                                                                 .bg(colors.muted.opacity(0.3))
                                                                 .child(format!("{}: {}", param_key, val_str))
                                                         )
@@ -3129,7 +3140,6 @@ impl ChartPanel {
                                     .items_center()
                                     .justify_between()
                                     .p(px(6.0))
-                                    .rounded(px(4.0))
                                     .bg(colors.muted.opacity(0.08))
                                     .child(
                                         div()
@@ -3146,7 +3156,6 @@ impl ChartPanel {
                                                     .text_xs()
                                                     .px(px(4.0))
                                                     .py(px(1.0))
-                                                    .rounded(px(2.0))
                                                     .bg(colors.muted.opacity(0.2))
                                                     .text_color(colors.muted_foreground)
                                                     .child(cat_label),
@@ -3157,7 +3166,6 @@ impl ChartPanel {
                                             .cursor_pointer()
                                             .px(px(8.0))
                                             .py(px(2.0))
-                                            .rounded(px(4.0))
                                             .bg(colors.primary.opacity(0.2))
                                             .text_color(colors.primary)
                                             .hover(|s| {

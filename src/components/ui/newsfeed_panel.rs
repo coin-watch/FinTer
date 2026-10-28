@@ -40,7 +40,7 @@ fn news_ws_url() -> String {
         .unwrap_or_else(|| "wss://newsfeed.coinwat.ch/ws".to_string())
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
 struct Article {
     id: String,
     title: String,
@@ -86,6 +86,13 @@ pub struct NewsfeedPanel {
 }
 
 impl NewsfeedPanel {
+    pub fn agent_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "articles": self.articles.iter().take(15).collect::<Vec<_>>(),
+            "loading": self.loading
+        })
+    }
+
     pub fn new(pane_id: String, priority: String, filter: String, cx: &mut Context<Self>) -> Self {
         // Coalesce external updates; weak access ends the task on panel close.
         cx.spawn(async move |this, cx| {
@@ -338,21 +345,43 @@ fn prioritize(articles: &mut Vec<Article>) {
 }
 
 fn clean_text(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
+    let mut output = String::with_capacity(value.len() + 8);
     let mut in_tag = false;
     for character in value.chars() {
         match character {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            '<' => {
+                in_tag = true;
+                output.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                output.push(' ');
+            }
             _ if !in_tag => output.push(character),
             _ => {}
         }
     }
     output
         .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn display_source(source: &str, category: &str) -> String {
+    let source = clean_text(source);
+    let category = category.to_uppercase();
+    let upper = source.to_uppercase();
+    for separator in [" | ", " - "] {
+        let prefix = format!("{category}{separator}");
+        if upper.starts_with(&prefix) {
+            return source[prefix.len()..].trim().to_uppercase();
+        }
+    }
+    source.to_uppercase()
 }
 
 fn published_time(value: Option<&str>, timezone: &str) -> String {
@@ -374,31 +403,34 @@ impl Render for NewsfeedPanel {
 
         let colors = &cx.theme().colors;
         let input = self.filter_input.as_ref().unwrap().clone();
-        let status = if self.connected { "NEWS MONITOR" } else { "RECONNECTING" };
-        let status_color = if self.connected { gpui::green() } else { colors.muted_foreground };
+        let status = if self.connected { "LIVE WIRE" } else { "CONNECTING" };
+        let status_color = if self.connected { colors.primary } else { colors.muted_foreground };
         let priority = self.priority.clone();
         let pane_id = self.pane_id.clone();
         let is_narrow = self.width < 340.0;
         let is_compact_row = self.width < 320.0;
         let header = div()
-            .h_8()
+            .w_full()
+            .flex_shrink_0()
+            .h(px(32.0))
             .flex()
             .items_center()
             .justify_between()
-            .gap_1()
-            .px_2()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .bg(colors.muted.opacity(0.18))
             .border_b_1()
             .border_color(colors.border)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(5.0))
                     .flex_shrink_0()
                     .text_size(px(10.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(colors.muted_foreground)
-                    .child(div().size(px(6.0)).rounded_full().bg(status_color))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(colors.foreground)
+                    .child(div().size(px(5.0)).bg(status_color))
                     .when(!is_narrow, |this| this.child(status)),
             )
             .child(
@@ -407,8 +439,15 @@ impl Render for NewsfeedPanel {
                     .flex_1()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .child(Input::new(&input).small())
+                    .justify_end()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .max_w(px(280.0))
+                            .child(Input::new(&input).small().w_full().cleanable(true)),
+                    )
                     .child(
                         Button::new("news-category")
                             .label(if is_narrow {
@@ -416,8 +455,8 @@ impl Render for NewsfeedPanel {
                             } else {
                                 priority.to_uppercase()
                             })
-                            .outline()
-                            .small()
+                            .ghost()
+                            .xsmall()
                             .dropdown_caret(true)
                             .dropdown_menu_with_anchor(gpui::Corner::TopRight, {
                                 let current = priority.clone();
@@ -465,7 +504,7 @@ impl Render for NewsfeedPanel {
                         Button::new("news-refresh")
                             .label(if is_narrow { "↻" } else { "REFRESH" })
                             .ghost()
-                            .small()
+                            .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.filter = this
                                     .filter_input
@@ -481,7 +520,9 @@ impl Render for NewsfeedPanel {
 
         let body = if self.loading {
             div()
-                .size_full()
+                .w_full()
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -491,7 +532,9 @@ impl Render for NewsfeedPanel {
                 .into_any_element()
         } else if self.failed {
             div()
-                .size_full()
+                .w_full()
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -501,7 +544,9 @@ impl Render for NewsfeedPanel {
                 .into_any_element()
         } else if self.articles.is_empty() {
             div()
-                .size_full()
+                .w_full()
+                .flex_1()
+                .min_h_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -516,31 +561,38 @@ impl Render for NewsfeedPanel {
                 .min_h_0()
                 .overflow_y_scrollbar()
                 .bg(colors.background)
-                .children(self.articles.iter().map(|article| {
+                .child(
+                    div()
+                        .w_full()
+                        .when(self.width >= 900.0, |this| this.max_w(px(1100.0)).mx_auto())
+                        .children(self.articles.iter().map(|article| {
                     let url = article.url.clone();
                     let id = ElementId::Name(format!("news-{}", article.id).into());
                     state_id += 1;
                     let local_state_id = state_id;
                     let title = clean_text(&article.title);
-                    let source = clean_text(&article.source);
                     let category = article.category.replace("science-tech", "science/tech");
                     let time = published_time(article.published_at.as_deref(), &self.timezone);
-                    let summary = article.summary.as_deref().map(|s| clean_text(s)).unwrap_or_default();
-                    let top = (article.priority >= 60).then_some("TOP").unwrap_or("");
+                    let summary = article.summary.as_deref().map(clean_text).unwrap_or_default();
                     let bg_hover = colors.muted;
 
                     let summary_color = colors.foreground.opacity(0.75);
+
+                    let source_upper = display_source(&article.source, &category);
+                    let is_top = article.priority >= 60;
+                    let flash_bg = gpui::rgba(0xf59e0b2e);
+                    let flash_border = gpui::rgba(0xf59e0b73);
 
                     if is_compact_row {
                         div()
                             .id(id)
                             .w_full()
-                            .px_2()
-                            .py(px(6.0))
+                            .px(px(8.0))
+                            .py(px(7.0))
                             .border_b_1()
-                            .border_color(colors.border.opacity(0.7))
+                            .border_color(colors.border.opacity(0.45))
                             .cursor_pointer()
-                            .hover(|s| s.bg(bg_hover.opacity(0.6)))
+                            .hover(|s| s.bg(bg_hover.opacity(0.45)))
                             .on_click(move |_, _, _| {
                                 let _ = webbrowser::open(&url);
                             })
@@ -550,55 +602,66 @@ impl Render for NewsfeedPanel {
                                     .flex()
                                     .items_center()
                                     .justify_between()
-                                    .gap_1()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
-                                            .gap_1()
+                                            .gap(px(5.0))
+                                            .min_w_0()
+                                            .flex_1()
+                                            .overflow_hidden()
                                             .child(
                                                 div()
-                                                    .max_w(px(110.0))
-                                                    .overflow_hidden()
+                                                    .font_family(cx.theme().mono_font_family.clone())
                                                     .text_size(px(9.5))
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                    .text_color(colors.primary)
-                                                    .child(source),
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(time),
                                             )
                                             .child(
                                                 div()
-                                                    .rounded_sm()
-                                                    .bg(colors.muted)
-                                                    .px(px(3.0))
-                                                    .py(px(1.0))
-                                                    .text_size(px(8.5))
-                                                    .text_color(colors.foreground.opacity(0.7))
-                                                    .child(category.to_uppercase()),
+                                                    .truncate()
+                                                    .text_size(px(9.5))
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(colors.primary)
+                                                    .child(source_upper),
                                             )
-                                            .when(!top.is_empty(), |element| {
-                                                element.child(
+                                            .when(is_top, |el| {
+                                                el.child(
                                                     div()
-                                                        .text_size(px(8.5))
-                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .px(px(3.0))
+                                                        .py(px(0.5))
+                                                        .bg(flash_bg)
+                                                        .border_1()
+                                                        .border_color(flash_border)
+                                                        .text_size(px(8.0))
+                                                        .font_weight(gpui::FontWeight::BOLD)
                                                         .text_color(gpui::rgb(0xf59e0b))
-                                                        .child(top),
+                                                        .child("FLASH"),
                                                 )
                                             }),
                                     )
                                     .child(
                                         div()
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(9.0))
+                                            .flex_shrink_0()
+                                            .px(px(4.0))
+                                            .py(px(0.5))
+                                            .bg(colors.muted.opacity(0.35))
+                                            .border_1()
+                                            .border_color(colors.border.opacity(0.6))
+                                            .text_size(px(8.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(colors.muted_foreground)
-                                            .child(time),
+                                            .child(category.to_uppercase()),
                                     ),
                             )
                             .child(
                                 div()
-                                    .pt_1()
+                                    .pt(px(3.0))
                                     .w_full()
                                     .text_size(px(12.0))
-                                    .line_height(gpui::relative(1.2))
+                                    .line_height(gpui::relative(1.28))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(colors.foreground)
                                     .child(title),
@@ -606,10 +669,14 @@ impl Render for NewsfeedPanel {
                             .when(!summary.is_empty(), |element| {
                                 element.child(
                                     div()
-                                        .pt_1()
+                                        .pt(px(3.0))
                                         .text_size(px(10.5))
-                                        .line_height(gpui::relative(1.2))
+                                        .line_height(gpui::relative(1.3))
                                         .text_color(summary_color)
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .line_clamp(3)
                                         .child(summary),
                                 )
                             })
@@ -617,12 +684,12 @@ impl Render for NewsfeedPanel {
                         div()
                             .id(id)
                             .w_full()
-                            .px_3()
-                            .py_2()
+                            .px(px(10.0))
+                            .py(px(8.0))
                             .border_b_1()
-                            .border_color(colors.border.opacity(0.7))
+                            .border_color(colors.border.opacity(0.45))
                             .cursor_pointer()
-                            .hover(|s| s.bg(bg_hover.opacity(0.6)))
+                            .hover(|s| s.bg(bg_hover.opacity(0.45)))
                             .on_click(move |_, _, _| {
                                 let _ = webbrowser::open(&url);
                             })
@@ -631,74 +698,90 @@ impl Render for NewsfeedPanel {
                                     .w_full()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .justify_between()
+                                    .gap(px(8.0))
                                     .child(
                                         div()
-                                            .flex_shrink_0()
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(10.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(colors.foreground.opacity(0.7))
-                                            .child(time),
-                                    )
-                                    .child(
-                                        div()
-                                            .max_w(px(144.0))
-                                            .flex_shrink_0()
-                                            .overflow_hidden()
-                                            .text_size(px(10.0))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(colors.primary)
-                                            .child(source),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .rounded_sm()
-                                            .bg(colors.muted)
-                                            .px(px(4.0))
-                                            .py(px(2.0))
-                                            .text_size(px(9.0))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(colors.foreground.opacity(0.7))
-                                            .child(category.to_uppercase()),
-                                    )
-                                    .when(!top.is_empty(), |element| {
-                                        element.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(gpui::rgb(0xf59e0b)) // amber-500
-                                                .child(top),
-                                        )
-                                    })
-                                    .child(
-                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
                                             .min_w_0()
                                             .flex_1()
                                             .overflow_hidden()
-                                            .text_size(px(13.0))
-                                            .line_height(gpui::relative(1.2))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(colors.foreground)
-                                            .group_hover(format!("news_row_{local_state_id}"), |s| s.text_color(colors.primary))
-                                            .child(title),
+                                            .child(
+                                                div()
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(10.0))
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(colors.muted_foreground)
+                                                    .child(time),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(10.0))
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(colors.primary)
+                                                    .child(source_upper),
+                                            )
+                                            .when(is_top, |el| {
+                                                el.child(
+                                                    div()
+                                                        .px(px(3.5))
+                                                        .py(px(0.5))
+                                                        .bg(flash_bg)
+                                                        .border_1()
+                                                        .border_color(flash_border)
+                                                        .text_size(px(8.5))
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .text_color(gpui::rgb(0xf59e0b))
+                                                        .child("FLASH"),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .bg(colors.muted.opacity(0.35))
+                                            .border_1()
+                                            .border_color(colors.border.opacity(0.6))
+                                            .text_size(px(9.0))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(colors.muted_foreground)
+                                            .child(category.to_uppercase()),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .pt(px(4.0))
+                                    .w_full()
+                                    .text_size(px(13.0))
+                                    .line_height(gpui::relative(1.3))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(colors.foreground)
+                                    .group_hover(format!("news_row_{local_state_id}"), |s| s.text_color(colors.primary))
+                                    .child(title),
                             )
                             .when(!summary.is_empty(), |element| {
                                 element.child(
                                     div()
-                                        .pt_2()
-                                        .pl(px(52.0))
-                                        .text_xs()
-                                        .line_height(gpui::relative(1.25))
+                                        .pt(px(3.0))
+                                        .text_size(px(11.0))
+                                        .line_height(gpui::relative(1.32))
                                         .text_color(summary_color)
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .line_clamp(3)
                                         .child(summary),
                                 )
                             })
                             .group(format!("news_row_{local_state_id}"))
                     }
-                }))
+                        })),
+                )
                 .into_any_element()
         };
 
