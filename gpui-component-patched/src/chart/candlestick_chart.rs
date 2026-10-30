@@ -29,6 +29,7 @@ pub struct PositionOverlaySpec {
     pub leverage: u32,
     pub current_price: f64,
     pub liquidation_price: Option<f64>,
+    pub is_live: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +41,7 @@ pub struct OrderOverlaySpec {
     pub price: f64,
     pub quantity: f64,
     pub status: String,
+    pub is_live: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,6 +1292,12 @@ where
         // ------------------------------------------------------------------ //
         // 9. Last-price dashed line + Y-axis price label
         // ------------------------------------------------------------------ //
+        // The live price badge (and its countdown) is deferred until the very end
+        // of `paint` so it always sits above every other Y-axis tag.
+        let mut live_price_badges: Vec<(SharedString, Hsla, f32)> = Vec::new();
+        // The crosshair price badge is deferred even further so it beats the live
+        // price badge when the cursor hovers on the current price row.
+        let mut crosshair_price_badge: Option<(SharedString, Hsla, f32)> = None;
         let last_close_px_y = y_scale.scale(last_close_f);
         if self.show_candles && last_close_f > 0.0 {
             let lcp_abs_y = origin.y.as_f32() + last_close_px_y;
@@ -1321,31 +1329,9 @@ where
             // Countdown timer: time until next candle opens.
             let countdown_str = countdown_label_for_width.clone();
 
-            let badge_fg = gpui::white();
-            self.paint_price_pill_with_width(
-                label_txt,
-                label_color,
-                badge_fg,
-                origin.x.as_f32() + chart_w,
-                lcp_abs_y,
-                shared_live_badge_w,
-                y_axis_w,
-                window,
-                cx,
-            );
-
-            // Paint countdown pill stacked directly below the price pill (no gap).
-            self.paint_price_pill_with_width(
-                countdown_str,
-                label_color,
-                badge_fg,
-                origin.x.as_f32() + chart_w,
-                lcp_abs_y + 14.0, // 14px pill height, no gap
-                shared_live_badge_w,
-                y_axis_w,
-                window,
-                cx,
-            );
+            live_price_badges.push((label_txt, label_color, lcp_abs_y));
+            // Countdown pill stacked directly below the price pill (no gap).
+            live_price_badges.push((countdown_str, label_color, lcp_abs_y + 14.0));
         }
 
         // ------------------------------------------------------------------ //
@@ -1421,6 +1407,7 @@ where
                     }
 
                     // 2. Position HUD Badge
+                    let mode_tag = if pos.is_live { "LIVE" } else { "PAPER" };
                     let side_label = if pos.is_long { "LONG" } else { "SHORT" };
                     let qty_str = if pos.quantity >= 1.0 {
                         format!("{:.2}", pos.quantity)
@@ -1428,7 +1415,8 @@ where
                         format!("{:.4}", pos.quantity)
                     };
                     let badge_text = format!(
-                        "{} {}x {} @ {} | {}",
+                        "{} {} {}x {} @ {} | {}",
+                        mode_tag,
                         side_label,
                         pos.leverage,
                         qty_str,
@@ -1436,7 +1424,7 @@ where
                         pnl_str
                     );
 
-                    let badge_w = ((badge_text.len() as f32) * 6.5 + 40.0).clamp(160.0, 340.0);
+                    let badge_w = ((badge_text.len() as f32) * 6.5 + 40.0).clamp(180.0, 380.0);
                     let badge_h = 22.0_f32;
                     let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let badge_y = (entry_abs_y - badge_h / 2.0)
@@ -1525,19 +1513,21 @@ where
                     );
                 } else {
                     // Off-screen indicator
+                    let mode_tag = if pos.is_live { "LIVE" } else { "PAPER" };
                     let (off_y, arrow) = if entry_px_y < 0.0 {
                         (origin.y.as_f32() + 4.0, "▲")
                     } else {
                         (origin.y.as_f32() + candle_h - 20.0, "▼")
                     };
                     let off_text = format!(
-                        "{} {} @ {} ({})",
+                        "{} {} {} @ {} ({})",
                         arrow,
+                        mode_tag,
                         if pos.is_long { "LONG" } else { "SHORT" },
                         self.price_str(pos.entry_price),
                         pnl_str
                     );
-                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(120.0, 240.0);
+                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(140.0, 260.0);
                     let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let off_bounds = Bounds::from_corners(
                         gpui::point(px(off_x), px(off_y)),
@@ -1626,6 +1616,7 @@ where
                     }
 
                     // 2. Order HUD Badge
+                    let mode_tag = if ord.is_live { "LIVE" } else { "PAPER" };
                     let ord_side_str = if ord.is_long { "BUY" } else { "SELL" };
                     let qty_str = if ord.quantity >= 1.0 {
                         format!("{:.2}", ord.quantity)
@@ -1633,14 +1624,15 @@ where
                         format!("{:.4}", ord.quantity)
                     };
                     let badge_text = format!(
-                        "{} {} {} @ {}",
+                        "{} {} {} {} @ {}",
+                        mode_tag,
                         ord.order_type,
                         ord_side_str,
                         qty_str,
                         self.price_str(ord.price)
                     );
 
-                    let badge_w = ((badge_text.len() as f32) * 6.5 + 36.0).clamp(140.0, 300.0);
+                    let badge_w = ((badge_text.len() as f32) * 6.5 + 36.0).clamp(160.0, 340.0);
                     let badge_h = 20.0_f32;
                     let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let badge_y = (ord_abs_y - badge_h / 2.0)
@@ -1728,6 +1720,7 @@ where
                     );
                 } else {
                     // Off-screen indicator
+                    let mode_tag = if ord.is_live { "LIVE" } else { "PAPER" };
                     let (off_y, arrow) = if ord_px_y < 0.0 {
                         (origin.y.as_f32() + 4.0, "▲")
                     } else {
@@ -1735,13 +1728,14 @@ where
                     };
                     let ord_side_str = if ord.is_long { "BUY" } else { "SELL" };
                     let off_text = format!(
-                        "{} {} {} @ {}",
+                        "{} {} {} {} @ {}",
                         arrow,
+                        mode_tag,
                         ord.order_type,
                         ord_side_str,
                         self.price_str(ord.price)
                     );
-                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(110.0, 220.0);
+                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(130.0, 240.0);
                     let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let off_bounds = Bounds::from_corners(
                         gpui::point(px(off_x), px(off_y)),
@@ -1876,17 +1870,7 @@ where
                                 }
                                 
                                 if !pl_txt.is_empty() {
-                                    self.paint_price_pill_with_width(
-                                        pl_txt,
-                                        crosshair_bg,
-                                        gpui::white(),
-                                        origin.x.as_f32() + chart_w,
-                                        hy,
-                                        shared_live_badge_w,
-                                        y_axis_w,
-                                        window,
-                                        cx,
-                                    );
+                                    crosshair_price_badge = Some((pl_txt, crosshair_bg, hy));
                                 }
                             }
 
@@ -1929,6 +1913,44 @@ where
                     }
                 }
             }
+        }
+
+        // ------------------------------------------------------------------ //
+        // 13. Live price tag & countdown — painted LAST so they always sit on
+        //     top of every other Y-axis tag (positions, orders, liquidation,
+        //     crosshair, etc.).
+        // ------------------------------------------------------------------ //
+        for (text, bg, centre_y) in live_price_badges {
+            self.paint_price_pill_with_width(
+                text,
+                bg,
+                gpui::white(),
+                origin.x.as_f32() + chart_w,
+                centre_y,
+                shared_live_badge_w,
+                y_axis_w,
+                window,
+                cx,
+            );
+        }
+
+        // ------------------------------------------------------------------ //
+        // 14. Crosshair price tag — painted dead last so the active cursor
+        //     label wins over every other Y-axis tag, including the live
+        //     price badge when both land on the same row.
+        // ------------------------------------------------------------------ //
+        if let Some((text, bg, centre_y)) = crosshair_price_badge {
+            self.paint_price_pill_with_width(
+                text,
+                bg,
+                gpui::white(),
+                origin.x.as_f32() + chart_w,
+                centre_y,
+                shared_live_badge_w,
+                y_axis_w,
+                window,
+                cx,
+            );
         }
     }
 }

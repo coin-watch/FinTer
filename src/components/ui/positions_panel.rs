@@ -17,7 +17,9 @@ use gpui_component::theme::ActiveTheme;
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
 
 use crate::data::feed::TickFeed;
-use crate::data::trade_store::{DeskPosition, TradeOrder, TradeOrderType, TradeSide, TradeStore};
+use crate::data::trade_store::{
+    DeskPosition, TradeOrder, TradeOrderType, TradeSide, TradeStore, TradingMode,
+};
 
 // ---------------------------------------------------------------------------
 // Position — a single legacy/custom trading position
@@ -388,7 +390,7 @@ impl PositionsPanel {
             .items_center()
             .child(
                 div()
-                    .w(px(110.0))
+                    .w(px(145.0))
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.muted_foreground)
@@ -495,12 +497,31 @@ impl PositionsPanel {
             .gap_2()
             .items_center()
             .hover(|style| style.bg(colors.table_hover))
-            // Symbol & Leverage
+            // Symbol, Mode & Leverage
             .child(
                 h_flex()
-                    .w(px(110.0))
+                    .w(px(145.0))
                     .gap_1p5()
                     .items_center()
+                    .child(
+                        div()
+                            .px_1()
+                            .py(px(0.5))
+                            .rounded(px(2.0))
+                            .bg(if pos.mode == TradingMode::Live {
+                                colors.danger.opacity(0.18)
+                            } else {
+                                colors.primary.opacity(0.15)
+                            })
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if pos.mode == TradingMode::Live {
+                                colors.danger
+                            } else {
+                                colors.primary
+                            })
+                            .child(if pos.mode == TradingMode::Live { "LIVE" } else { "PAPER" }),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -663,6 +684,25 @@ impl PositionsPanel {
                         h_flex()
                             .gap_1p5()
                             .items_center()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .bg(if pos.mode == TradingMode::Live {
+                                        colors.danger.opacity(0.18)
+                                    } else {
+                                        colors.primary.opacity(0.15)
+                                    })
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if pos.mode == TradingMode::Live {
+                                        colors.danger
+                                    } else {
+                                        colors.primary
+                                    })
+                                    .child(if pos.mode == TradingMode::Live { "LIVE" } else { "PAPER" }),
+                            )
                             .child(
                                 div()
                                     .px_1p5()
@@ -833,7 +873,7 @@ impl PositionsPanel {
             .hover(|style| style.bg(colors.table_hover))
             .child(
                 div()
-                    .w(px(110.0))
+                    .w(px(145.0))
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.foreground)
@@ -938,7 +978,7 @@ impl PositionsPanel {
             )
             .child(
                 div()
-                    .w(px(100.0))
+                    .w(px(145.0))
                     .text_xs()
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.muted_foreground)
@@ -1048,14 +1088,38 @@ impl PositionsPanel {
                     .text_color(side_color)
                     .child(side_str),
             )
-            // Symbol
+            // Symbol & Mode
             .child(
-                div()
-                    .w(px(100.0))
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(colors.foreground)
-                    .child(ord.symbol.clone()),
+                h_flex()
+                    .w(px(145.0))
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        div()
+                            .px_1()
+                            .py(px(0.5))
+                            .rounded(px(2.0))
+                            .bg(if ord.mode == TradingMode::Live {
+                                colors.danger.opacity(0.18)
+                            } else {
+                                colors.primary.opacity(0.15)
+                            })
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(if ord.mode == TradingMode::Live {
+                                colors.danger
+                            } else {
+                                colors.primary
+                            })
+                            .child(if ord.mode == TradingMode::Live { "LIVE" } else { "PAPER" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(colors.foreground)
+                            .child(ord.symbol.clone()),
+                    ),
             )
             // Type
             .child(
@@ -1092,31 +1156,46 @@ impl PositionsPanel {
                     .text_color(colors.foreground)
                     .child(format!("${:.2}", ord.notional)),
             )
-            // Status
+            // Status / Action
             .child(
                 div()
                     .w(px(75.0))
                     .flex()
                     .justify_end()
-                    .child(
-                        div()
-                            .px_1p5()
-                            .py(px(0.5))
-                            .rounded(px(2.0))
-                            .bg(if is_filled {
-                                colors.accent.opacity(0.2)
-                            } else {
-                                colors.muted.opacity(0.3)
-                            })
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if is_filled {
-                                colors.primary
-                            } else {
-                                colors.muted_foreground
-                            })
-                            .child(ord.status),
-                    ),
+                    .when(ord.status == "OPEN", |s| {
+                        let ord_id = ord.id.clone();
+                        s.child(
+                            Button::new(ElementId::Name(format!("btn-cancel-ord-{}", ord.id).into()))
+                                .xsmall()
+                                .outline()
+                                .label("Cancel")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let _ = TradeStore::global().lock().unwrap().cancel_order(&ord_id);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(ord.status != "OPEN", |s| {
+                        s.child(
+                            div()
+                                .px_1p5()
+                                .py(px(0.5))
+                                .rounded(px(2.0))
+                                .bg(if is_filled {
+                                    colors.accent.opacity(0.2)
+                                } else {
+                                    colors.muted.opacity(0.3)
+                                })
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_filled {
+                                    colors.primary
+                                } else {
+                                    colors.muted_foreground
+                                })
+                                .child(ord.status),
+                        )
+                    }),
             )
     }
 
@@ -1146,6 +1225,25 @@ impl PositionsPanel {
                         h_flex()
                             .gap_1p5()
                             .items_center()
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(0.5))
+                                    .rounded(px(2.0))
+                                    .bg(if ord.mode == TradingMode::Live {
+                                        colors.danger.opacity(0.18)
+                                    } else {
+                                        colors.primary.opacity(0.15)
+                                    })
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(if ord.mode == TradingMode::Live {
+                                        colors.danger
+                                    } else {
+                                        colors.primary
+                                    })
+                                    .child(if ord.mode == TradingMode::Live { "LIVE" } else { "PAPER" }),
+                            )
                             .child(
                                 div()
                                     .px_1p5()
@@ -1182,25 +1280,40 @@ impl PositionsPanel {
                                     }),
                             ),
                     )
-                    .child(
-                        div()
-                            .px_1p5()
-                            .py(px(0.5))
-                            .rounded(px(2.0))
-                            .bg(if is_filled {
-                                colors.accent.opacity(0.2)
-                            } else {
-                                colors.muted.opacity(0.3)
-                            })
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(if is_filled {
-                                colors.primary
-                            } else {
-                                colors.muted_foreground
-                            })
-                            .child(ord.status),
-                    ),
+                    .when(ord.status == "OPEN", |s| {
+                        let ord_id = ord.id.clone();
+                        s.child(
+                            Button::new(ElementId::Name(format!("btn-card-cancel-ord-{}", ord.id).into()))
+                                .xsmall()
+                                .outline()
+                                .label("Cancel")
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let _ = TradeStore::global().lock().unwrap().cancel_order(&ord_id);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(ord.status != "OPEN", |s| {
+                        s.child(
+                            div()
+                                .px_1p5()
+                                .py(px(0.5))
+                                .rounded(px(2.0))
+                                .bg(if is_filled {
+                                    colors.accent.opacity(0.2)
+                                } else {
+                                    colors.muted.opacity(0.3)
+                                })
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_filled {
+                                    colors.primary
+                                } else {
+                                    colors.muted_foreground
+                                })
+                                .child(ord.status),
+                        )
+                    }),
             )
             // Bottom Row: Price, Qty, Notional, Time
             .child(
@@ -1359,14 +1472,22 @@ impl Render for PositionsPanel {
         let is_narrow = self.width > 0.0 && self.width < 500.0;
         let is_very_narrow = self.width > 0.0 && self.width < 340.0;
 
-        let (store_positions, store_orders, total_pnl, deployed_margin, mark_prices) = {
+        let (store_positions, store_orders, total_pnl, deployed_margin) = {
             let store = TradeStore::global().lock().unwrap();
-            let pos = store.positions.clone();
+            // Pair each position with the exact mark price used for its PnL so the
+            // rows and the header aggregates can never disagree.
+            let pos: Vec<(DeskPosition, f64)> = store
+                .positions
+                .iter()
+                .map(|p| (p.clone(), store.position_mark_price(p)))
+                .collect();
             let ord = store.orders.clone();
-            let upnl = store.total_unrealized_pnl();
-            let dep = store.deployed_margin();
-            let marks = store.mark_prices.clone();
-            (pos, ord, upnl, dep, marks)
+            let upnl: f64 = pos
+                .iter()
+                .map(|(p, _)| store.position_unrealized_pnl(p))
+                .sum();
+            let dep = store.deployed_margin_all();
+            (pos, ord, upnl, dep)
         };
 
         let total_positions_count = store_positions.len() + self.positions.len();
@@ -1394,9 +1515,8 @@ impl Render for PositionsPanel {
                         // Narrow Card List
                         let pos_elements: Vec<_> = store_positions
                             .iter()
-                            .map(|pos| {
-                                let mark = mark_prices.get(&pos.symbol).copied().unwrap_or(pos.entry_price);
-                                self.render_desk_position_card(pos, mark, cx).into_any_element()
+                            .map(|(pos, mark)| {
+                                self.render_desk_position_card(pos, *mark, cx).into_any_element()
                             })
                             .collect();
 
@@ -1414,9 +1534,8 @@ impl Render for PositionsPanel {
                         let desk_rows: Vec<_> = store_positions
                             .iter()
                             .enumerate()
-                            .map(|(i, pos)| {
-                                let mark = mark_prices.get(&pos.symbol).copied().unwrap_or(pos.entry_price);
-                                self.render_desk_position_row(pos, mark, i, cx).into_any_element()
+                            .map(|(i, (pos, mark))| {
+                                self.render_desk_position_row(pos, *mark, i, cx).into_any_element()
                             })
                             .collect();
 

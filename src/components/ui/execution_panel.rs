@@ -15,7 +15,7 @@ use crate::data::feed::TickFeed;
 use crate::data::gateway_registry::GatewayRegistry;
 pub use crate::data::trade_store::{
     DeskPosition, TradeOrder as PaperOrder, TradeOrderType as OrderType, TradeSide as Side,
-    TradeStore,
+    TradeStore, TradingMode,
 };
 
 pub struct ExecutionPanel {
@@ -76,17 +76,29 @@ impl ExecutionPanel {
                 if this
                     .update(cx, |this, cx| {
                         if changed {
-                            if let Some(p) = this.price() {
-                                if let Some(prev) = this.last_price {
+                            if let Some(prev) = this.last_price {
+                                if let Some(p) = this.price() {
                                     if p > prev {
                                         this.price_direction = 1;
                                     } else if p < prev {
                                         this.price_direction = -1;
                                     }
                                 }
-                                this.last_price = Some(p);
-                                TradeStore::global().lock().unwrap().set_mark_price(&this.symbol, p);
                             }
+                            if let Some(p) = this.price() {
+                                this.last_price = Some(p);
+                            }
+                        }
+                        // Publish the mark price every tick (not only when the UI
+                        // notices a change) so it is always the freshest feed value
+                        // that the trade desk, positions panel and chart read.
+                        if let Some(p) = this.price() {
+                            TradeStore::global()
+                                .lock()
+                                .unwrap()
+                                .set_mark_price(&this.symbol, p);
+                        }
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -211,8 +223,17 @@ impl ExecutionPanel {
         }
     }
 
+    pub fn active_mode(&self) -> TradingMode {
+        if self.is_live_mode {
+            TradingMode::Live
+        } else {
+            TradingMode::Paper
+        }
+    }
+
     pub fn adjust_margin(&mut self, delta: f64, cx: &mut Context<Self>) {
-        let balance = TradeStore::global().lock().unwrap().paper_balance;
+        let mode = self.active_mode();
+        let balance = TradeStore::global().lock().unwrap().balance(mode);
         let new_margin = (self.margin + delta).max(10.0).min(balance.max(10.0));
         self.margin = (new_margin * 100.0).round() / 100.0;
         self.margin_focused = false;
@@ -221,7 +242,8 @@ impl ExecutionPanel {
     }
 
     pub fn set_margin_percent(&mut self, pct: f64, cx: &mut Context<Self>) {
-        let balance = TradeStore::global().lock().unwrap().paper_balance;
+        let mode = self.active_mode();
+        let balance = TradeStore::global().lock().unwrap().balance(mode);
         let raw = balance * pct;
         let rounded = if raw >= 100.0 {
             (raw / 25.0).round() * 25.0
@@ -329,20 +351,32 @@ impl ExecutionPanel {
                 }
                 InputEvent::Blur => {
                     this.price_focused = false;
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val > 0.0 && val.is_finite() {
+                            this.limit_price = Some(val);
+                        }
+                    }
                     cx.notify();
                 }
                 InputEvent::Change => {
-                    if this.price_focused {
-                        let text = input.read(cx).value().to_string();
-                        if let Ok(val) = text.trim().replace(',', "").parse::<f64>() {
-                            if val > 0.0 && val.is_finite() {
-                                this.limit_price = Some(val);
-                                cx.notify();
-                            }
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val > 0.0 && val.is_finite() {
+                            this.limit_price = Some(val);
+                            cx.notify();
                         }
                     }
                 }
-                _ => {}
+                InputEvent::PressEnter { .. } => {
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val > 0.0 && val.is_finite() {
+                            this.limit_price = Some(val);
+                            cx.notify();
+                        }
+                    }
+                }
             })
             .detach();
             self.price_input = Some(input);
@@ -361,21 +395,38 @@ impl ExecutionPanel {
                 }
                 InputEvent::Blur => {
                     this.margin_focused = false;
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val >= 0.0 && val.is_finite() {
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            this.margin = val.min(balance.max(10.0));
+                        }
+                    }
                     cx.notify();
                 }
                 InputEvent::Change => {
-                    if this.margin_focused {
-                        let text = input.read(cx).value().to_string();
-                        if let Ok(val) = text.trim().replace(',', "").parse::<f64>() {
-                            if val >= 0.0 && val.is_finite() {
-                                let balance = TradeStore::global().lock().unwrap().paper_balance;
-                                this.margin = val.min(balance.max(10.0));
-                                cx.notify();
-                            }
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val >= 0.0 && val.is_finite() {
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            this.margin = val.min(balance.max(10.0));
+                            cx.notify();
                         }
                     }
                 }
-                _ => {}
+                InputEvent::PressEnter { .. } => {
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val >= 0.0 && val.is_finite() {
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            this.margin = val.min(balance.max(10.0));
+                            cx.notify();
+                        }
+                    }
+                }
             })
             .detach();
             self.margin_input = Some(input);
@@ -405,29 +456,62 @@ impl ExecutionPanel {
                 }
                 InputEvent::Blur => {
                     this.size_focused = false;
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(qty) = text.trim().replace(',', "").parse::<f64>() {
+                        if qty >= 0.0 && qty.is_finite() {
+                            let exec_price = match this.order_type {
+                                OrderType::Limit => {
+                                    this.limit_price.or_else(|| this.price()).unwrap_or(1.0)
+                                }
+                                OrderType::Market => this.price().unwrap_or(1.0),
+                            };
+                            let lev = this.leverage.max(1) as f64;
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let computed_margin = (qty * exec_price) / lev;
+                            this.margin = computed_margin.min(balance.max(10.0));
+                        }
+                    }
                     cx.notify();
                 }
                 InputEvent::Change => {
-                    if this.size_focused {
-                        let text = input.read(cx).value().to_string();
-                        if let Ok(qty) = text.trim().replace(',', "").parse::<f64>() {
-                            if qty >= 0.0 && qty.is_finite() {
-                                let exec_price = match this.order_type {
-                                    OrderType::Limit => {
-                                        this.limit_price.or_else(|| this.price()).unwrap_or(1.0)
-                                    }
-                                    OrderType::Market => this.price().unwrap_or(1.0),
-                                };
-                                let lev = this.leverage.max(1) as f64;
-                                let balance = TradeStore::global().lock().unwrap().paper_balance;
-                                let computed_margin = (qty * exec_price) / lev;
-                                this.margin = computed_margin.min(balance.max(10.0));
-                                cx.notify();
-                            }
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(qty) = text.trim().replace(',', "").parse::<f64>() {
+                        if qty >= 0.0 && qty.is_finite() {
+                            let exec_price = match this.order_type {
+                                OrderType::Limit => {
+                                    this.limit_price.or_else(|| this.price()).unwrap_or(1.0)
+                                }
+                                OrderType::Market => this.price().unwrap_or(1.0),
+                            };
+                            let lev = this.leverage.max(1) as f64;
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let computed_margin = (qty * exec_price) / lev;
+                            this.margin = computed_margin.min(balance.max(10.0));
+                            cx.notify();
                         }
                     }
                 }
-                _ => {}
+                InputEvent::PressEnter { .. } => {
+                    let text = input.read(cx).value().to_string();
+                    if let Ok(qty) = text.trim().replace(',', "").parse::<f64>() {
+                        if qty >= 0.0 && qty.is_finite() {
+                            let exec_price = match this.order_type {
+                                OrderType::Limit => {
+                                    this.limit_price.or_else(|| this.price()).unwrap_or(1.0)
+                                }
+                                OrderType::Market => this.price().unwrap_or(1.0),
+                            };
+                            let lev = this.leverage.max(1) as f64;
+                            let mode = this.active_mode();
+                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let computed_margin = (qty * exec_price) / lev;
+                            this.margin = computed_margin.min(balance.max(10.0));
+                        }
+                    }
+                    cx.notify();
+                }
             })
             .detach();
             self.size_input = Some(input);
@@ -435,14 +519,59 @@ impl ExecutionPanel {
     }
 
     pub fn execute_order(&mut self, cx: &mut Context<Self>) {
+        let mode = self.active_mode();
+
+        // Enforce live trading prerequisites: configured API key
+        if mode == TradingMode::Live && !api_management::has_credential(&self.exchange) {
+            self.notification = Some((
+                true,
+                format!(
+                    "LIVE ORDER BLOCKED: No API key for exchange '{}'. Add API credentials in Settings -> API Keys to enable live execution.",
+                    self.exchange.to_uppercase()
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+
         let Some(mark) = self.price() else {
             self.notification = Some((true, "Awaiting live market price feed...".to_string()));
             cx.notify();
             return;
         };
 
+        // For limit orders: first read and sync latest value directly from price_input
+        if self.order_type == OrderType::Limit {
+            if let Some(ref price_inp) = self.price_input {
+                let text = price_inp.read(cx).value().to_string();
+                if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                    if val > 0.0 && val.is_finite() {
+                        self.limit_price = Some(val);
+                    }
+                }
+            }
+        }
+
         let exec_price = match self.order_type {
-            OrderType::Limit => self.limit_price.unwrap_or(mark),
+            OrderType::Limit => {
+                let Some(lp) = self.limit_price else {
+                    self.notification = Some((
+                        true,
+                        "Please specify a valid limit price for the limit order.".to_string(),
+                    ));
+                    cx.notify();
+                    return;
+                };
+                if lp <= 0.0 || !lp.is_finite() {
+                    self.notification = Some((
+                        true,
+                        "Limit price must be greater than 0.".to_string(),
+                    ));
+                    cx.notify();
+                    return;
+                }
+                lp
+            }
             OrderType::Market => mark,
         };
 
@@ -453,6 +582,7 @@ impl ExecutionPanel {
         }
 
         let result = TradeStore::global().lock().unwrap().execute_order(
+            mode,
             self.symbol.clone(),
             self.side,
             self.order_type,
@@ -472,10 +602,22 @@ impl ExecutionPanel {
                     OrderType::Market => "MARKET",
                 };
                 let base = self.base_asset().to_string();
+                let mode_prefix = if mode == TradingMode::Live {
+                    let creds = api_management::get_credentials_for_exchange(&self.exchange);
+                    let label = creds.first().map(|c| c.label.as_str()).unwrap_or("API Key");
+                    let testnet_tag = if creds.first().map(|c| c.is_testnet).unwrap_or(false) {
+                        " [TESTNET]"
+                    } else {
+                        ""
+                    };
+                    format!("⚡ LIVE{testnet_tag} ({label})")
+                } else {
+                    "🛡 PAPER".to_string()
+                };
                 self.notification = Some((
                     false,
                     format!(
-                        "{}: {type_str} {side_str} {} {base} @ ${} (Notional: ${:.2})",
+                        "{mode_prefix} {}: {type_str} {side_str} {} {base} @ ${} (Notional: ${:.2})",
                         order.status,
                         Self::fmt_size(order.quantity),
                         Self::fmt_price(exec_price),
@@ -484,18 +626,27 @@ impl ExecutionPanel {
                 ));
             }
             Err(err) => {
-                self.notification = Some((true, err));
+                let mode_str = if mode == TradingMode::Live { "LIVE" } else { "PAPER" };
+                self.notification = Some((true, format!("[{mode_str}] {err}")));
             }
         }
         cx.notify();
     }
 
     pub fn reset_balance(&mut self, cx: &mut Context<Self>) {
-        TradeStore::global().lock().unwrap().reset();
-        self.notification = Some((
-            false,
-            "Virtual paper balance reset to $100,000.00 USDT.".to_string(),
-        ));
+        if self.is_live_mode {
+            TradeStore::global().lock().unwrap().reset_live();
+            self.notification = Some((
+                false,
+                "Live trading desk reset: live simulated balance reset to $10,000.00 USDT.".to_string(),
+            ));
+        } else {
+            TradeStore::global().lock().unwrap().reset_paper();
+            self.notification = Some((
+                false,
+                "Virtual paper balance reset to $100,000.00 USDT.".to_string(),
+            ));
+        }
         cx.notify();
     }
 }
@@ -505,7 +656,17 @@ impl Render for ExecutionPanel {
         let mark = self.price();
 
         if self.order_type == OrderType::Limit && self.limit_price.is_none() {
-            self.limit_price = mark;
+            if let Some(ref price_inp) = self.price_input {
+                let text = price_inp.read(cx).value().to_string();
+                if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                    if val > 0.0 && val.is_finite() {
+                        self.limit_price = Some(val);
+                    }
+                }
+            }
+            if self.limit_price.is_none() {
+                self.limit_price = mark;
+            }
         }
 
         let exec_price = match self.order_type {
@@ -521,14 +682,23 @@ impl Render for ExecutionPanel {
         // Keep inputs in sync with model state when not actively focused
         if let Some(ref price_inp) = self.price_input {
             if !self.price_focused {
+                if self.order_type == OrderType::Limit {
+                    let cur = price_inp.read(cx).value().to_string();
+                    if let Ok(val) = cur.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                        if val > 0.0 && val.is_finite() {
+                            self.limit_price = Some(val);
+                        }
+                    }
+                }
                 let target_price = match self.order_type {
-                    OrderType::Limit => self.limit_price.or(mark),
+                    OrderType::Limit => self.limit_price,
                     OrderType::Market => mark,
                 };
                 if let Some(p) = target_price {
                     let cur = price_inp.read(cx).value().to_string();
                     let diff = cur
                         .trim()
+                        .replace('$', "")
                         .replace(',', "")
                         .parse::<f64>()
                         .map(|v| (v - p).abs() > 0.0001)
@@ -588,12 +758,13 @@ impl Render for ExecutionPanel {
             .map(|c| c.label.clone())
             .unwrap_or_else(|| "Direct API".to_string());
 
-        let (paper_balance, deployed_margin, total_unrealized_pnl, total_equity) = {
+        let mode = self.active_mode();
+        let (avail_balance, deployed_margin, total_unrealized_pnl, total_equity) = {
             let store = TradeStore::global().lock().unwrap();
-            let bal = store.paper_balance;
-            let dep = store.deployed_margin();
-            let upnl = store.total_unrealized_pnl();
-            let eq = store.total_equity();
+            let bal = store.balance(mode);
+            let dep = store.deployed_margin(mode);
+            let upnl = store.total_unrealized_pnl(mode);
+            let eq = store.total_equity(mode);
             (bal, dep, upnl, eq)
         };
 
@@ -727,14 +898,31 @@ impl Render for ExecutionPanel {
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             this.is_live_mode = !this.is_live_mode;
-                                            this.notification = Some((
-                                                false,
-                                                if this.is_live_mode {
-                                                    "Switched to LIVE API Execution Mode".to_string()
+                                            let mode = this.active_mode();
+                                            TradeStore::global().lock().unwrap().active_mode = mode;
+                                            if this.is_live_mode {
+                                                let has_api = api_management::has_credential(&this.exchange);
+                                                if has_api {
+                                                    let creds = api_management::get_credentials_for_exchange(&this.exchange);
+                                                    let label = creds.first().map(|c| c.label.as_str()).unwrap_or("API Key");
+                                                    let testnet = creds.first().map(|c| c.is_testnet).unwrap_or(false);
+                                                    let env = if testnet { " [TESTNET]" } else { "" };
+                                                    this.notification = Some((
+                                                        false,
+                                                        format!("Switched to LIVE API Execution Mode{env} (Account: {label})"),
+                                                    ));
                                                 } else {
-                                                    "Switched to VIRTUAL PAPER Simulation Mode".to_string()
-                                                },
-                                            ));
+                                                    this.notification = Some((
+                                                        true,
+                                                        format!("Switched to LIVE Mode (WARNING: No API key for {}. Go to Settings -> API Keys)", this.exchange.to_uppercase()),
+                                                    ));
+                                                }
+                                            } else {
+                                                this.notification = Some((
+                                                    false,
+                                                    "Switched to VIRTUAL PAPER Simulation Mode (Risk-Free)".to_string(),
+                                                ));
+                                            }
                                             cx.notify();
                                         }),
                                     )
@@ -1048,6 +1236,14 @@ impl Render for ExecutionPanel {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     this.order_type = OrderType::Limit;
+                                    if let Some(ref price_inp) = this.price_input {
+                                        let text = price_inp.read(cx).value().to_string();
+                                        if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
+                                            if val > 0.0 && val.is_finite() {
+                                                this.limit_price = Some(val);
+                                            }
+                                        }
+                                    }
                                     if this.limit_price.is_none() {
                                         this.limit_price = this.price();
                                     }
@@ -1346,8 +1542,13 @@ impl Render for ExecutionPanel {
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(c.muted_foreground)
-                                    .child(format!("Avail: ${:.2} {quote}", paper_balance)),
+                                    .text_color(if self.is_live_mode { c.danger } else { c.muted_foreground })
+                                    .font_weight(if self.is_live_mode { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                    .child(format!(
+                                        "Avail: ${:.2} {quote} [{}]",
+                                        avail_balance,
+                                        if self.is_live_mode { "LIVE" } else { "PAPER" }
+                                    )),
                             ),
                     )
                     .child(price_input_el)
@@ -1591,6 +1792,7 @@ impl Render for ExecutionPanel {
                     );
 
                 // 6. Tactical Execution Action Bar (Short & Compact)
+                let mode_action_tag = if self.is_live_mode { "⚡ LIVE" } else { "🛡 PAPER" };
                 let execute_btn_el = div()
                     .id("submit-order-btn")
                     .w_full()
@@ -1626,10 +1828,11 @@ impl Render for ExecutionPanel {
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .child(if is_very_narrow {
-                                format!("{} {}", if is_long { "BUY" } else { "SELL" }, Self::fmt_size(qty))
+                                format!("{} {} {}", mode_action_tag, if is_long { "BUY" } else { "SELL" }, Self::fmt_size(qty))
                             } else {
                                 format!(
-                                    "EXECUTE {} {} {base}",
+                                    "EXECUTE {} {} {} {base}",
+                                    mode_action_tag,
                                     if is_long { "BUY" } else { "SELL" },
                                     Self::fmt_size(qty)
                                 )
@@ -1744,11 +1947,11 @@ impl Render for ExecutionPanel {
                                     .font_family(mono_font.clone())
                                     .text_color(c.muted_foreground)
                                     .child(if is_very_narrow {
-                                        format!("${:.0}", paper_balance)
+                                        format!("${:.0}", avail_balance)
                                     } else if is_narrow {
-                                        format!("CASH ${:.0}", paper_balance)
+                                        format!("{} ${:.0}", if self.is_live_mode { "LIVE" } else { "CASH" }, avail_balance)
                                     } else {
-                                        format!("CASH: ${:.1}", paper_balance)
+                                        format!("{}: ${:.1}", if self.is_live_mode { "LIVE CASH" } else { "PAPER CASH" }, avail_balance)
                                     }),
                             )
                             .when(!is_narrow, |this| {
@@ -1796,7 +1999,13 @@ impl Render for ExecutionPanel {
                         Button::new("reset-desk-btn")
                             .xsmall()
                             .ghost()
-                            .label(if is_narrow { "Reset" } else { "Reset Desk" })
+                            .label(if is_narrow {
+                                "Reset"
+                            } else if self.is_live_mode {
+                                "Reset Live"
+                            } else {
+                                "Reset Paper"
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.reset_balance(cx);
                             })),

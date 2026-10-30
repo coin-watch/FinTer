@@ -1600,14 +1600,17 @@ impl Render for ChartPanel {
         }
 
         // Active positions and open orders overlays
+        // NOTE: the chart only publishes a fallback mark price for symbols without
+        // a live feed. Overwriting here would fight the tick-feed writer and make
+        // PnL flicker between the candle close and the live traded price.
         if current_mark > 0.0 {
             let mut store = crate::data::trade_store::TradeStore::global().lock().unwrap();
-            store.set_mark_price(&self.symbol, current_mark);
+            store.sync_chart_mark_price(&self.symbol, current_mark);
         }
 
         let (pos_overlays, ord_overlays) = {
             let store = crate::data::trade_store::TradeStore::global().lock().unwrap();
-            let mark = if current_mark > 0.0 {
+            let chart_mark = if current_mark > 0.0 {
                 current_mark
             } else {
                 store.get_mark_price(&self.symbol).unwrap_or(0.0)
@@ -1631,6 +1634,12 @@ impl Render for ChartPanel {
                     } else {
                         None
                     };
+                    // Use the position's own mark price so the chart badge matches
+                    // the trade desk / positions panel exactly.
+                    let pos_mark = store
+                        .get_mark_price(&p.symbol)
+                        .filter(|m| m.is_finite() && *m > 0.0)
+                        .unwrap_or(chart_mark);
                     PositionOverlaySpec {
                         id: p.id.clone(),
                         symbol: p.symbol.clone(),
@@ -1639,8 +1648,9 @@ impl Render for ChartPanel {
                         quantity: p.quantity,
                         margin: p.margin,
                         leverage: p.leverage,
-                        current_price: mark,
+                        current_price: pos_mark,
                         liquidation_price: liq,
+                        is_live: p.mode == crate::data::trade_store::TradingMode::Live,
                     }
                 })
                 .collect();
@@ -1660,6 +1670,7 @@ impl Render for ChartPanel {
                     price: o.price,
                     quantity: o.quantity,
                     status: o.status.to_string(),
+                    is_live: o.mode == crate::data::trade_store::TradingMode::Live,
                 })
                 .collect();
 
