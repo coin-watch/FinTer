@@ -62,6 +62,22 @@ pub struct ChartState {
     pub candle_ts_range: std::rc::Rc<std::cell::Cell<Option<(f64, f64)>>>,
     /// Saved during paint: (y_min_padded, y_max_padded)
     pub candle_price_range: std::rc::Rc<std::cell::Cell<Option<(f64, f64)>>>,
+    /// Hitboxes registered during paint for interactive overlay buttons (e.g. close position, cancel order)
+    pub overlay_hitboxes: std::rc::Rc<std::cell::RefCell<Vec<ChartOverlayHitbox>>>,
+}
+
+/// Clickable action for an overlay on the chart (position close or order cancel).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChartOverlayAction {
+    ClosePosition { position_id: String },
+    CancelOrder { order_id: String },
+}
+
+/// Hitbox for an overlay button (e.g. close position 'X' or cancel order 'X').
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartOverlayHitbox {
+    pub bounds: gpui::Bounds<gpui::Pixels>,
+    pub action: ChartOverlayAction,
 }
 
 /// Fewest candles that can be shown at maximum zoom-in.
@@ -97,6 +113,7 @@ impl ChartState {
             candle_plot_size: std::rc::Rc::new(std::cell::Cell::new(None)),
             candle_ts_range: std::rc::Rc::new(std::cell::Cell::new(None)),
             candle_price_range: std::rc::Rc::new(std::cell::Cell::new(None)),
+            overlay_hitboxes: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         }
     }
 

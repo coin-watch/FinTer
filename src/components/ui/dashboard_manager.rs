@@ -574,12 +574,39 @@ impl Render for DashboardManager {
                             div()
                                 .m(px(10.0))
                                 .p(px(8.0))
+                                .min_w_0()
+                                .rounded(px(4.0))
                                 .bg(colors.danger.opacity(0.1))
                                 .border_1()
                                 .border_color(colors.danger.opacity(0.3))
-                                .text_xs()
-                                .text_color(colors.danger)
-                                .child(error),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_color(colors.danger)
+                                        .child(error),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(colors.danger.opacity(0.8))
+                                        .hover(|s| s.text_color(colors.danger))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.api_error = None;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child("✕"),
+                                ),
                         )
                     }),
             )

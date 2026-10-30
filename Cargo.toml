@@ -1,6 +1,6 @@
 [package]
 name = "finter"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -35,6 +35,9 @@ urlencoding = "2.1"
 sha2 = "0.10"
 uuid = { version = "1.26.1", features = ["v4"] }
 rodio = { version = "0.19", default-features = false, features = ["wav"] }
+# Disable ccxt's default `all` feature: compiling every exchange exhausts memory.
+# Enable only exchange features needed by the application (for example, `binance`).
+ccxt = { version = "4.5.90", default-features = false }
 
 [patch.crates-io]
 gpui = { path = "gpui-patched" }
@@ -42,4 +45,3 @@ gpui-component = { path = "gpui-component-patched" }
 
 [build-dependencies]
 winres = "0.1.12"
-

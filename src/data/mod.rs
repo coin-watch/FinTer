@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod api_management;
 pub mod auth;
 pub mod bridge;
 pub mod candle_feed;
@@ -23,6 +24,7 @@ pub mod subscription;
 pub mod terminal_audio;
 pub mod theme;
 pub mod tick;
+pub mod trade_store;
 pub mod update_checker;
 pub mod update_downloader;
 pub mod update_manager;

@@ -37,7 +37,10 @@ use gpui_component::PixelsExt;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::Selectable;
-use gpui_component::chart::{CandleType, CandlestickChart, ChartState, IndicatorStyle, PaneTarget};
+use gpui_component::chart::{
+    CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle, OrderOverlaySpec,
+    PaneTarget, PositionOverlaySpec,
+};
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement;
@@ -212,6 +215,7 @@ impl ChartPanel {
         cx.spawn(async move |this, cx| {
             let mut last_ms = 0;
             let mut last_countdown_second = u64::MAX;
+            let mut last_trade_ver = u64::MAX;
             loop {
                 let ms = f.last_update_ms();
                 // Use the absolute Unix second as the invalidation key. The
@@ -221,12 +225,18 @@ impl ChartPanel {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|duration| duration.as_secs())
                     .unwrap_or(0);
+                let trade_ver = crate::data::trade_store::TradeStore::global()
+                    .lock()
+                    .map(|s| s.version)
+                    .unwrap_or(0);
                 let feed_changed = ms != last_ms;
                 let countdown_changed = countdown_second != last_countdown_second;
+                let trade_changed = trade_ver != last_trade_ver;
 
-                if feed_changed || countdown_changed {
+                if feed_changed || countdown_changed || trade_changed {
                     last_ms = ms;
                     last_countdown_second = countdown_second;
+                    last_trade_ver = trade_ver;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -1534,6 +1544,7 @@ impl Render for ChartPanel {
         };
 
         // Candlestick chart construction
+        let current_mark = candles.last().map(|c| c.close).unwrap_or(0.0);
         let mut chart = CandlestickChart::new(candles)
             .show_candles(self.show_main_series)
             .subpane_count(subpane_count)
@@ -1587,6 +1598,75 @@ impl Render for ChartPanel {
         for line in &indicator_lines {
             chart = chart.indicator_line(line.series.clone(), line.color, line.style, line.pane);
         }
+
+        // Active positions and open orders overlays
+        if current_mark > 0.0 {
+            let mut store = crate::data::trade_store::TradeStore::global().lock().unwrap();
+            store.set_mark_price(&self.symbol, current_mark);
+        }
+
+        let (pos_overlays, ord_overlays) = {
+            let store = crate::data::trade_store::TradeStore::global().lock().unwrap();
+            let mark = if current_mark > 0.0 {
+                current_mark
+            } else {
+                store.get_mark_price(&self.symbol).unwrap_or(0.0)
+            };
+
+            let pos: Vec<PositionOverlaySpec> = store
+                .positions
+                .iter()
+                .filter(|p| crate::data::trade_store::symbol_matches(&p.symbol, &self.symbol))
+                .map(|p| {
+                    let liq = if p.leverage > 1 {
+                        let factor = 0.9 / (p.leverage as f64);
+                        match p.side {
+                            crate::data::trade_store::TradeSide::Long => {
+                                Some((p.entry_price * (1.0 - factor)).max(0.0))
+                            }
+                            crate::data::trade_store::TradeSide::Short => {
+                                Some(p.entry_price * (1.0 + factor))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    PositionOverlaySpec {
+                        id: p.id.clone(),
+                        symbol: p.symbol.clone(),
+                        is_long: p.side == crate::data::trade_store::TradeSide::Long,
+                        entry_price: p.entry_price,
+                        quantity: p.quantity,
+                        margin: p.margin,
+                        leverage: p.leverage,
+                        current_price: mark,
+                        liquidation_price: liq,
+                    }
+                })
+                .collect();
+
+            let ord: Vec<OrderOverlaySpec> = store
+                .orders
+                .iter()
+                .filter(|o| o.status == "OPEN" && crate::data::trade_store::symbol_matches(&o.symbol, &self.symbol))
+                .map(|o| OrderOverlaySpec {
+                    id: o.id.clone(),
+                    symbol: o.symbol.clone(),
+                    is_long: o.side == crate::data::trade_store::TradeSide::Long,
+                    order_type: match o.order_type {
+                        crate::data::trade_store::TradeOrderType::Market => "MARKET".to_string(),
+                        crate::data::trade_store::TradeOrderType::Limit => "LIMIT".to_string(),
+                    },
+                    price: o.price,
+                    quantity: o.quantity,
+                    status: o.status.to_string(),
+                })
+                .collect();
+
+            (pos, ord)
+        };
+
+        chart = chart.position_overlays(pos_overlays).order_overlays(ord_overlays);
 
         // Render drawing overlay
         let drawing_overlay = {
@@ -1985,6 +2065,35 @@ impl Render for ChartPanel {
                 cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                     let pos: Point<Pixels> = ev.position;
                     if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
+                        return;
+                    }
+
+                    // Check if clicking on an overlay badge button (close position / cancel order)
+                    let hit_action = {
+                        let hitboxes = this.chart_state.overlay_hitboxes.borrow();
+                        hitboxes
+                            .iter()
+                            .find(|hb| hb.bounds.contains(&pos))
+                            .map(|hb| hb.action.clone())
+                    };
+                    if let Some(action) = hit_action {
+                        cx.stop_propagation();
+                        match action {
+                            ChartOverlayAction::ClosePosition { position_id } => {
+                                let last_price = this.feed.snapshot().last().map(|c| c.close);
+                                let _ = crate::data::trade_store::TradeStore::global()
+                                    .lock()
+                                    .unwrap()
+                                    .close_position(&position_id, last_price);
+                            }
+                            ChartOverlayAction::CancelOrder { order_id } => {
+                                let _ = crate::data::trade_store::TradeStore::global()
+                                    .lock()
+                                    .unwrap()
+                                    .cancel_order(&order_id);
+                            }
+                        }
+                        cx.notify();
                         return;
                     }
 

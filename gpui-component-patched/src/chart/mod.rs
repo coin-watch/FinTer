@@ -8,8 +8,11 @@ mod pie_chart;
 
 pub use area_chart::AreaChart;
 pub use bar_chart::BarChart;
-pub use candlestick_chart::{CandleType, CandlestickChart, PaneTarget, IndicatorStyle, paint_text_line_centered};
-pub use chart_state::ChartState;
+pub use candlestick_chart::{
+    paint_text_line_centered, CandleType, CandlestickChart, IndicatorStyle, OrderOverlaySpec,
+    PaneTarget, PositionOverlaySpec,
+};
+pub use chart_state::{ChartOverlayAction, ChartOverlayHitbox, ChartState};
 pub use line_chart::LineChart;
 pub use linear_scale::LinearScale;
 pub use pie_chart::PieChart;

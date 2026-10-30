@@ -4,8 +4,8 @@ use gpui::{
     Context, EventEmitter, InteractiveElement, IntoElement, ParentElement, Render, Styled, Window,
     div, px, rgb,
 };
-use gpui_component::Sizable;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{h_flex, Sizable};
 use std::sync::Arc;
 
 /// Event emitted by the update banner.
@@ -62,6 +62,7 @@ impl Render for UpdateBanner {
                     .flex_row()
                     .items_center()
                     .w_full()
+                    .min_w_0()
                     .px(px(16.0))
                     .py(px(8.0))
                     .bg(banner_bg)
@@ -70,34 +71,43 @@ impl Render for UpdateBanner {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(text_color)
                             .child(format!("Update v{} available", version)),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_xs()
                             .text_color(rgb(0x86efac))
                             .child(changelog_preview),
                     )
                     .child(
-                        Button::new("download-update")
-                            .label("Download")
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::DownloadRequested);
-                            })),
-                    )
-                    .child(
-                        Button::new("dismiss-update")
-                            .label("Dismiss")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::Dismissed);
-                            })),
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("download-update")
+                                    .label("Download")
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::DownloadRequested);
+                                    })),
+                            )
+                            .child(
+                                Button::new("dismiss-update")
+                                    .label("Dismiss")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::Dismissed);
+                                    })),
+                            ),
                     )
             }
             UpdateState::Downloading { version, progress } => {
@@ -110,6 +120,7 @@ impl Render for UpdateBanner {
                     .flex_row()
                     .items_center()
                     .w_full()
+                    .min_w_0()
                     .px(px(16.0))
                     .py(px(8.0))
                     .bg(banner_bg)
@@ -118,6 +129,7 @@ impl Render for UpdateBanner {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_sm()
                             .text_color(rgb(0x60a5fa))
                             .child(format!("Downloading v{}...", version)),
@@ -125,8 +137,11 @@ impl Render for UpdateBanner {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .h(px(4.0))
                             .bg(rgb(0x1e293b))
+                            .rounded(px(2.0))
+                            .overflow_hidden()
                             .child(
                                 div()
                                     .h_full()
@@ -136,6 +151,7 @@ impl Render for UpdateBanner {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_xs()
                             .text_color(rgb(0x93c5fd))
                             .child(format!("{}%", pct)),
@@ -151,6 +167,7 @@ impl Render for UpdateBanner {
                     .flex_row()
                     .items_center()
                     .w_full()
+                    .min_w_0()
                     .px(px(16.0))
                     .py(px(8.0))
                     .bg(banner_bg)
@@ -159,28 +176,34 @@ impl Render for UpdateBanner {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_sm()
                             .text_color(rgb(0xc084fc))
                             .child(format!("v{} ready to install", version)),
                     )
-                    .child(div().flex_1())
+                    .child(div().flex_1().min_w_0())
                     .child(
-                        Button::new("install-update")
-                            .label("Install Now")
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(move |_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::InstallRequested(install_path.clone()));
-                            })),
-                    )
-                    .child(
-                        Button::new("dismiss-install")
-                            .label("Later")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::Dismissed);
-                            })),
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("install-update")
+                                    .label("Install Now")
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(move |_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::InstallRequested(install_path.clone()));
+                                    })),
+                            )
+                            .child(
+                                Button::new("dismiss-install")
+                                    .label("Later")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::Dismissed);
+                                    })),
+                            ),
                     )
             }
             UpdateState::RestartRequired { version } => {
@@ -192,6 +215,7 @@ impl Render for UpdateBanner {
                     .flex_row()
                     .items_center()
                     .w_full()
+                    .min_w_0()
                     .px(px(16.0))
                     .py(px(8.0))
                     .bg(banner_bg)
@@ -200,28 +224,35 @@ impl Render for UpdateBanner {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_sm()
                             .text_color(rgb(0x4ade80))
                             .child(format!("v{} installed! Restart application to apply changes.", version)),
                     )
-                    .child(div().flex_1())
                     .child(
-                        Button::new("restart-app")
-                            .label("Restart Now")
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::RestartRequested);
-                            })),
-                    )
-                    .child(
-                        Button::new("dismiss-restart")
-                            .label("Later")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::Dismissed);
-                            })),
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("restart-app")
+                                    .label("Restart Now")
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::RestartRequested);
+                                    })),
+                            )
+                            .child(
+                                Button::new("dismiss-restart")
+                                    .label("Later")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::Dismissed);
+                                    })),
+                            ),
                     )
             }
             UpdateState::Failed(msg) => {
@@ -233,6 +264,7 @@ impl Render for UpdateBanner {
                     .flex_row()
                     .items_center()
                     .w_full()
+                    .min_w_0()
                     .px(px(16.0))
                     .py(px(6.0))
                     .bg(banner_bg)
@@ -241,28 +273,35 @@ impl Render for UpdateBanner {
                     .gap(px(12.0))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_xs()
                             .text_color(rgb(0xfca5a5))
                             .child(format!("Update check failed: {}", msg)),
                     )
-                    .child(div().flex_1())
                     .child(
-                        Button::new("retry-update")
-                            .label("Retry")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::CheckRequested);
-                            })),
-                    )
-                    .child(
-                        Button::new("dismiss-error")
-                            .label("Dismiss")
-                            .small()
-                            .ghost()
-                            .on_click(cx.listener(|_this, _event, _window, cx| {
-                                cx.emit(UpdateBannerEvent::Dismissed);
-                            })),
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("retry-update")
+                                    .label("Retry")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::CheckRequested);
+                                    })),
+                            )
+                            .child(
+                                Button::new("dismiss-error")
+                                    .label("Dismiss")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(UpdateBannerEvent::Dismissed);
+                                    })),
+                            ),
                     )
             }
         }

@@ -1,3 +1,4 @@
+use crate::components::pages::api_management_view::ApiManagementView;
 use crate::data::models::SettingsData;
 use crate::data::theme;
 use gpui::*;
@@ -100,10 +101,26 @@ pub struct AppSettings {
     /// Local-only Agent configuration; never included in SettingsData.
     pub agent_base_url: SharedString,
     pub agent_api_key: SharedString,
+    /// Local-only exchange API credentials.
+    pub api_exchange: SharedString,
+    pub api_key: SharedString,
+    pub api_secret: SharedString,
+    pub api_passphrase: SharedString,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
+        let saved_creds = crate::data::api_management::load();
+        let initial_ex = saved_creds
+            .first()
+            .map(|c| c.exchange.clone())
+            .unwrap_or_else(|| "binance".to_string());
+        let initial_cred = saved_creds
+            .iter()
+            .find(|c| c.exchange.eq_ignore_ascii_case(&initial_ex))
+            .cloned()
+            .unwrap_or_default();
+
         Self {
             server_url: crate::data::client::DEFAULT_FINTER_API_URL.into(),
             dark_mode: false,
@@ -124,6 +141,10 @@ impl Default for AppSettings {
             default_timezone: "UTC".into(),
             agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
             agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
+            api_exchange: initial_ex.into(),
+            api_key: initial_cred.api_key.into(),
+            api_secret: initial_cred.api_secret.into(),
+            api_passphrase: initial_cred.passphrase.into(),
         }
     }
 }
@@ -170,6 +191,10 @@ impl AppSettings {
             auto_check_updates: data.auto_check_updates.unwrap_or(true),
             agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
             agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
+            api_exchange: crate::data::api_management::load().first().map(|c| c.exchange.clone()).unwrap_or_else(|| "binance".into()).into(),
+            api_key: String::new().into(),
+            api_secret: String::new().into(),
+            api_passphrase: String::new().into(),
         }
     }
 
@@ -206,6 +231,7 @@ pub struct SettingsPage {
     settings: Entity<AppSettings>,
     committed: Entity<AppSettings>,
     on_change: OnChangeFn,
+    api_management: Entity<ApiManagementView>,
 }
 
 impl SettingsPage {
@@ -214,6 +240,7 @@ impl SettingsPage {
             settings: cx.new(|_| AppSettings::default()),
             committed: cx.new(|_| AppSettings::default()),
             on_change: None,
+            api_management: cx.new(|cx| ApiManagementView::new(cx)),
         }
     }
 
@@ -222,6 +249,7 @@ impl SettingsPage {
             settings: cx.new(|_| AppSettings::from_settings_data(data)),
             committed: cx.new(|_| AppSettings::from_settings_data(data)),
             on_change: None,
+            api_management: cx.new(|cx| ApiManagementView::new(cx)),
         }
     }
 
@@ -254,6 +282,7 @@ impl SettingsPage {
             .page(self.build_appearance_page(settings.clone(), on_change.clone()))
             .page(self.build_network_page(settings.clone(), on_change.clone()))
             .page(self.build_agent_page(settings.clone()))
+            .page(self.build_api_management_page(settings.clone()))
             .page(self.build_trading_page(settings.clone(), on_change.clone()))
             .page(self.build_alerts_page(settings.clone(), on_change.clone()))
             .page(self.build_performance_page(settings.clone(), on_change.clone()))
@@ -357,6 +386,18 @@ impl SettingsPage {
                             cx.refresh_windows();
                         })
                 })))
+    }
+
+    fn build_api_management_page(&self, _settings: Entity<AppSettings>) -> SettingPage {
+        let view = self.api_management.clone();
+        SettingPage::new("APIs Management")
+            .description("Configure and manage local exchange API keys. Stored only on this machine with 0600 permissions.")
+            .group(
+                SettingGroup::new()
+                    .item(SettingItem::render(move |_, _, _| {
+                        view.clone()
+                    })),
+            )
     }
 
     fn build_appearance_page(

@@ -191,6 +191,7 @@ impl RenderOnce for Alert {
         h_flex()
             .id(self.id)
             .w_full()
+            .min_w_0()
             .text_color(fg)
             .bg(color.opacity(0.08))
             .px(padding_x)
@@ -206,17 +207,20 @@ impl RenderOnce for Alert {
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .when(self.banner, |this| this.items_center())
                     .overflow_hidden()
                     .gap(gap)
                     .child(
                         div()
+                            .flex_shrink_0()
                             .when(!self.banner, |this| this.mt(px(5.)))
                             .child(self.icon),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .gap_3()
                             .when(!self.banner, |this| {
@@ -236,6 +240,7 @@ impl RenderOnce for Alert {
                 this.child(
                     div()
                         .id("close")
+                        .flex_shrink_0()
                         .p_0p5()
                         .rounded(cx.theme().radius)
                         .hover(|this| this.bg(color.opacity(0.1)))

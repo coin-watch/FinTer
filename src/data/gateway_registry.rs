@@ -62,6 +62,9 @@ fn gateway_base() -> String {
 struct RegistryInner {
     exchanges: Vec<String>,
     exchange_infos: Vec<ExchangeInfo>,
+    /// True once the CoinWatch exchange request has completed successfully.
+    exchanges_loaded: bool,
+    exchanges_fetch_in_flight: bool,
     /// exchange_id → list of symbol strings
     symbols: HashMap<String, Vec<String>>,
     /// exchange_id → list of rich SymbolInfo
@@ -109,6 +112,16 @@ impl GatewayRegistry {
             DEFAULT_EXCHANGES.iter().map(|s| s.to_string()).collect()
         } else {
             inner.exchanges.clone()
+        }
+    }
+
+    /// Returns only the exchanges confirmed loaded from the CoinWatch API.
+    pub fn api_loaded_exchanges(&self) -> Option<Vec<String>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.exchanges_loaded && !inner.exchanges.is_empty() {
+            Some(inner.exchanges.clone())
+        } else {
+            None
         }
     }
 
@@ -200,6 +213,15 @@ impl GatewayRegistry {
     /// Kick off a background fetch for the exchange list, using an explicit session token if provided.
     pub fn prefetch_exchanges_with_token(&self, token: Option<&str>) {
         let inner = Arc::clone(&self.inner);
+        {
+            let mut guard = inner.lock().unwrap();
+            // Exchange catalogue is process-cached. Never start another request
+            // while one is in flight or after a successful load.
+            if guard.exchanges_loaded || guard.exchanges_fetch_in_flight {
+                return;
+            }
+            guard.exchanges_fetch_in_flight = true;
+        }
         let token_opt = token.map(str::to_string);
         tokio_runtime().spawn(async move {
             fetch_exchanges(inner, token_opt.as_deref()).await;
@@ -315,6 +337,8 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) 
                         let mut guard = inner.lock().unwrap();
                         guard.exchanges = ids;
                         guard.exchange_infos = infos;
+                        guard.exchanges_loaded = true;
+                        guard.exchanges_fetch_in_flight = false;
                     }
                     Err(e) => error!("GatewayRegistry: exchanges parse error: {e}"),
                 },
@@ -328,6 +352,8 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) 
             error!("GatewayRegistry: exchanges fetch error: {e}");
         }
     }
+    // Permit a later caller to retry after any unsuccessful response or parse failure.
+    inner.lock().unwrap().exchanges_fetch_in_flight = false;
 }
 
 async fn fetch_symbols(inner: Arc<Mutex<RegistryInner>>, exchange: &str, token: Option<&str>) {

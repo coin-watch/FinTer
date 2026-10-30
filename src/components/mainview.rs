@@ -1792,11 +1792,15 @@ fn build_superchat_content(cx: &App) -> impl IntoElement {
 fn build_notifications_content(cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
         .gap(px(12.0))
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .text_sm()
                 .text_color(theme.colors.muted_foreground)
                 .child("Your trading alerts"),
@@ -1962,10 +1966,15 @@ fn build_notification_item(
 ) -> impl IntoElement {
     let theme = cx.theme();
     div()
+        .w_full()
+        .min_w_0()
         .p(px(12.0))
+        .rounded(theme.radius)
         .bg(theme.colors.sidebar_accent)
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .text_sm()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.colors.sidebar_foreground)
@@ -1974,6 +1983,8 @@ fn build_notification_item(
         )
         .child(
             div()
+                .w_full()
+                .min_w_0()
                 .text_sm()
                 .text_color(theme.colors.muted_foreground)
                 .child(message),

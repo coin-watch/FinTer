@@ -173,7 +173,7 @@ impl Render for DragView {
                                                     } else if self.module_type.to_lowercase() == "feargreed" {
                                                         "Fear & Greed Index".to_string()
                                                     } else if self.module_type.to_lowercase() == "execution" || self.module_type.to_lowercase() == "tradedesk" {
-                                                        "Trade Desk · Read Only".to_string()
+                                                        "Trade Desk".to_string()
                                                     } else if self.module_type.to_lowercase() == "positions" {
                                                         "Positions".to_string()
                                                     } else {

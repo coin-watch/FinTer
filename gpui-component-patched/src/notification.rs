@@ -278,13 +278,16 @@ impl Render for Notification {
             Some(type_) => Some(type_.icon(cx)),
         };
         let has_icon = icon.is_some();
+        let max_w = (window.viewport_size().width - px(32.0)).max(px(160.0));
 
         h_flex()
             .id("notification")
             .group("")
             .occlude()
             .relative()
-            .w_112()
+            .w(px(448.0).min(max_w))
+            .max_w(max_w)
+            .min_w_0()
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().popover)
@@ -295,11 +298,12 @@ impl Render for Notification {
             .gap_3()
             .refine_style(&self.style)
             .when_some(icon, |this, icon| {
-                this.child(div().absolute().py_3p5().left_4().child(icon))
+                this.child(div().absolute().py_3p5().left_4().flex_shrink_0().child(icon))
             })
             .child(
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .overflow_hidden()
                     .when(has_icon, |this| this.pl_6())
                     .when_some(self.title.clone(), |this, title| {
@@ -313,7 +317,7 @@ impl Render for Notification {
                     }),
             )
             .when_some(action, |this, action| {
-                this.child(action)
+                this.child(div().flex_shrink_0().child(action))
             })
             .when_some(self.on_click.clone(), |this, on_click| {
                 this.on_click(cx.listener(move |view, event, window, cx| {
@@ -449,16 +453,22 @@ impl Render for NotificationList {
         let size = window.viewport_size();
         let items = self.notifications.iter().rev().take(10).rev().cloned();
 
-        div().absolute().top_4().right_4().child(
-            v_flex()
-                .id("notification-list")
-                .h(size.height - px(8.))
-                .on_hover(cx.listener(|view, hovered, _, cx| {
-                    view.expanded = *hovered;
-                    cx.notify()
-                }))
-                .gap_3()
-                .children(items),
-        )
+        div()
+            .absolute()
+            .top_4()
+            .right_4()
+            .max_w(size.width - px(32.))
+            .child(
+                v_flex()
+                    .id("notification-list")
+                    .max_w_full()
+                    .h(size.height - px(8.))
+                    .on_hover(cx.listener(|view, hovered, _, cx| {
+                        view.expanded = *hovered;
+                        cx.notify()
+                    }))
+                    .gap_3()
+                    .children(items),
+            )
     }
 }

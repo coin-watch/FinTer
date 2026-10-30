@@ -356,6 +356,47 @@ impl Render for AgentPanel {
                         )
                 )
             })
+            .when_some(self.error.clone(), |this, err| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(colors.danger.opacity(0.12))
+                        .border_1()
+                        .border_color(colors.danger.opacity(0.35))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(colors.danger)
+                                .child(err),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(colors.danger.opacity(0.8))
+                                .hover(|s| s.text_color(colors.danger))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.error = None;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("✕"),
+                        ),
+                )
+            })
             .child(chat_view)
             .child(div().min_w_0().flex().items_center().gap(px(6.0))
                 .child(Input::new(&input).flex_1())

@@ -62,10 +62,10 @@ where
         );
         let popover_id = ElementId::Name(format!("combobox-field-{}", field.type_name()).into());
         let search_focus = search_input_state.focus_handle(cx);
-        search_input_state.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
 
+        // Do not focus the combobox search field while rendering the closed
+        // control. Settings rerender whenever an input changes; forcing focus
+        // here steals keyboard focus from every other field on the page.
         Popover::new(popover_id)
             .anchor(Corner::TopRight)
             .appearance(false)

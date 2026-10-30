@@ -296,28 +296,8 @@ fn symbol_choices(exchange: &str) -> Vec<String> {
     .collect()
 }
 
-fn symbol_choices_for_menu(exchange: &str, current_symbol: &str) -> Vec<String> {
-    let all = symbol_choices(exchange);
-    if all.len() <= 60 {
-        return all;
-    }
-    let mut result = Vec::with_capacity(60);
-    if !current_symbol.is_empty() {
-        if let Some(pos) = all.iter().position(|s| s.eq_ignore_ascii_case(current_symbol)) {
-            result.push(all[pos].clone());
-        } else {
-            result.push(current_symbol.to_string());
-        }
-    }
-    for s in &all {
-        if result.len() >= 60 {
-            break;
-        }
-        if !result.iter().any(|existing| existing.eq_ignore_ascii_case(s)) {
-            result.push(s.clone());
-        }
-    }
-    result
+fn symbol_choices_for_menu(exchange: &str, _current_symbol: &str) -> Vec<String> {
+    symbol_choices(exchange)
 }
 
 fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
@@ -1633,7 +1613,7 @@ impl PaneGridRenderer {
                                                         ("agent", "Agent"),
                                                         ("trades", "Trades / Tape"),
                                                         ("positions", "Positions"),
-                                                        ("execution", "Trade Desk · Read Only"),
+                                                        ("execution", "Trade Desk"),
                                                         ("watchlist", "Watchlist"),
                                                         ("marketcap", "Market Cap"),
                                                         ("newsfeed", "Newsfeed"),
@@ -1798,13 +1778,7 @@ impl PaneGridRenderer {
                                                                 );
                                                             }
                                                         }
-                                                        _ => {
-                                                            menu = menu.separator().label("Settings");
-                                                            menu = menu.item(
-                                                                gpui_component::menu::PopupMenuItem::new("No configuration options available")
-                                                                    .disabled(true),
-                                                            );
-                                                        }
+                                                        _ => {}
                                                     }
                                                     menu
                                                 }
@@ -2175,6 +2149,8 @@ impl PaneGridRenderer {
                                                 let panel = cx.new(|cx| {
                                                     let mut p = crate::components::ui::execution_panel::ExecutionPanel::new(feed, title, symbol.clone(), cx);
                                                     p.set_size(content_w, content_h);
+                                                    p.set_pane_id(pane_id.clone());
+                                                    p.set_exchange(exchange.clone());
                                                     p
                                                 });
                                                 execution_map.insert(pane_id.clone(), ExecutionViewState {
@@ -2186,9 +2162,14 @@ impl PaneGridRenderer {
                                         }
                                     } else {
                                         let entity = execution_map.get(&pane_id).unwrap().entity.clone();
-                                        if !entity.read(cx).has_size(content_w, content_h) {
-                                            entity.update(cx, |panel, _| panel.set_size(content_w, content_h));
-                                        }
+                                        entity.update(cx, |panel, cx| {
+                                            if !panel.has_size(content_w, content_h) {
+                                                panel.set_size(content_w, content_h);
+                                                cx.notify();
+                                            }
+                                            panel.set_pane_id(pane_id.clone());
+                                            panel.set_exchange(exchange.clone());
+                                        });
                                         cached_panel(entity)
                                     }
                                 }

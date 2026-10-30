@@ -454,6 +454,7 @@ impl Render for LoginPage {
                                 this.child(
                                     div()
                                         .w_full()
+                                        .min_w_0()
                                         .px(px(12.0))
                                         .py(px(8.0))
                                         .rounded(px(8.0))
@@ -467,10 +468,13 @@ impl Render for LoginPage {
                                             Icon::default()
                                                 .path("icons/triangle-alert.svg")
                                                 .size_4()
+                                                .flex_shrink_0()
                                                 .text_color(bearish),
                                         )
                                         .child(
                                             div()
+                                                .flex_1()
+                                                .min_w_0()
                                                 .text_xs()
                                                 .text_color(bearish)
                                                 .child(error_message.unwrap_or_default()),
@@ -481,6 +485,7 @@ impl Render for LoginPage {
                                 this.child(
                                     div()
                                         .w_full()
+                                        .min_w_0()
                                         .px(px(12.0))
                                         .py(px(8.0))
                                         .rounded(px(8.0))
@@ -494,10 +499,13 @@ impl Render for LoginPage {
                                             Icon::default()
                                                 .path("icons/circle-check.svg")
                                                 .size_4()
+                                                .flex_shrink_0()
                                                 .text_color(bullish),
                                         )
                                         .child(
                                             div()
+                                                .flex_1()
+                                                .min_w_0()
                                                 .text_xs()
                                                 .text_color(bullish)
                                                 .child(info_message.unwrap_or_default()),

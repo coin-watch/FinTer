@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    fill, px, rgb, App, Bounds, Corner, Hsla, PathBuilder, Pixels, SharedString, TextAlign, Window,
+    fill, px, rgb, rgba, App, Bounds, Corner, Hsla, PathBuilder, Pixels, SharedString, TextAlign, Window,
 };
 use gpui_component_macros::IntoPlot;
 use num_traits::{Num, ToPrimitive};
@@ -11,8 +11,36 @@ use crate::{
     ActiveTheme, PixelsExt,
 };
 
-use super::chart_state::ChartState;
+use super::chart_state::{ChartOverlayAction, ChartOverlayHitbox, ChartState};
 use super::linear_scale::LinearScale;
+
+// ---------------------------------------------------------------------------
+// Position & Order Overlays
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionOverlaySpec {
+    pub id: String,
+    pub symbol: String,
+    pub is_long: bool,
+    pub entry_price: f64,
+    pub quantity: f64,
+    pub margin: f64,
+    pub leverage: u32,
+    pub current_price: f64,
+    pub liquidation_price: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrderOverlaySpec {
+    pub id: String,
+    pub symbol: String,
+    pub is_long: bool,
+    pub order_type: String,
+    pub price: f64,
+    pub quantity: f64,
+    pub status: String,
+}
 
 // ---------------------------------------------------------------------------
 // Layout constants
@@ -106,6 +134,10 @@ where
     subpane_count: usize,
     /// Timestamp/value series painted over the price pane.
     indicator_lines: Vec<(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)>,
+    /// Active trading position overlays (entry line, PnL badge, liquidation line).
+    position_overlays: Vec<PositionOverlaySpec>,
+    /// Open order overlays (price line, type/side badge, cancel action).
+    order_overlays: Vec<OrderOverlaySpec>,
 }
 
 impl<T, Y> CandlestickChart<T, Y>
@@ -135,6 +167,8 @@ where
             show_volume_pane: true,
             subpane_count: 0,
             indicator_lines: Vec::new(),
+            position_overlays: Vec::new(),
+            order_overlays: Vec::new(),
         }
     }
 
@@ -246,6 +280,18 @@ where
 
     pub fn show_volume_pane(mut self, show: bool) -> Self {
         self.show_volume_pane = show;
+        self
+    }
+
+    /// Attach active position overlay specs (entry price lines, PnL badges, liquidation lines).
+    pub fn position_overlays(mut self, overlays: Vec<PositionOverlaySpec>) -> Self {
+        self.position_overlays = overlays;
+        self
+    }
+
+    /// Attach open order overlay specs (order price lines, side/type badges, cancel action).
+    pub fn order_overlays(mut self, overlays: Vec<OrderOverlaySpec>) -> Self {
+        self.order_overlays = overlays;
         self
     }
 }
@@ -428,6 +474,10 @@ where
         
         if !candle_h.is_finite() || candle_h <= 1.0 {
             return;
+        }
+
+        if let Some(st) = &self.state {
+            st.overlay_hitboxes.borrow_mut().clear();
         }
 
         // ------------------------------------------------------------------ //
@@ -1326,6 +1376,392 @@ where
                 window,
                 cx,
             );
+        }
+
+        // ------------------------------------------------------------------ //
+        // 11. Active positions & open orders overlays
+        // ------------------------------------------------------------------ //
+        if self.show_candles {
+            // A. Active Positions
+            for pos in &self.position_overlays {
+                let side_color = if pos.is_long { bullish_color } else { bearish_color };
+                let pnl = if pos.is_long {
+                    (pos.current_price - pos.entry_price) * pos.quantity
+                } else {
+                    (pos.entry_price - pos.current_price) * pos.quantity
+                };
+                let roi = if pos.margin > 0.0 {
+                    (pnl / pos.margin) * 100.0
+                } else {
+                    0.0
+                };
+                let pnl_sign = if pnl >= 0.0 { "+" } else { "" };
+                let pnl_str = format!("{}${:.2} ({}{:.1}%)", pnl_sign, pnl, pnl_sign, roi);
+
+                let entry_px_y = y_scale.scale(pos.entry_price);
+                let entry_abs_y = origin.y.as_f32() + entry_px_y;
+
+                if entry_px_y >= 0.0 && entry_px_y <= candle_h {
+                    // 1. Horizontal dashed entry line across chart
+                    let mut line_color = side_color;
+                    line_color.a = 0.85;
+                    let seg = 6.0_f32;
+                    let gap = 3.0_f32;
+                    let mut x_cur = origin.x.as_f32();
+                    let end_x = origin.x.as_f32() + chart_w;
+                    while x_cur < end_x {
+                        let x_end = (x_cur + seg).min(end_x);
+                        let mut pb = PathBuilder::stroke(px(1.5));
+                        pb.move_to(gpui::point(px(x_cur), px(entry_abs_y)));
+                        pb.line_to(gpui::point(px(x_end), px(entry_abs_y)));
+                        if let Ok(p) = pb.build() {
+                            window.paint_path(p, line_color);
+                        }
+                        x_cur += seg + gap;
+                    }
+
+                    // 2. Position HUD Badge
+                    let side_label = if pos.is_long { "LONG" } else { "SHORT" };
+                    let qty_str = if pos.quantity >= 1.0 {
+                        format!("{:.2}", pos.quantity)
+                    } else {
+                        format!("{:.4}", pos.quantity)
+                    };
+                    let badge_text = format!(
+                        "{} {}x {} @ {} | {}",
+                        side_label,
+                        pos.leverage,
+                        qty_str,
+                        self.price_str(pos.entry_price),
+                        pnl_str
+                    );
+
+                    let badge_w = ((badge_text.len() as f32) * 6.5 + 40.0).clamp(160.0, 340.0);
+                    let badge_h = 22.0_f32;
+                    let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let badge_y = (entry_abs_y - badge_h / 2.0)
+                        .clamp(origin.y.as_f32() + 2.0, origin.y.as_f32() + candle_h - badge_h - 2.0);
+
+                    // Badge background
+                    let badge_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x), px(badge_y)),
+                        gpui::point(px(badge_x + badge_w), px(badge_y + badge_h)),
+                    );
+                    window.paint_quad(fill(badge_bounds, rgba(0x131722f0)));
+
+                    // Left accent strip indicating side
+                    let strip_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x), px(badge_y)),
+                        gpui::point(px(badge_x + 3.0), px(badge_y + badge_h)),
+                    );
+                    window.paint_quad(fill(strip_bounds, side_color));
+
+                    // Subtle border
+                    let mut b_builder = PathBuilder::stroke(px(1.0));
+                    b_builder.move_to(gpui::point(px(badge_x), px(badge_y)));
+                    b_builder.line_to(gpui::point(px(badge_x + badge_w), px(badge_y)));
+                    b_builder.line_to(gpui::point(px(badge_x + badge_w), px(badge_y + badge_h)));
+                    b_builder.line_to(gpui::point(px(badge_x), px(badge_y + badge_h)));
+                    b_builder.line_to(gpui::point(px(badge_x), px(badge_y)));
+                    if let Ok(bp) = b_builder.build() {
+                        let mut border_c = side_color;
+                        border_c.a = 0.4;
+                        window.paint_path(bp, border_c);
+                    }
+
+                    // Badge text
+                    let text_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x + 6.0), px(badge_y)),
+                        gpui::point(px(badge_x + badge_w - 24.0), px(badge_y + badge_h)),
+                    );
+                    let pnl_color = if pnl >= 0.0 { bullish_color } else { bearish_color };
+                    paint_text_line(
+                        badge_text.into(),
+                        gpui::point(px(badge_x + 6.0), px(badge_y + 5.0)),
+                        pnl_color,
+                        text_bounds,
+                        window,
+                        cx,
+                    );
+
+                    // Close button [×]
+                    let close_size = 16.0_f32;
+                    let close_x = badge_x + badge_w - close_size - 4.0;
+                    let close_y = badge_y + (badge_h - close_size) / 2.0;
+                    let close_bounds = Bounds::from_corners(
+                        gpui::point(px(close_x), px(close_y)),
+                        gpui::point(px(close_x + close_size), px(close_y + close_size)),
+                    );
+                    window.paint_quad(fill(close_bounds, rgba(0xffffff22)));
+                    paint_text_line_centered(
+                        "×".into(),
+                        gpui::white(),
+                        close_bounds,
+                        window,
+                        cx,
+                    );
+
+                    // Register close hitbox
+                    if let Some(ref st) = self.state {
+                        st.overlay_hitboxes.borrow_mut().push(ChartOverlayHitbox {
+                            bounds: close_bounds,
+                            action: ChartOverlayAction::ClosePosition {
+                                position_id: pos.id.clone(),
+                            },
+                        });
+                    }
+
+                    // 3. Price pill on Y-axis
+                    self.paint_price_pill_with_width(
+                        self.price_str(pos.entry_price),
+                        side_color,
+                        gpui::white(),
+                        origin.x.as_f32() + chart_w,
+                        entry_abs_y,
+                        shared_live_badge_w,
+                        y_axis_w,
+                        window,
+                        cx,
+                    );
+                } else {
+                    // Off-screen indicator
+                    let (off_y, arrow) = if entry_px_y < 0.0 {
+                        (origin.y.as_f32() + 4.0, "▲")
+                    } else {
+                        (origin.y.as_f32() + candle_h - 20.0, "▼")
+                    };
+                    let off_text = format!(
+                        "{} {} @ {} ({})",
+                        arrow,
+                        if pos.is_long { "LONG" } else { "SHORT" },
+                        self.price_str(pos.entry_price),
+                        pnl_str
+                    );
+                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(120.0, 240.0);
+                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let off_bounds = Bounds::from_corners(
+                        gpui::point(px(off_x), px(off_y)),
+                        gpui::point(px(off_x + off_w), px(off_y + 18.0)),
+                    );
+                    window.paint_quad(fill(off_bounds, rgba(0x131722e0)));
+                    let text_b = Bounds::from_corners(
+                        gpui::point(px(off_x + 4.0), px(off_y)),
+                        gpui::point(px(off_x + off_w - 4.0), px(off_y + 18.0)),
+                    );
+                    paint_text_line(
+                        off_text.into(),
+                        gpui::point(px(off_x + 4.0), px(off_y + 3.0)),
+                        side_color,
+                        text_b,
+                        window,
+                        cx,
+                    );
+                }
+
+                // 4. Liquidation line (if leveraged)
+                if let Some(liq_price) = pos.liquidation_price {
+                    if liq_price > 0.0 && pos.leverage > 1 {
+                        let liq_px_y = y_scale.scale(liq_price);
+                        let liq_abs_y = origin.y.as_f32() + liq_px_y;
+                        if liq_px_y >= 0.0 && liq_px_y <= candle_h {
+                            let warning_color: Hsla = rgb(0xf59e0b).into();
+                            let mut liq_line_color = warning_color;
+                            liq_line_color.a = 0.75;
+                            let seg = 4.0_f32;
+                            let gap = 4.0_f32;
+                            let mut x_cur = origin.x.as_f32();
+                            let end_x = origin.x.as_f32() + chart_w;
+                            while x_cur < end_x {
+                                let x_end = (x_cur + seg).min(end_x);
+                                let mut pb = PathBuilder::stroke(px(1.0));
+                                pb.move_to(gpui::point(px(x_cur), px(liq_abs_y)));
+                                pb.line_to(gpui::point(px(x_end), px(liq_abs_y)));
+                                if let Ok(p) = pb.build() {
+                                    window.paint_path(p, liq_line_color);
+                                }
+                                x_cur += seg + gap;
+                            }
+
+                            // Liquidation pill on Y-axis
+                            let liq_str: SharedString = format!("LIQ {}", self.price_str(liq_price)).into();
+                            self.paint_price_pill_with_width(
+                                liq_str,
+                                warning_color,
+                                gpui::white(),
+                                origin.x.as_f32() + chart_w,
+                                liq_abs_y,
+                                shared_live_badge_w,
+                                y_axis_w,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // B. Open Orders
+            for ord in &self.order_overlays {
+                let side_color = if ord.is_long { bullish_color } else { bearish_color };
+                let ord_px_y = y_scale.scale(ord.price);
+                let ord_abs_y = origin.y.as_f32() + ord_px_y;
+
+                if ord_px_y >= 0.0 && ord_px_y <= candle_h {
+                    // 1. Horizontal dashed order line across chart
+                    let mut line_color = side_color;
+                    line_color.a = 0.75;
+                    let seg = 4.0_f32;
+                    let gap = 4.0_f32;
+                    let mut x_cur = origin.x.as_f32();
+                    let end_x = origin.x.as_f32() + chart_w;
+                    while x_cur < end_x {
+                        let x_end = (x_cur + seg).min(end_x);
+                        let mut pb = PathBuilder::stroke(px(1.2));
+                        pb.move_to(gpui::point(px(x_cur), px(ord_abs_y)));
+                        pb.line_to(gpui::point(px(x_end), px(ord_abs_y)));
+                        if let Ok(p) = pb.build() {
+                            window.paint_path(p, line_color);
+                        }
+                        x_cur += seg + gap;
+                    }
+
+                    // 2. Order HUD Badge
+                    let ord_side_str = if ord.is_long { "BUY" } else { "SELL" };
+                    let qty_str = if ord.quantity >= 1.0 {
+                        format!("{:.2}", ord.quantity)
+                    } else {
+                        format!("{:.4}", ord.quantity)
+                    };
+                    let badge_text = format!(
+                        "{} {} {} @ {}",
+                        ord.order_type,
+                        ord_side_str,
+                        qty_str,
+                        self.price_str(ord.price)
+                    );
+
+                    let badge_w = ((badge_text.len() as f32) * 6.5 + 36.0).clamp(140.0, 300.0);
+                    let badge_h = 20.0_f32;
+                    let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let badge_y = (ord_abs_y - badge_h / 2.0)
+                        .clamp(origin.y.as_f32() + 2.0, origin.y.as_f32() + candle_h - badge_h - 2.0);
+
+                    // Badge background
+                    let badge_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x), px(badge_y)),
+                        gpui::point(px(badge_x + badge_w), px(badge_y + badge_h)),
+                    );
+                    window.paint_quad(fill(badge_bounds, rgba(0x131722e8)));
+
+                    // Left accent strip
+                    let strip_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x), px(badge_y)),
+                        gpui::point(px(badge_x + 3.0), px(badge_y + badge_h)),
+                    );
+                    window.paint_quad(fill(strip_bounds, side_color));
+
+                    // Border
+                    let mut b_builder = PathBuilder::stroke(px(1.0));
+                    b_builder.move_to(gpui::point(px(badge_x), px(badge_y)));
+                    b_builder.line_to(gpui::point(px(badge_x + badge_w), px(badge_y)));
+                    b_builder.line_to(gpui::point(px(badge_x + badge_w), px(badge_y + badge_h)));
+                    b_builder.line_to(gpui::point(px(badge_x), px(badge_y + badge_h)));
+                    b_builder.line_to(gpui::point(px(badge_x), px(badge_y)));
+                    if let Ok(bp) = b_builder.build() {
+                        let mut border_c = side_color;
+                        border_c.a = 0.35;
+                        window.paint_path(bp, border_c);
+                    }
+
+                    // Text
+                    let text_bounds = Bounds::from_corners(
+                        gpui::point(px(badge_x + 6.0), px(badge_y)),
+                        gpui::point(px(badge_x + badge_w - 22.0), px(badge_y + badge_h)),
+                    );
+                    paint_text_line(
+                        badge_text.into(),
+                        gpui::point(px(badge_x + 6.0), px(badge_y + 4.0)),
+                        gpui::white(),
+                        text_bounds,
+                        window,
+                        cx,
+                    );
+
+                    // Cancel button [×]
+                    let cancel_size = 14.0_f32;
+                    let cancel_x = badge_x + badge_w - cancel_size - 4.0;
+                    let cancel_y = badge_y + (badge_h - cancel_size) / 2.0;
+                    let cancel_bounds = Bounds::from_corners(
+                        gpui::point(px(cancel_x), px(cancel_y)),
+                        gpui::point(px(cancel_x + cancel_size), px(cancel_y + cancel_size)),
+                    );
+                    window.paint_quad(fill(cancel_bounds, rgba(0xffffff22)));
+                    paint_text_line_centered(
+                        "×".into(),
+                        gpui::white(),
+                        cancel_bounds,
+                        window,
+                        cx,
+                    );
+
+                    // Register cancel hitbox
+                    if let Some(ref st) = self.state {
+                        st.overlay_hitboxes.borrow_mut().push(ChartOverlayHitbox {
+                            bounds: cancel_bounds,
+                            action: ChartOverlayAction::CancelOrder {
+                                order_id: ord.id.clone(),
+                            },
+                        });
+                    }
+
+                    // 3. Price pill on Y-axis
+                    self.paint_price_pill_with_width(
+                        self.price_str(ord.price),
+                        side_color,
+                        gpui::white(),
+                        origin.x.as_f32() + chart_w,
+                        ord_abs_y,
+                        shared_live_badge_w,
+                        y_axis_w,
+                        window,
+                        cx,
+                    );
+                } else {
+                    // Off-screen indicator
+                    let (off_y, arrow) = if ord_px_y < 0.0 {
+                        (origin.y.as_f32() + 4.0, "▲")
+                    } else {
+                        (origin.y.as_f32() + candle_h - 20.0, "▼")
+                    };
+                    let ord_side_str = if ord.is_long { "BUY" } else { "SELL" };
+                    let off_text = format!(
+                        "{} {} {} @ {}",
+                        arrow,
+                        ord.order_type,
+                        ord_side_str,
+                        self.price_str(ord.price)
+                    );
+                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(110.0, 220.0);
+                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let off_bounds = Bounds::from_corners(
+                        gpui::point(px(off_x), px(off_y)),
+                        gpui::point(px(off_x + off_w), px(off_y + 16.0)),
+                    );
+                    window.paint_quad(fill(off_bounds, rgba(0x131722d8)));
+                    let text_b = Bounds::from_corners(
+                        gpui::point(px(off_x + 4.0), px(off_y)),
+                        gpui::point(px(off_x + off_w - 4.0), px(off_y + 16.0)),
+                    );
+                    paint_text_line(
+                        off_text.into(),
+                        gpui::point(px(off_x + 4.0), px(off_y + 2.0)),
+                        side_color,
+                        text_b,
+                        window,
+                        cx,
+                    );
+                }
+            }
         }
 
         // ------------------------------------------------------------------ //
