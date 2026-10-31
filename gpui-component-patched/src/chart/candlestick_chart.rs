@@ -1371,10 +1371,17 @@ where
             // A. Active Positions
             for pos in &self.position_overlays {
                 let side_color = if pos.is_long { bullish_color } else { bearish_color };
-                let pnl = if pos.is_long {
-                    (pos.current_price - pos.entry_price) * pos.quantity
+                // Guard against a missing/zero mark so a fresh position never
+                // renders an absurd P&L while waiting for its first tick.
+                let mark_px = if pos.current_price.is_finite() && pos.current_price > 0.0 {
+                    pos.current_price
                 } else {
-                    (pos.entry_price - pos.current_price) * pos.quantity
+                    pos.entry_price
+                };
+                let pnl = if pos.is_long {
+                    (mark_px - pos.entry_price) * pos.quantity
+                } else {
+                    (pos.entry_price - mark_px) * pos.quantity
                 };
                 let roi = if pos.margin > 0.0 {
                     (pnl / pos.margin) * 100.0

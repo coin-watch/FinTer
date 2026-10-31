@@ -56,6 +56,126 @@ fn history_request_cache() -> &'static Mutex<HashMap<String, HistoryCacheEntry>>
     HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone)]
+enum TickerCacheState {
+    Ready(Instant, serde_json::Value),
+    InFlight(tokio::sync::watch::Receiver<Option<serde_json::Value>>),
+}
+
+static TICKER_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, TickerCacheState>>> = OnceLock::new();
+
+pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Option<serde_json::Value> {
+    if config.rest_base_url.trim().is_empty() {
+        return None;
+    }
+    let cache_key = format!(
+        "{}:{}:{}",
+        config.rest_base_url,
+        config.exchange.to_lowercase(),
+        crate::data::trade_store::normalize_symbol(&config.symbol)
+    );
+    let cache = TICKER_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let (tx_to_fetch, mut rx) = {
+        let mut guard = cache.lock().unwrap();
+        match guard.get(&cache_key) {
+            Some(TickerCacheState::Ready(instant, val))
+                if instant.elapsed() < Duration::from_millis(2000) =>
+            {
+                debug!("gateway: reusing cached ticker snapshot for {}", cache_key);
+                return Some(val.clone());
+            }
+            Some(TickerCacheState::InFlight(rx)) => {
+                debug!("gateway: awaiting in-flight ticker snapshot for {}", cache_key);
+                (None, rx.clone())
+            }
+            _ => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                guard.insert(cache_key.clone(), TickerCacheState::InFlight(rx.clone()));
+                (Some(tx), rx)
+            }
+        }
+    };
+
+    if let Some(tx) = tx_to_fetch {
+        let url = config.ticker_snapshot_url(module);
+        let token = crate::data::session_store::load_session()
+            .ok()
+            .flatten()
+            .map(|s| s.access_token)
+            .or_else(|| config.access_token.clone());
+        let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+
+        let fetch_res = match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let val = resp.json::<serde_json::Value>().await.ok();
+                if let Some(ref v) = val {
+                    if v.get("error").and_then(|e| e.as_str()) == Some("insufficient_credits") {
+                        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("Not enough credits");
+                        let balance = v.get("balance").and_then(|b| b.as_i64()).unwrap_or(0);
+                        let required = v.get("required").and_then(|r| r.as_i64()).unwrap_or(0);
+                        crate::data::credits::CreditStore::record(
+                            module,
+                            msg,
+                            balance,
+                            required,
+                            Some(&config.rest_base_url),
+                        );
+                    }
+                }
+                val
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let val: serde_json::Value = resp.json().await.unwrap_or_default();
+                if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+                    let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+                    let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+                    crate::data::credits::CreditStore::record(
+                        module,
+                        msg,
+                        balance,
+                        required,
+                        Some(&config.rest_base_url),
+                    );
+                    warn!("gateway: ticker bootstrap returned 402 (insufficient credits) for {module}: {msg}");
+                } else {
+                    warn!("gateway: ticker bootstrap returned HTTP {}", status);
+                }
+                None
+            }
+            Err(e) => {
+                warn!("gateway: ticker bootstrap failed: {}", e);
+                None
+            }
+        };
+
+        {
+            let mut guard = cache.lock().unwrap();
+            if let Some(ref val) = fetch_res {
+                guard.insert(
+                    cache_key,
+                    TickerCacheState::Ready(Instant::now(), val.clone()),
+                );
+            } else {
+                guard.remove(&cache_key);
+            }
+        }
+        let _ = tx.send(fetch_res.clone());
+        return fetch_res;
+    }
+
+    if rx.changed().await.is_ok() {
+        rx.borrow().clone()
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -111,18 +231,22 @@ impl BridgeConfig {
         Self::default_dev(exchange, symbol)
     }
 
-    /// CoinWatch market stream endpoint. Override only for local gateway work.
+    /// Gateway market stream endpoint. Override only for local gateway work.
     pub fn ws_url(&self) -> String {
         std::env::var("FINTER_WS_URL").unwrap_or_else(|_| {
             let base = self.rest_base_url.trim_end_matches('/');
-            if base.contains("coinwat.ch") {
+            if base.is_empty() {
+                String::new()
+            } else if base.contains("coinwat.ch") {
                 "wss://ws.coinwat.ch/ws".to_string()
             } else if let Some(origin) = base.strip_prefix("https://") {
                 format!("wss://{origin}/ws")
             } else if let Some(origin) = base.strip_prefix("http://") {
                 format!("ws://{origin}/ws")
+            } else if base.contains("://") {
+                format!("{base}/ws")
             } else {
-                "wss://ws.coinwat.ch/ws".to_string()
+                format!("wss://{base}/ws")
             }
         })
     }
@@ -200,6 +324,8 @@ pub struct Bridge {
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
     last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_orderbook: Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
     cancel_token: CancellationToken,
     _supervisor: JoinHandle<()>,
 }
@@ -223,6 +349,10 @@ impl Bridge {
         let cancel_token = CancellationToken::new();
         let last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let last_orderbook: Arc<std::sync::Mutex<Option<Arc<OrderBook>>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
         let tick_tx = tick_sender.clone();
         let trade_tx = trade_sender.clone();
@@ -230,9 +360,22 @@ impl Bridge {
         let ohlcv_tx = ohlcv_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
+        let tick_cache = Arc::clone(&last_tick);
+        let ob_cache = Arc::clone(&last_orderbook);
 
         let supervisor = tokio_runtime().spawn(async move {
-            supervision_loop(config, tick_tx, trade_tx, ob_tx, ohlcv_tx, token, history_cache).await;
+            supervision_loop(
+                config,
+                tick_tx,
+                trade_tx,
+                ob_tx,
+                ohlcv_tx,
+                token,
+                history_cache,
+                tick_cache,
+                ob_cache,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -241,14 +384,28 @@ impl Bridge {
             ob_sender,
             ohlcv_sender,
             last_ohlcv_history,
+            last_tick,
+            last_orderbook,
             cancel_token,
             _supervisor: supervisor,
         })
     }
 
     /// Subscribe to the trade tick stream.
+    ///
+    /// If a tick (e.g. from ticker snapshot) is already cached, it is replayed
+    /// immediately so new subscribers do not miss the initial price.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<UnifiedTick>> {
-        self.tick_sender.subscribe()
+        let rx = self.tick_sender.subscribe();
+        if let Some(tick) = self.last_tick.lock().unwrap().clone() {
+            let _ = self.tick_sender.send(tick);
+        }
+        rx
+    }
+
+    /// Return the most recently cached tick, if any.
+    pub fn latest_tick(&self) -> Option<Arc<UnifiedTick>> {
+        self.last_tick.lock().unwrap().clone()
     }
 
     /// Subscribe to actual executed market trades stream.
@@ -257,8 +414,19 @@ impl Bridge {
     }
 
     /// Subscribe to the order book snapshot stream.
+    ///
+    /// If an order book snapshot is already cached, it is replayed immediately.
     pub fn subscribe_orderbook(&self) -> broadcast::Receiver<Arc<OrderBook>> {
-        self.ob_sender.subscribe()
+        let rx = self.ob_sender.subscribe();
+        if let Some(book) = self.last_orderbook.lock().unwrap().clone() {
+            let _ = self.ob_sender.send(book);
+        }
+        rx
+    }
+
+    /// Return the most recently cached orderbook, if any.
+    pub fn latest_orderbook(&self) -> Option<Arc<OrderBook>> {
+        self.last_orderbook.lock().unwrap().clone()
     }
 
     /// Subscribe to the OHLCV candle stream.
@@ -286,6 +454,11 @@ impl Bridge {
     pub fn subscriber_count(&self) -> usize {
         self.tick_sender.receiver_count()
     }
+
+    /// Check if this bridge's module (or general market-data requests) has run out of credits.
+    pub fn credit_error(&self, module: &str) -> Option<crate::data::credits::CreditExhaustedInfo> {
+        crate::data::credits::CreditStore::module_error(module)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +473,8 @@ async fn supervision_loop(
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_ob_cache: Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
     let mut initial_snapshot_done = false;
     loop {
@@ -308,9 +483,19 @@ async fn supervision_loop(
             return;
         }
 
+        let ws_url = config.ws_url();
+        if ws_url.trim().is_empty() {
+            warn!("gateway: no API service URL configured — streaming disabled");
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(RECONNECT_DELAY_MS)) => {}
+                _ = cancel_token.cancelled() => { return; }
+            }
+            continue;
+        }
+
         info!(
             "gateway: connecting to {} ({} {})",
-            config.ws_url(),
+            ws_url,
             config.exchange,
             config.symbol
         );
@@ -323,6 +508,8 @@ async fn supervision_loop(
             &ohlcv_tx,
             &cancel_token,
             &history_cache,
+            &last_tick_cache,
+            &last_ob_cache,
             !initial_snapshot_done,
         )
         .await
@@ -447,6 +634,8 @@ async fn connect_and_stream(
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
     should_fetch_initial_snapshot: bool,
 ) -> anyhow::Result<()> {
     // Only chart and ticker panes ask CoinWatch for an OHLCV REST snapshot.
@@ -479,27 +668,25 @@ async fn connect_and_stream(
         if let Some((channel, limit, module)) = config.snapshot {
             match channel {
             "ticker" => {
-                let url = config.ticker_snapshot_url(module);
-                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
-                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
-                if let Some(t) = token { req = req.bearer_auth(t); }
-                // A failed bootstrap is intentionally non-fatal: the live WS ticker
-                // subscription below remains the source of subsequent updates.
-                if let Ok(resp) = req.send().await {
-                    if resp.status().is_success() {
-                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                            let envelope = serde_json::json!({
-                                "type": "data",
-                                "channel": "ticker",
-                                "exchange": config.exchange,
-                                "symbol": config.symbol,
-                                "data": data,
-                            });
-                            handle_message(&envelope.to_string(), config, tick_tx, trade_tx, ob_tx, ohlcv_tx, history_cache);
-                        }
-                    } else {
-                        warn!("gateway: ticker bootstrap returned HTTP {}", resp.status());
-                    }
+                if let Some(data) = fetch_ticker_snapshot(config, module).await {
+                    let envelope = serde_json::json!({
+                        "type": "data",
+                        "channel": "ticker",
+                        "exchange": config.exchange,
+                        "symbol": config.symbol,
+                        "data": data,
+                    });
+                    handle_message(
+                        &envelope.to_string(),
+                        config,
+                        tick_tx,
+                        trade_tx,
+                        ob_tx,
+                        ohlcv_tx,
+                        history_cache,
+                        last_tick_cache,
+                        last_ob_cache,
+                    );
                 }
             }
             "orderbook" => {
@@ -514,27 +701,51 @@ async fn connect_and_stream(
                 let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
                 if let Some(t) = token { req = req.bearer_auth(t); }
                 if let Ok(resp) = req.send().await {
+                    let status = resp.status();
                     if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        let bids = val.get("bids").and_then(|v| v.as_array()).map(|arr| {
-                            arr.iter().filter_map(|row| {
-                                let r = row.as_array()?;
-                                Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
-                            }).collect()
-                        }).unwrap_or_default();
-                        let asks = val.get("asks").and_then(|v| v.as_array()).map(|arr| {
-                            arr.iter().filter_map(|row| {
-                                let r = row.as_array()?;
-                                Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
-                            }).collect()
-                        }).unwrap_or_default();
-                        let book = Arc::new(OrderBook::new(
-                            config.exchange.clone(),
-                            config.symbol.clone(),
-                            bids,
-                            asks,
-                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
-                        ));
-                        let _ = ob_tx.send(book);
+                        if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+                            let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+                            let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+                            crate::data::credits::CreditStore::record(
+                                "OrderBook",
+                                msg,
+                                balance,
+                                required,
+                                Some(&config.rest_base_url),
+                            );
+                        } else {
+                            let bids = val.get("bids").and_then(|v| v.as_array()).map(|arr| {
+                                arr.iter().filter_map(|row| {
+                                    let r = row.as_array()?;
+                                    Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
+                                }).collect()
+                            }).unwrap_or_default();
+                            let asks = val.get("asks").and_then(|v| v.as_array()).map(|arr| {
+                                arr.iter().filter_map(|row| {
+                                    let r = row.as_array()?;
+                                    Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
+                                }).collect()
+                            }).unwrap_or_default();
+                            let book = Arc::new(OrderBook::new(
+                                config.exchange.clone(),
+                                config.symbol.clone(),
+                                bids,
+                                asks,
+                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
+                            ));
+                            if let Ok(mut cache) = last_ob_cache.lock() {
+                                *cache = Some(Arc::clone(&book));
+                            }
+                            if let Some(mid) = book.mid_price() {
+                                if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                                    if store.get_mark_price(&config.symbol).is_none() {
+                                        store.set_mark_price(&config.symbol, mid);
+                                    }
+                                }
+                            }
+                            let _ = ob_tx.send(book);
+                        }
                     }
                 }
             }
@@ -550,19 +761,36 @@ async fn connect_and_stream(
                 let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
                 if let Some(t) = token { req = req.bearer_auth(t); }
                 if let Ok(resp) = req.send().await {
+                    let status = resp.status();
                     if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        let trades = val.get("trades").and_then(|v| v.as_array()).or_else(|| val.as_array());
-                        if let Some(arr) = trades {
-                            for item in arr.iter().rev() {
-                                if let (Some(p), Some(a)) = (
-                                    item.get("price").and_then(|v| v.as_f64()),
-                                    item.get("amount").and_then(|v| v.as_f64()),
-                                ) {
-                                    let raw_side = item.get("side").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                    let side = if raw_side.contains("buy") { TradeSide::Buy } else if raw_side.contains("sell") { TradeSide::Sell } else { TradeSide::Unknown };
-                                    let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    let tick = UnifiedTick::new(&config.exchange, &config.symbol, p, a, side, ts);
-                                    let _ = trade_tx.send(Arc::new(tick));
+                        if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+                            let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+                            let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+                            crate::data::credits::CreditStore::record(
+                                "Trades",
+                                msg,
+                                balance,
+                                required,
+                                Some(&config.rest_base_url),
+                            );
+                        } else {
+                            let trades = val.get("trades").and_then(|v| v.as_array()).or_else(|| val.as_array());
+                            if let Some(arr) = trades {
+                                for item in arr.iter().rev() {
+                                    if let (Some(p), Some(a)) = (
+                                        item.get("price").and_then(|v| v.as_f64()),
+                                        item.get("amount").and_then(|v| v.as_f64()),
+                                    ) {
+                                        let raw_side = item.get("side").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        let side = if raw_side.contains("buy") { TradeSide::Buy } else if raw_side.contains("sell") { TradeSide::Sell } else { TradeSide::Unknown };
+                                        let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        let tick = UnifiedTick::new(&config.exchange, &config.symbol, p, a, side, ts);
+                                        if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                                            store.set_mark_price(&tick.symbol, tick.price);
+                                        }
+                                        let _ = trade_tx.send(Arc::new(tick));
+                                    }
                                 }
                             }
                         }
@@ -574,6 +802,9 @@ async fn connect_and_stream(
         }
     }
     let url = config.ws_url();
+    if url.trim().is_empty() {
+        anyhow::bail!("No API service URL configured");
+    }
     let (ws_stream, _) = connect_async(&url).await?;
     info!("gateway: WebSocket connected to {url}");
 
@@ -612,6 +843,15 @@ async fn connect_and_stream(
                             .or_else(|| ack.get("error"))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown error");
+                        if err_msg.to_lowercase().contains("credit") || err_msg.to_lowercase().contains("insufficient") {
+                            crate::data::credits::CreditStore::record(
+                                "Stream",
+                                err_msg,
+                                0,
+                                1,
+                                Some(&config.rest_base_url),
+                            );
+                        }
                         anyhow::bail!("gateway subscription failed: {}", err_msg);
                     }
                 }
@@ -651,7 +891,17 @@ async fn connect_and_stream(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(&text, config, tick_tx, trade_tx, ob_tx, ohlcv_tx, history_cache);
+                        handle_message(
+                            &text,
+                            config,
+                            tick_tx,
+                            trade_tx,
+                            ob_tx,
+                            ohlcv_tx,
+                            history_cache,
+                            last_tick_cache,
+                            last_ob_cache,
+                        );
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("gateway: received close frame");
@@ -687,6 +937,8 @@ fn handle_message(
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
     let msg: GatewayMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -709,6 +961,15 @@ fn handle_message(
 
     if msg.msg_type.as_deref() == Some("error") {
         if let Some(m) = &msg.message {
+            if m.to_lowercase().contains("credit") || m.to_lowercase().contains("insufficient") {
+                crate::data::credits::CreditStore::record(
+                    "Stream",
+                    m,
+                    0,
+                    1,
+                    Some(&config.rest_base_url),
+                );
+            }
             warn!("gateway: server error: {m}");
         }
         return;
@@ -796,7 +1057,14 @@ fn handle_message(
                 tick.open_24h = open_24h;
                 tick.high_24h = high_24h;
                 tick.low_24h = low_24h;
-                let _ = tick_tx.send(Arc::new(tick));
+                let arc_tick = Arc::new(tick);
+                if let Ok(mut cache) = last_tick_cache.lock() {
+                    *cache = Some(Arc::clone(&arc_tick));
+                }
+                if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                    store.set_mark_price(&arc_tick.symbol, arc_tick.price);
+                }
+                let _ = tick_tx.send(arc_tick);
             }
         }
 
@@ -835,15 +1103,14 @@ fn handle_message(
                     side,
                     ts,
                 ));
-
+                if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                    store.set_mark_price(&tick.symbol, tick.price);
+                }
                 let _ = trade_tx.send(tick);
             }
         }
 
         Some("orderbook") => {
-            if ob_tx.receiver_count() == 0 {
-                return;
-            }
             match serde_json::from_value::<GatewayOrderBook>(data) {
                 Ok(raw) => {
                     let bids = raw
@@ -864,7 +1131,20 @@ fn handle_message(
                     });
                     let exchange = msg.exchange.unwrap_or_else(|| config.exchange.clone());
                     let symbol = msg.symbol.unwrap_or_else(|| config.symbol.clone());
-                    let _ = ob_tx.send(Arc::new(OrderBook::new(exchange, symbol, bids, asks, ts)));
+                    let book = Arc::new(OrderBook::new(exchange, symbol, bids, asks, ts));
+                    if let Ok(mut cache) = last_ob_cache.lock() {
+                        *cache = Some(Arc::clone(&book));
+                    }
+                    if let Some(mid) = book.mid_price() {
+                        if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                            if store.get_mark_price(&book.symbol).is_none() {
+                                store.set_mark_price(&book.symbol, mid);
+                            }
+                        }
+                    }
+                    if ob_tx.receiver_count() > 0 {
+                        let _ = ob_tx.send(book);
+                    }
                 }
                 Err(e) => warn!("gateway: orderbook data parse error: {e}"),
             }
@@ -985,6 +1265,9 @@ fn parse_kline_payload(data: &serde_json::Value) -> Vec<OhlcvCandle> {
 // ---------------------------------------------------------------------------
 
 pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> anyhow::Result<Vec<OhlcvCandle>> {
+    if config.rest_base_url.trim().is_empty() {
+        anyhow::bail!("No API service URL configured");
+    }
     let url = config.ohlcv_history_url(until);
     // CoinWatch meters REST snapshots. Reuse immutable history briefly (and the
     // latest chart bootstrap longer) so reconnects or multiple panes do not
@@ -1021,15 +1304,36 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
         let status = response.status();
         let error: serde_json::Value = response.json().await.unwrap_or_default();
         let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Market data request failed");
-        if status.as_u16() == 402 {
+        if status.as_u16() == 402 || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+            let balance = error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+            let required = error.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+            crate::data::credits::CreditStore::record(
+                "Chart",
+                message,
+                balance,
+                required,
+                Some(&config.rest_base_url),
+            );
             anyhow::bail!("Insufficient credits: {} (balance {}, required {}). Manage credits at {}/account/credits", message,
-                error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0),
-                error.get("required").and_then(|v| v.as_i64()).unwrap_or(0), config.rest_base_url);
+                balance, required, config.rest_base_url);
         }
         anyhow::bail!("OHLCV history fetch failed: HTTP {}: {}", status, message);
     }
 
     let value: serde_json::Value = response.json().await?;
+    if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+        let balance = value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+        let required = value.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+        crate::data::credits::CreditStore::record(
+            "Chart",
+            message,
+            balance,
+            required,
+            Some(&config.rest_base_url),
+        );
+        anyhow::bail!("Insufficient credits: {}", message);
+    }
     let mut candles = Vec::new();
 
     // 1. Try { klines: [{ t, o, h, l, c, v }, ...] }
@@ -1146,6 +1450,13 @@ mod tests {
     }
 
     #[test]
+    fn ws_url_empty_when_no_base() {
+        let mut cfg = base_cfg();
+        cfg.rest_base_url = String::new();
+        assert_eq!(cfg.ws_url(), "");
+    }
+
+    #[test]
     fn ws_url_works_with_http_scheme() {
         let mut cfg = base_cfg();
         cfg.rest_base_url = "http://localhost:3000".to_string();
@@ -1196,8 +1507,10 @@ mod tests {
         let (books, _) = broadcast::channel(8);
         let (candles, _) = broadcast::channel(8);
         let cache = Arc::new(std::sync::Mutex::new(None));
+        let last_tick_cache = Arc::new(std::sync::Mutex::new(None));
+        let last_ob_cache = Arc::new(std::sync::Mutex::new(None));
         let cancel = CancellationToken::new();
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, true).await;
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, true).await;
         server.await.unwrap();
         let tick = rx.try_recv().expect("REST response must seed the watchlist feed");
         assert_eq!(tick.price, 110.0);
@@ -1206,7 +1519,7 @@ mod tests {
         assert_eq!(tick.low_24h, Some(90.0));
         assert_eq!(tick.quote_volume_24h, Some(1234.0));
         assert_eq!(tick.change_24h_percent, Some(10.0));
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, false).await;
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, false).await;
         assert!(rx.try_recv().is_err());
     }
 
@@ -1235,8 +1548,10 @@ mod tests {
         let (books, _) = broadcast::channel(8);
         let (candles, _) = broadcast::channel(8);
         let cache = Arc::new(std::sync::Mutex::new(None));
+        let last_tick_cache = Arc::new(std::sync::Mutex::new(None));
+        let last_ob_cache = Arc::new(std::sync::Mutex::new(None));
         let cancel = CancellationToken::new();
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, true).await;
+        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, true).await;
         server.await.unwrap();
         // Since REST returned 500, no tick was seeded from REST, but connect_and_stream finished without panicking
         assert!(rx.try_recv().is_err());
@@ -1330,5 +1645,99 @@ mod tests {
         let msg: GatewayMessage = serde_json::from_str(json).expect("parse with both data and payload");
         assert_eq!(msg.channel.as_deref(), Some("ticker"));
         assert!(msg.data.is_some());
+    }
+
+    #[test]
+    fn last_tick_and_orderbook_replay_on_subscribe() {
+        let (tick_tx, _) = broadcast::channel(16);
+        let (trade_tx, _) = broadcast::channel(16);
+        let (ob_tx, _) = broadcast::channel(16);
+        let (ohlcv_tx, _) = broadcast::channel(16);
+
+        let cached_tick = Arc::new(UnifiedTick::new("binance", "BTC/USDT", 68500.0, 1.0, TradeSide::Buy, 1000));
+        let cached_book = Arc::new(OrderBook::new(
+            "binance".to_string(),
+            "BTC/USDT".to_string(),
+            vec![PriceLevel::new(68490.0, 1.0)],
+            vec![PriceLevel::new(68510.0, 1.0)],
+            1000,
+        ));
+
+        let bridge = Bridge {
+            tick_sender: tick_tx,
+            trade_sender: trade_tx,
+            ob_sender: ob_tx,
+            ohlcv_sender: ohlcv_tx,
+            last_ohlcv_history: Arc::new(std::sync::Mutex::new(None)),
+            last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
+            last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),
+            cancel_token: CancellationToken::new(),
+            _supervisor_handle: tokio::spawn(async {}),
+        };
+
+        // When a subscriber attaches after bridge startup, cached tick is replayed immediately
+        let mut tick_rx = bridge.subscribe();
+        let replayed_tick = tick_rx.try_recv().expect("cached tick must be replayed");
+        assert_eq!(replayed_tick.price, 68500.0);
+
+        // When an orderbook subscriber attaches, cached orderbook is replayed immediately
+        let mut ob_rx = bridge.subscribe_orderbook();
+        let replayed_book = ob_rx.try_recv().expect("cached orderbook must be replayed");
+        assert_eq!(replayed_book.mid_price(), Some(68500.0));
+    }
+
+    #[tokio::test]
+    async fn ticker_request_coalescing_deduplicates_concurrent_fetches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        static REQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+        REQ_COUNT.store(0, Ordering::SeqCst);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n > 0 {
+                    REQ_COUNT.fetch_add(1, Ordering::SeqCst);
+                    // Add a tiny delay to ensure both callers hit the in-flight window
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let body = r#"{"last":69000,"open":68000,"high":70000,"low":67000,"quoteVolume":500000,"percentage":1.47}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let mut cfg1 = base_cfg();
+        cfg1.rest_base_url = format!("http://127.0.0.1:{port}");
+        cfg1.symbol = "COALESCE/USDT".to_string();
+
+        let mut cfg2 = cfg1.clone();
+
+        // Spawn two concurrent requests for the same symbol/exchange
+        let handle1 = tokio::spawn(async move {
+            fetch_ticker_snapshot(&cfg1, "Chart").await
+        });
+        let handle2 = tokio::spawn(async move {
+            fetch_ticker_snapshot(&cfg2, "Execution").await
+        });
+
+        let res1 = handle1.await.unwrap();
+        let res2 = handle2.await.unwrap();
+
+        assert!(res1.is_some());
+        assert!(res2.is_some());
+        assert_eq!(res1.unwrap().price, 69000.0);
+        assert_eq!(res2.unwrap().price, 69000.0);
+
+        // Only 1 outbound HTTP request was made because in-flight coalescing deduplicated them
+        assert_eq!(REQ_COUNT.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

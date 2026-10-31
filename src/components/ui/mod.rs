@@ -1,6 +1,7 @@
 pub mod avatar;
 pub mod clock_panel;
 pub mod chart_panel;
+pub mod credit_alert;
 pub mod dashboard_manager;
 pub mod delete_dashboard_dialog;
 pub mod agent_panel;

@@ -42,12 +42,11 @@ cargo run --release
 
 ## Connecting to a Backend API (Optional)
 
-FinTer is **local-first by default**: it runs offline in Guest Mode with local workspace and chart layout persistence, requiring no account or server.
+FinTer is **local-first by default**: it runs offline in Guest Mode with local workspace and chart layout persistence, requiring no account or server. There is no pre-configured default API endpoint. If no endpoint is configured or market data cannot be fetched, guest sessions clearly display informative notifications and empty states across panels.
 
-By default, the backend API endpoint is configured to `https://coinwat.ch`:
-- **Default Hosted Service**: `https://coinwat.ch` (market gateway and cloud account sync).
-- **Via In-App Settings**: Go to **Settings → Network & Server**, and customize your API Server URL (e.g. `http://localhost:5173` for local development with your `coinwatch` backend).
-- **Via Environment Variable**: Override `FINTER_API_URL` before launching:
+To connect to a custom backend or market gateway:
+- **Via In-App Settings**: Go to **Settings → Network & Server**, and configure your API Server URL (e.g. `http://localhost:5173` for local development).
+- **Via Environment Variable**: Set `FINTER_API_URL` before launching:
   ```sh
   FINTER_API_URL="http://localhost:5173" cargo run
   ```

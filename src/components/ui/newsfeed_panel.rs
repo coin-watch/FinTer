@@ -30,6 +30,9 @@ fn articles_url() -> String {
         }
     }
     let base = crate::data::client::service_base_url();
+    if base.trim().is_empty() {
+        return String::new();
+    }
     format!("{base}/api/newsfeed/articles?limit={LIMIT}")
 }
 
@@ -37,7 +40,19 @@ fn news_ws_url() -> String {
     std::env::var("FINTER_NEWS_WS_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or_else(|| "wss://newsfeed.coinwat.ch/ws".to_string())
+        .unwrap_or_else(|| {
+            let base = crate::data::client::service_base_url();
+            let base = base.trim_end_matches('/');
+            if base.is_empty() {
+                String::new()
+            } else if let Some(origin) = base.strip_prefix("https://") {
+                format!("wss://{origin}/ws")
+            } else if let Some(origin) = base.strip_prefix("http://") {
+                format!("ws://{origin}/ws")
+            } else {
+                format!("wss://{base}/ws")
+            }
+        })
 }
 
 #[derive(Clone, Debug, Deserialize, serde::Serialize)]
@@ -96,10 +111,14 @@ impl NewsfeedPanel {
     pub fn new(pane_id: String, priority: String, filter: String, cx: &mut Context<Self>) -> Self {
         // Coalesce external updates; weak access ends the task on panel close.
         cx.spawn(async move |this, cx| {
+            let mut last_credit_rev = u64::MAX;
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 if this.update(cx, |panel, cx| {
-                    if panel.pump() { cx.notify(); }
+                    let credit_rev = crate::data::credits::CreditStore::revision();
+                    let credit_changed = credit_rev != last_credit_rev;
+                    last_credit_rev = credit_rev;
+                    if panel.pump() || credit_changed { cx.notify(); }
                 }).is_err() { break; }
             }
         }).detach();
@@ -220,6 +239,10 @@ impl NewsfeedPanel {
 
 async fn run_feed(tx: mpsc::Sender<FeedEvent>, priority: String, filter: String) {
     let url = articles_url();
+    if url.is_empty() {
+        let _ = tx.send(FeedEvent::Error).await;
+        return;
+    }
     let client = reqwest::Client::builder()
         .user_agent("FinTer Native")
         .build()
@@ -243,57 +266,20 @@ async fn run_feed(tx: mpsc::Sender<FeedEvent>, priority: String, filter: String)
                 }
             },
             Err(e) => {
-                tracing::warn!("Failed to fetch newsfeed from primary endpoint: {e}");
-                // Fallback attempt: try direct upstream newsfeed.coinwat.ch with secret API key
-                let fallback_url = format!("https://newsfeed.coinwat.ch/api/articles?limit={LIMIT}");
-                let mut fb_req = client.get(&fallback_url).header("X-API-Key", "secret");
-                if priority != "latest" {
-                    fb_req = fb_req.query(&[("category", priority.as_str())]);
-                }
-                if !filter.is_empty() {
-                    fb_req = fb_req.query(&[("query", filter.as_str())]);
-                }
-                let mut loaded = false;
-                if let Ok(resp) = fb_req.send().await {
-                    if let Ok(resp) = resp.error_for_status() {
-                        if let Ok(payload) = resp.json::<ArticlesResponse>().await {
-                            let _ = tx.send(FeedEvent::Loaded(payload.articles)).await;
-                            loaded = true;
-                        }
-                    }
-                }
-                if !loaded {
-                    let _ = tx.send(FeedEvent::Error).await;
-                }
+                tracing::warn!("Failed to fetch newsfeed from endpoint: {e}");
+                let _ = tx.send(FeedEvent::Error).await;
             }
         },
         Err(e) => {
             tracing::warn!("Failed to connect to newsfeed endpoint: {e}");
-            // Fallback attempt
-            let fallback_url = format!("https://newsfeed.coinwat.ch/api/articles?limit={LIMIT}");
-            let mut fb_req = client.get(&fallback_url).header("X-API-Key", "secret");
-            if priority != "latest" {
-                fb_req = fb_req.query(&[("category", priority.as_str())]);
-            }
-            if !filter.is_empty() {
-                fb_req = fb_req.query(&[("query", filter.as_str())]);
-            }
-            let mut loaded = false;
-            if let Ok(resp) = fb_req.send().await {
-                if let Ok(resp) = resp.error_for_status() {
-                    if let Ok(payload) = resp.json::<ArticlesResponse>().await {
-                        let _ = tx.send(FeedEvent::Loaded(payload.articles)).await;
-                        loaded = true;
-                    }
-                }
-            }
-            if !loaded {
-                let _ = tx.send(FeedEvent::Error).await;
-            }
+            let _ = tx.send(FeedEvent::Error).await;
         }
     }
 
     let ws_url = news_ws_url();
+    if ws_url.is_empty() {
+        return;
+    }
     loop {
         match connect_async(&ws_url).await {
             Ok((socket, _)) => {
@@ -402,12 +388,28 @@ impl Render for NewsfeedPanel {
         self.pump();
 
         let colors = &cx.theme().colors;
+        let is_narrow = self.width < 340.0;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("Newsfeed");
+        if let Some(ref ce) = credit_error {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .bg(colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Newsfeed",
+                    Some(ce),
+                    is_narrow,
+                    cx.theme(),
+                ));
+        }
+
         let input = self.filter_input.as_ref().unwrap().clone();
         let status = if self.connected { "LIVE WIRE" } else { "CONNECTING" };
         let status_color = if self.connected { colors.primary } else { colors.muted_foreground };
         let priority = self.priority.clone();
         let pane_id = self.pane_id.clone();
-        let is_narrow = self.width < 340.0;
         let is_compact_row = self.width < 320.0;
         let header = div()
             .w_full()
@@ -518,7 +520,9 @@ impl Render for NewsfeedPanel {
 
         let mut state_id = 0;
 
-        let body = if self.loading {
+        let has_api = crate::data::client::is_api_url_configured();
+
+        let body = if self.loading && has_api {
             div()
                 .w_full()
                 .flex_1()
@@ -530,17 +534,33 @@ impl Render for NewsfeedPanel {
                 .text_color(colors.muted_foreground)
                 .child("Loading headlines")
                 .into_any_element()
-        } else if self.failed {
+        } else if self.failed || !has_api {
             div()
                 .w_full()
                 .flex_1()
                 .min_h_0()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
-                .text_sm()
-                .text_color(colors.muted_foreground)
-                .child("Unable to load headlines")
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(colors.muted_foreground)
+                        .child(if has_api { "Unable to load headlines" } else { "No data fetched" }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted_foreground.opacity(0.6))
+                        .child(if has_api {
+                            "Failed to fetch headlines from news feed"
+                        } else {
+                            "Guest session: configure API URL in Settings to stream news"
+                        }),
+                )
                 .into_any_element()
         } else if self.articles.is_empty() {
             div()

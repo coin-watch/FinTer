@@ -65,6 +65,8 @@ struct RegistryInner {
     /// True once the CoinWatch exchange request has completed successfully.
     exchanges_loaded: bool,
     exchanges_fetch_in_flight: bool,
+    /// True if the last fetch attempt failed or no endpoint was configured.
+    fetch_failed: bool,
     /// exchange_id → list of symbol strings
     symbols: HashMap<String, Vec<String>>,
     /// exchange_id → list of rich SymbolInfo
@@ -123,6 +125,18 @@ impl GatewayRegistry {
         } else {
             None
         }
+    }
+
+    /// Returns true if the exchanges fetch attempt failed or could not run.
+    pub fn fetch_failed(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.fetch_failed
+    }
+
+    /// Returns true if exchanges were successfully loaded from the API.
+    pub fn is_loaded(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.exchanges_loaded
     }
 
     /// Returns the full exchange metadata list.
@@ -311,8 +325,14 @@ impl GatewayRegistry {
 
 async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) {
     let base = gateway_base();
+    if base.trim().is_empty() {
+        let mut guard = inner.lock().unwrap();
+        guard.exchanges_fetch_in_flight = false;
+        guard.fetch_failed = true;
+        return;
+    }
     let url = format!("{base}/api/v1/exchanges");
-    info!("GatewayRegistry: fetching exchanges from CoinWatch API: {url}");
+    info!("GatewayRegistry: fetching exchanges from API: {url}");
 
     let client = reqwest::Client::new();
     let mut req = client
@@ -338,18 +358,37 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) 
                         guard.exchanges = ids;
                         guard.exchange_infos = infos;
                         guard.exchanges_loaded = true;
+                        guard.fetch_failed = false;
                         guard.exchanges_fetch_in_flight = false;
                     }
-                    Err(e) => error!("GatewayRegistry: exchanges parse error: {e}"),
+                    Err(e) => {
+                        error!("GatewayRegistry: exchanges parse error: {e}");
+                        inner.lock().unwrap().fetch_failed = true;
+                    }
                 },
-                Err(e) => error!("GatewayRegistry: failed to read exchanges response: {e}"),
+                Err(e) => {
+                    error!("GatewayRegistry: failed to read exchanges response: {e}");
+                    inner.lock().unwrap().fetch_failed = true;
+                }
             }
         }
         Ok(resp) => {
-            error!("GatewayRegistry: exchanges HTTP {}", resp.status());
+            let status = resp.status();
+            if status.as_u16() == 402 {
+                crate::data::credits::CreditStore::record(
+                    "Exchanges",
+                    "Not enough credits for market data catalog",
+                    0,
+                    1,
+                    Some(&base),
+                );
+            }
+            error!("GatewayRegistry: exchanges HTTP {}", status);
+            inner.lock().unwrap().fetch_failed = true;
         }
         Err(e) => {
             error!("GatewayRegistry: exchanges fetch error: {e}");
+            inner.lock().unwrap().fetch_failed = true;
         }
     }
     // Permit a later caller to retry after any unsuccessful response or parse failure.
@@ -359,9 +398,15 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) 
 async fn fetch_symbols(inner: Arc<Mutex<RegistryInner>>, exchange: &str, token: Option<&str>) {
     let base = gateway_base();
     let lower_exchange = exchange.trim().to_lowercase();
+    if base.trim().is_empty() {
+        let mut guard = inner.lock().unwrap();
+        guard.symbol_fetches_in_flight.remove(exchange);
+        guard.symbol_fetches_in_flight.remove(&lower_exchange);
+        return;
+    }
     let encoded_exchange = urlencoding::encode(&lower_exchange);
     let url = format!("{base}/api/v1/symbols?exchange={encoded_exchange}");
-    info!("GatewayRegistry: fetching symbols for {exchange} from CoinWatch API: {url}");
+    info!("GatewayRegistry: fetching symbols for {exchange} from API: {url}");
 
     let client = reqwest::Client::new();
     let mut req = client
@@ -407,7 +452,17 @@ async fn fetch_symbols(inner: Arc<Mutex<RegistryInner>>, exchange: &str, token: 
             }
         }
         Ok(resp) => {
-            error!("GatewayRegistry: symbols HTTP {} for {exchange}", resp.status());
+            let status = resp.status();
+            if status.as_u16() == 402 {
+                crate::data::credits::CreditStore::record(
+                    "Watchlist",
+                    "Not enough credits for symbol catalog",
+                    0,
+                    1,
+                    Some(&base),
+                );
+            }
+            error!("GatewayRegistry: symbols HTTP {} for {exchange}", status);
             let mut guard = inner.lock().unwrap();
             guard.symbol_fetches_in_flight.remove(exchange);
             guard.symbol_fetches_in_flight.remove(&lower_exchange);

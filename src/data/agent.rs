@@ -305,6 +305,20 @@ pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Resu
     let status = response.status();
     if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
+        let is_credits_error = status.as_u16() == 402
+            || (status.as_u16() == 429 && (err_text.to_lowercase().contains("quota") || err_text.to_lowercase().contains("credit")))
+            || err_text.to_lowercase().contains("insufficient_quota")
+            || err_text.to_lowercase().contains("insufficient_credits");
+
+        if is_credits_error {
+            crate::data::credits::CreditStore::record(
+                "AI Agent",
+                &format!("AI request failed: insufficient credits or quota ({status})"),
+                0,
+                0,
+                None,
+            );
+        }
         return Err(anyhow!("AI request failed ({status}): {err_text}"));
     }
 

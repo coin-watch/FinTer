@@ -4,6 +4,7 @@ pub mod auth;
 pub mod bridge;
 pub mod candle_feed;
 pub mod client;
+pub mod credits;
 pub mod dashboard_store;
 pub mod error;
 pub mod exchanges;

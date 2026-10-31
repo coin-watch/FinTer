@@ -35,10 +35,14 @@ impl TickerPanel {
     pub fn new(exchange: &str, symbol: &str, cx: &mut Context<Self>) -> Self {
         // Coalesce external updates; weak access ends the task on panel close.
         cx.spawn(async move |this, cx| {
+            let mut last_credit_rev = u64::MAX;
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 if this.update(cx, |panel, cx| {
-                    if panel.pump_events() { cx.notify(); }
+                    let credit_rev = crate::data::credits::CreditStore::revision();
+                    let credit_changed = credit_rev != last_credit_rev;
+                    last_credit_rev = credit_rev;
+                    if panel.pump_events() || credit_changed { cx.notify(); }
                 }).is_err() { break; }
             }
         }).detach();
@@ -52,6 +56,7 @@ impl TickerPanel {
         // The explicit task below owns this snapshot; do not fetch it again as
         // a side effect of starting the ticker's WebSocket bridge.
         config.fetch_history = false;
+        config.snapshot = Some(("ticker", 0, "Ticker"));
         if let Ok(Some(session)) = crate::data::session_store::load_session() {
             config.access_token = Some(session.access_token);
         }
@@ -62,6 +67,26 @@ impl TickerPanel {
         // price jump back and forth (which looked like a WebSocket flicker).
         let bridge = Arc::new(Bridge::start(config.clone()).expect("failed to start bridge for ticker"));
         let tick_rx = bridge.subscribe();
+
+        let initial_mark = crate::data::trade_store::TradeStore::global()
+            .lock()
+            .ok()
+            .and_then(|ts| ts.get_mark_price(symbol));
+        let initial_tick = initial_mark.map(|p| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Arc::new(UnifiedTick::new(
+                exchange,
+                symbol,
+                p,
+                0.0,
+                crate::data::tick::TradeSide::Unknown,
+                ts,
+            ))
+        });
+        let is_loading = initial_tick.is_none();
 
         // One-time fetch of 1h historical chart data for sparkline, plus a 24h periodic refresh
         let (history_tx, history_rx) = tokio::sync::mpsc::channel(1);
@@ -82,10 +107,10 @@ impl TickerPanel {
             symbol: symbol.to_string(),
             _bridge: bridge,
             tick_rx,
-            latest_tick: None,
+            latest_tick: initial_tick,
             price_history: Vec::with_capacity(168),
             history_rx: Some(history_rx),
-            is_loading: true,
+            is_loading,
             width: 300.0,
             height: 180.0,
         }
@@ -127,6 +152,9 @@ impl TickerPanel {
             match self.tick_rx.try_recv() {
                 Ok(tick) => {
                     changed |= self.latest_tick.as_ref().is_none_or(|last| !Arc::ptr_eq(last, &tick));
+                    if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                        store.set_mark_price(&self.symbol, tick.price);
+                    }
                     self.latest_tick = Some(tick);
                     self.is_loading = false;
                 }
@@ -142,22 +170,49 @@ impl Render for TickerPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.pump_events();
 
-
-
         let colors = &cx.theme().colors;
 
+        let credit_error = crate::data::credits::CreditStore::module_error("Ticker");
+        if let Some(ref ce) = credit_error {
+            let is_compact = self.height < 95.0;
+            return div()
+                .size_full()
+                .bg(colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Ticker Feed",
+                    Some(ce),
+                    is_compact,
+                    cx.theme(),
+                ))
+                .into_any_element();
+        }
+
         if self.is_loading {
+            let has_api = crate::data::client::is_api_url_configured();
             return div()
                 .size_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap_1()
                 .bg(colors.background)
                 .child(
                     div()
                         .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(colors.muted_foreground)
-                        .child("Waiting for connection..."),
+                        .child(if has_api { "Waiting for connection..." } else { "No data fetched" }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted_foreground.opacity(0.6))
+                        .child(if has_api {
+                            "Streaming ticker"
+                        } else {
+                            "Guest session: configure API URL in Settings"
+                        }),
                 )
                 .into_any_element();
         }

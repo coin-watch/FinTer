@@ -34,6 +34,7 @@ pub enum SortColumn {
     Volume24h,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WatchlistFilter {
     All,
@@ -63,6 +64,38 @@ pub struct WatchlistEntry {
     pub sparkline: Vec<f64>,
 }
 
+impl WatchlistEntry {
+    /// Return the current effective mark price, checking TradeStore first and
+    /// falling back to initial_price.
+    pub fn effective_price(&self) -> f64 {
+        if let Ok(store) = crate::data::trade_store::TradeStore::global().lock() {
+            if let Some(mark) = store.get_mark_price(&self.symbol) {
+                if mark > 0.0 {
+                    return mark;
+                }
+            }
+        }
+        self.initial_price
+    }
+
+    /// Return the live 24h change percentage, falling back to computing it from
+    /// effective_price and open_24h if change_24h is None.
+    pub fn effective_change_24h(&self) -> Option<f64> {
+        if let Some(change) = self.change_24h {
+            return Some(change);
+        }
+        if let Some(open) = self.open_24h {
+            if open > 0.0 {
+                let price = self.effective_price();
+                if price > 0.0 {
+                    return Some(((price - open) / open) * 100.0);
+                }
+            }
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WatchlistPanel
 // ---------------------------------------------------------------------------
@@ -77,6 +110,7 @@ pub struct WatchlistPanel {
     search_input: Option<Entity<InputState>>,
     sort_column: SortColumn,
     sort_ascending: bool,
+    #[allow(dead_code)]
     filter: WatchlistFilter,
     favorites: HashSet<String>,
     last_catalog_refresh: Option<std::time::Instant>,
@@ -253,6 +287,11 @@ impl WatchlistPanel {
                 } else {
                     info.base.clone()
                 };
+                let initial_price = crate::data::trade_store::TradeStore::global()
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.get_mark_price(&info.symbol))
+                    .unwrap_or(0.0);
                 entries.push(WatchlistEntry {
                     symbol: info.symbol,
                     base: base.clone(),
@@ -260,14 +299,14 @@ impl WatchlistPanel {
                     exchange: exchange.clone(),
                     category: Self::category_for(&base),
                     quote: info.quote.clone(),
-                    initial_price: 0.0,
+                    initial_price,
                     open_24h: None,
                     high_24h: None,
                     low_24h: None,
                     change_24h: None,
                     volume_24h_usd: None,
                     feed: None,
-                    sparkline: Vec::new(),
+                    sparkline: if initial_price > 0.0 { vec![initial_price] } else { Vec::new() },
                 });
             }
         }
@@ -287,7 +326,19 @@ impl WatchlistPanel {
         for exchange in registry.exchanges() {
             for info in registry.symbol_infos(&exchange).into_iter().filter(|info| info.active) {
                 let key = (exchange.clone(), info.symbol.clone());
-                if let Some(entry) = existing.remove(&key) {
+                if let Some(mut entry) = existing.remove(&key) {
+                    if entry.initial_price <= 0.0 {
+                        if let Some(mark) = crate::data::trade_store::TradeStore::global()
+                            .lock()
+                            .ok()
+                            .and_then(|store| store.get_mark_price(&entry.symbol))
+                        {
+                            entry.initial_price = mark;
+                            if entry.sparkline.is_empty() {
+                                entry.sparkline.push(mark);
+                            }
+                        }
+                    }
                     refreshed.push(entry);
                     continue;
                 }
@@ -296,6 +347,11 @@ impl WatchlistPanel {
                 } else {
                     info.base
                 };
+                let initial_price = crate::data::trade_store::TradeStore::global()
+                    .lock()
+                    .ok()
+                    .and_then(|store| store.get_mark_price(&info.symbol))
+                    .unwrap_or(0.0);
                 refreshed.push(WatchlistEntry {
                     symbol: info.symbol,
                     base: base.clone(),
@@ -303,14 +359,14 @@ impl WatchlistPanel {
                     exchange: exchange.clone(),
                     category: Self::category_for(&base),
                     quote: if info.quote.is_empty() { info.quote_asset.unwrap_or_default() } else { info.quote },
-                    initial_price: 0.0,
+                    initial_price,
                     open_24h: None,
                     high_24h: None,
                     low_24h: None,
                     change_24h: None,
                     volume_24h_usd: None,
                     feed: None,
-                    sparkline: Vec::new(),
+                    sparkline: if initial_price > 0.0 { vec![initial_price] } else { Vec::new() },
                 });
             }
         }
@@ -411,8 +467,8 @@ impl Render for WatchlistPanel {
         filtered.sort_by(|a, b| {
             let ordering = match self.sort_column {
                 SortColumn::Asset => a.symbol.cmp(&b.symbol),
-                SortColumn::Price => a.initial_price.partial_cmp(&b.initial_price).unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Change24h => a.change_24h.unwrap_or(f64::NEG_INFINITY).partial_cmp(&b.change_24h.unwrap_or(f64::NEG_INFINITY)).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Price => a.effective_price().partial_cmp(&b.effective_price()).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Change24h => a.effective_change_24h().unwrap_or(f64::NEG_INFINITY).partial_cmp(&b.effective_change_24h().unwrap_or(f64::NEG_INFINITY)).unwrap_or(std::cmp::Ordering::Equal),
                 SortColumn::Volume24h => a.volume_24h_usd.unwrap_or(f64::NEG_INFINITY).partial_cmp(&b.volume_24h_usd.unwrap_or(f64::NEG_INFINITY)).unwrap_or(std::cmp::Ordering::Equal),
             };
             if self.sort_ascending {
@@ -421,6 +477,21 @@ impl Render for WatchlistPanel {
                 ordering.reverse()
             }
         });
+
+        let credit_error = crate::data::credits::CreditStore::module_error("Watchlist");
+
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(colors.background)
+                .overflow_hidden()
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Watchlist",
+                    Some(ce),
+                    is_compact,
+                    cx.theme(),
+                ));
+        }
 
         v_flex()
             .size_full()
@@ -613,7 +684,9 @@ impl WatchlistPanel {
     ) -> gpui::Stateful<gpui::Div> {
         let colors = &cx.theme().colors;
         let is_fav = self.is_favorite(&item.exchange, &item.symbol);
-        let is_positive = item.change_24h.map_or(false, |c| c >= 0.0);
+        let effective_price = item.effective_price();
+        let change_opt = item.effective_change_24h();
+        let is_positive = change_opt.map_or(false, |c| c >= 0.0);
 
         let row_bg = if idx.is_multiple_of(2) {
             colors.table_even
@@ -690,8 +763,8 @@ impl WatchlistPanel {
                     .text_size(px(11.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(colors.foreground)
-                    .child(if item.initial_price > 0.0 {
-                        format!("${}", Self::fmt_price(item.initial_price))
+                    .child(if effective_price > 0.0 {
+                        format!("${}", Self::fmt_price(effective_price))
                     } else {
                         "—".to_string()
                     }),
@@ -705,17 +778,17 @@ impl WatchlistPanel {
                         div()
                             .px_1p5()
                             .py(px(0.5))
-                            .bg(match item.change_24h {
+                            .bg(match change_opt {
                                 Some(_) => if is_positive { colors.bullish.opacity(0.15) } else { colors.bearish.opacity(0.15) },
                                 None => colors.muted.opacity(0.2),
                             })
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(match item.change_24h {
+                            .text_color(match change_opt {
                                 Some(_) => if is_positive { colors.bullish } else { colors.bearish },
                                 None => colors.muted_foreground,
                             })
-                            .child(match item.change_24h {
+                            .child(match change_opt {
                                 Some(change) => format!("{}{:.2}%", if is_positive { "+" } else { "" }, change),
                                 None => "—".to_string(),
                             }),
@@ -804,6 +877,9 @@ async fn run_watchlist_syncer(entries: Arc<Mutex<Vec<WatchlistEntry>>>, tracked:
                                 row.initial_price = tick.price;
                                 row.sparkline.push(tick.price);
                                 if row.sparkline.len() > 60 { row.sparkline.remove(0); }
+                                if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                                    store.set_mark_price(&row.symbol, tick.price);
+                                }
                             }
                             if let Some(change) = tick.change_24h_percent {
                                 row.change_24h = Some(change);
@@ -872,5 +948,77 @@ impl EventEmitter<PanelEvent> for WatchlistPanel {}
 impl Focusable for WatchlistPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_watchlist_entry_effective_price_fallback() {
+        let entry = WatchlistEntry {
+            symbol: "TEST/SYNC1".to_string(),
+            base: "TEST".to_string(),
+            name: "Test".to_string(),
+            exchange: "binance".to_string(),
+            category: "L1",
+            quote: "USDT".to_string(),
+            initial_price: 0.0,
+            open_24h: Some(100.0),
+            high_24h: None,
+            low_24h: None,
+            change_24h: None,
+            volume_24h_usd: None,
+            feed: None,
+            sparkline: Vec::new(),
+        };
+
+        // When initial_price is 0 and TradeStore has no entry, returns 0.0
+        assert_eq!(entry.effective_price(), 0.0);
+        assert_eq!(entry.effective_change_24h(), None);
+
+        // Update TradeStore mark price
+        crate::data::trade_store::TradeStore::global()
+            .lock()
+            .unwrap()
+            .set_mark_price("TEST/SYNC1", 125.0);
+
+        // effective_price picks up mark price from TradeStore
+        assert_eq!(entry.effective_price(), 125.0);
+        // effective_change_24h calculates (125 - 100) / 100 * 100% = 25.0%
+        assert_eq!(entry.effective_change_24h(), Some(25.0));
+    }
+
+    #[test]
+    fn test_watchlist_entry_effective_price_authoritative() {
+        let entry = WatchlistEntry {
+            symbol: "TEST/SYNC2".to_string(),
+            base: "TEST2".to_string(),
+            name: "Test2".to_string(),
+            exchange: "binance".to_string(),
+            category: "L1",
+            quote: "USDT".to_string(),
+            initial_price: 50.0,
+            open_24h: Some(50.0),
+            high_24h: None,
+            low_24h: None,
+            change_24h: Some(0.0),
+            volume_24h_usd: None,
+            feed: None,
+            sparkline: vec![50.0],
+        };
+
+        // Initially returns initial_price 50.0
+        assert_eq!(entry.effective_price(), 50.0);
+
+        // Another panel updates TradeStore with a newer live tick price
+        crate::data::trade_store::TradeStore::global()
+            .lock()
+            .unwrap()
+            .set_mark_price("TEST/SYNC2", 60.0);
+
+        // effective_price immediately reflects the updated mark price from TradeStore
+        assert_eq!(entry.effective_price(), 60.0);
     }
 }

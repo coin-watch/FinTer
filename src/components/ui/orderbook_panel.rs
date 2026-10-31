@@ -56,6 +56,7 @@ impl OrderBookPanel {
         let feed_for_timer = feed.clone();
         cx.spawn(async move |this, cx| {
             let mut last = feed_for_timer.snapshot();
+            let mut last_credit_rev = u64::MAX;
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 let latest = feed_for_timer.snapshot();
@@ -64,10 +65,13 @@ impl OrderBookPanel {
                     (None, None) => false,
                     _ => true,
                 };
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                let credit_changed = credit_rev != last_credit_rev;
                 if changed { last = latest; }
+                if credit_changed { last_credit_rev = credit_rev; }
                 // Always touch the weak entity so this task ends after panel close.
                 if this.update(cx, |_, cx| {
-                    if changed { cx.notify(); }
+                    if changed || credit_changed { cx.notify(); }
                 }).is_err() { break; }
             }
         }).detach();
@@ -393,14 +397,31 @@ impl OrderBookPanel {
     /// Render empty-state placeholder.
     fn render_empty(cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
+        let has_api = crate::data::client::is_api_url_configured();
         div()
             .size_full()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .text_sm()
-            .text_color(colors.muted_foreground)
-            .child("Waiting for order book…")
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(colors.muted_foreground)
+                    .child(if has_api { "Waiting for order book…" } else { "No data fetched" }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted_foreground.opacity(0.6))
+                    .child(if has_api {
+                        "Streaming live level-2 depth from exchange"
+                    } else {
+                        "Guest session: configure API URL in Settings to stream order book"
+                    }),
+            )
     }
 }
 
@@ -410,6 +431,23 @@ impl Render for OrderBookPanel {
         let qty_w = if self.width < 220.0 { 60.0 } else { 80.0 };
         let font_size = if self.width < 220.0 { 10.5 } else { 11.5 };
         let is_dual_column = self.width >= 380.0 && self.height < 320.0;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("OrderBook");
+
+        if let Some(ref ce) = credit_error {
+            let compact = self.width < 220.0 || self.height < 180.0;
+            return v_flex()
+                .size_full()
+                .overflow_hidden()
+                .bg(cx.theme().colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Order Book",
+                    Some(ce),
+                    compact,
+                    cx.theme(),
+                ))
+                .into_any_element();
+        }
 
         v_flex()
             .size_full()
@@ -427,6 +465,7 @@ impl Render for OrderBookPanel {
                         .child(self.render_book(&book, cx)),
                 )
             })
+            .into_any_element()
     }
 }
 

@@ -70,12 +70,16 @@ impl TapePanel {
     pub fn new(feed: TickFeed, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
         // Coalesce external updates; weak access ends the task on panel close.
         let mut last = feed.sequence();
+        let mut last_credit_rev = u64::MAX;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 if this.update(cx, |panel, cx| {
                     let sequence = panel.feed.sequence();
-                    if sequence != last && !panel.is_paused { cx.notify(); }
+                    let credit_rev = crate::data::credits::CreditStore::revision();
+                    let credit_changed = credit_rev != last_credit_rev;
+                    last_credit_rev = credit_rev;
+                    if (sequence != last && !panel.is_paused) || credit_changed { cx.notify(); }
                     last = sequence;
                 }).is_err() { break; }
             }
@@ -244,6 +248,22 @@ impl Render for TapePanel {
             })
             .take(MAX_VISIBLE_ROWS)
             .collect();
+
+        let credit_error = crate::data::credits::CreditStore::module_error("Tape");
+
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(colors.background)
+                .overflow_hidden()
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Time & Sales",
+                    Some(ce),
+                    is_compact,
+                    cx.theme(),
+                ))
+                .into_any_element();
+        }
 
         v_flex()
             .size_full()
@@ -437,6 +457,7 @@ impl Render for TapePanel {
             )
             // Scrollable Rows or Empty State
             .when(filtered_ticks.is_empty(), |el| {
+                let has_api = crate::data::client::is_api_url_configured();
                 el.child(
                     div()
                         .size_full()
@@ -450,13 +471,17 @@ impl Render for TapePanel {
                                 .text_sm()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(colors.muted_foreground)
-                                .child("Waiting for trades…"),
+                                .child(if has_api { "Waiting for trades…" } else { "No data fetched" }),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(colors.muted_foreground.opacity(0.6))
-                                .child("Streaming live executed trades from exchange"),
+                                .child(if has_api {
+                                    "Streaming live executed trades from exchange"
+                                } else {
+                                    "Guest session: configure API URL in Settings to stream trades"
+                                }),
                         ),
                 )
             })
@@ -474,6 +499,7 @@ impl Render for TapePanel {
                         ),
                 )
             })
+            .into_any_element()
     }
 }
 

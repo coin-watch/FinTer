@@ -64,15 +64,18 @@ impl ExecutionPanel {
         cx.spawn(async move |this, cx| {
             let mut last_seq = feed_for_timer.sequence();
             let mut last_ver = 0;
+            let mut last_credit_rev = u64::MAX;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
                     .await;
                 let sequence = feed_for_timer.sequence();
                 let ver = TradeStore::global().lock().unwrap().version;
-                let changed = sequence != last_seq || ver != last_ver;
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                let changed = sequence != last_seq || ver != last_ver || credit_rev != last_credit_rev;
                 last_seq = sequence;
                 last_ver = ver;
+                last_credit_rev = credit_rev;
                 if this
                     .update(cx, |this, cx| {
                         if changed {
@@ -110,6 +113,11 @@ impl ExecutionPanel {
         })
         .detach();
 
+        let initial_price = TradeStore::global()
+            .lock()
+            .ok()
+            .and_then(|ts| ts.get_mark_price(&sym_str));
+
         Self {
             feed,
             title: title_str,
@@ -125,7 +133,7 @@ impl ExecutionPanel {
             margin: 100.0,
             notification: None,
             is_live_mode: false,
-            last_price: None,
+            last_price: initial_price,
             price_direction: 0,
             limit_price: None,
             price_input: None,
@@ -166,6 +174,12 @@ impl ExecutionPanel {
             .latest()
             .map(|t| t.price)
             .filter(|p| p.is_finite() && *p > 0.0)
+            .or_else(|| {
+                TradeStore::global()
+                    .lock()
+                    .ok()
+                    .and_then(|ts| ts.get_mark_price(&self.symbol))
+            })
     }
 
     fn fmt_price(v: f64) -> String {
@@ -786,6 +800,21 @@ impl Render for ExecutionPanel {
         let is_very_narrow = self.width < 290.0;
         let is_compact_h = self.height < 380.0;
         let is_micro_h = self.height < 290.0;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("Trade");
+
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .overflow_hidden()
+                .bg(c.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Trading Desk",
+                    Some(ce),
+                    is_compact_h || is_narrow,
+                    cx.theme(),
+                ));
+        }
 
         v_flex()
             .size_full()

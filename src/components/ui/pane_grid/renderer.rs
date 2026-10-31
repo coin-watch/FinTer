@@ -1460,6 +1460,46 @@ impl PaneGridRenderer {
                                     .flex_shrink_0()
                                     .items_center()
                                     .gap(px(2.0))
+                                    .when({
+                                        let mod_name = match module_type.to_lowercase().as_str() {
+                                            "chart" => "Chart",
+                                            "ticker" => "Ticker",
+                                            "orderbook" => "OrderBook",
+                                            "trades" | "tape" => "Tape",
+                                            "execution" | "tradedesk" => "Trade",
+                                            "agent" => "AI Agent",
+                                            "watchlist" => "Watchlist",
+                                            "positions" => "Positions",
+                                            "marketcap" => "MarketCap",
+                                            "newsfeed" => "Newsfeed",
+                                            "feargreed" => "FearGreed",
+                                            _ => "",
+                                        };
+                                        !mod_name.is_empty() && crate::data::credits::CreditStore::module_error(mod_name).is_some()
+                                    }, |toolbar| {
+                                        toolbar.child(
+                                            div()
+                                                .id(ElementId::Name(format!("credit-warn-badge-{split_h_id}").into()))
+                                                .px(px(4.0))
+                                                .py(px(1.0))
+                                                .rounded(px(3.0))
+                                                .bg(theme.colors.danger.opacity(0.18))
+                                                .border_1()
+                                                .border_color(theme.colors.danger.opacity(0.45))
+                                                .text_size(px(10.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.colors.danger)
+                                                .cursor_pointer()
+                                                .tooltip(move |win, cx| gpui_component::tooltip::Tooltip::new("Credit limit reached. Click to top up credits.").build(win, cx))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|_this, _ev, _win, _cx| {
+                                                        crate::data::credits::CreditStore::open_billing_page(None);
+                                                    }),
+                                                )
+                                                .child("NO CREDITS"),
+                                        )
+                                    })
                                     .child(
                                         Popover::new(ElementId::Name(format!("layout-pop-{split_h_id}").into())).anchor(gpui::Corner::TopRight)
                                             .trigger(
@@ -1881,7 +1921,8 @@ impl PaneGridRenderer {
                                         bridge_config.timeframe = timeframe.clone();
                                         bridge_config.trades = false;
                                         bridge_config.orderbook = false;
-                                        bridge_config.ticker = false;
+                                        bridge_config.ticker = true;
+                                        bridge_config.snapshot = Some(("ticker", 0, "Chart"));
                                         if timeframe == "1s" {
                                             bridge_config.fetch_history = false;
                                             bridge_config.kline = false;
@@ -1896,6 +1937,9 @@ impl PaneGridRenderer {
                                                 let rx = bridge.subscribe_ohlcv();
                                                 let tick_rx = bridge.subscribe();
                                                 let feed = crate::data::candle_feed::CandleFeed::new(rx, Some(tick_rx), Some(timeframe.clone()));
+                                                if !crate::data::client::is_api_url_configured() {
+                                                    feed.set_error("No API service URL configured. Configure in Settings to stream data.".to_string());
+                                                }
                                                 let title = format!("{} {}", exchange.to_uppercase(), symbol);
                                                 let tf = timeframe.clone();
                                                 
@@ -1914,6 +1958,7 @@ impl PaneGridRenderer {
                                                             }
                                                             Err(e) => {
                                                                 tracing::error!("chart: historical request failed through {}: {}", until, e);
+                                                                feed.set_error(format!("{e}"));
                                                             }
                                                         }
                                                         let _ = done.send(());
@@ -2008,6 +2053,7 @@ impl PaneGridRenderer {
                                         bridge_config.trades = false;
                                         bridge_config.kline = false;
                                         bridge_config.fetch_history = false;
+                                        bridge_config.snapshot = Some(("orderbook", limit as u32, "OrderBook"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -2139,6 +2185,7 @@ impl PaneGridRenderer {
                                         bridge_config.orderbook = false;
                                         bridge_config.kline = false;
                                         bridge_config.fetch_history = false;
+                                        bridge_config.snapshot = Some(("ticker", 0, "Trade Desk"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }

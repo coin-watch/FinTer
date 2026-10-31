@@ -345,7 +345,7 @@ impl SettingsPage {
                             )
                             .default_value(SharedString::from(crate::data::client::DEFAULT_FINTER_API_URL)),
                         )
-                        .description("URL of your API backend (defaults to https://coinwat.ch). Override for local development or custom endpoints."),
+                        .description("URL of your API backend. Configure an endpoint for market data streaming and account synchronization."),
                     ),
             )
             .group(self.save_section("network", settings.clone(), on_change.clone()))

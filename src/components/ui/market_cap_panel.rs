@@ -136,6 +136,7 @@ impl MarketCapPanel {
         let watcher_cancel = cancel_token.clone();
         cx.spawn(async move |this, cx| {
             let mut seen = 0;
+            let mut last_credit_rev = u64::MAX;
             loop {
                 if watcher_cancel.is_cancelled() {
                     break;
@@ -144,8 +145,10 @@ impl MarketCapPanel {
                     .timer(std::time::Duration::from_millis(250))
                     .await;
                 let current = revision_watcher.load(Ordering::Relaxed);
-                if current != seen {
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                if current != seen || credit_rev != last_credit_rev {
                     seen = current;
+                    last_credit_rev = credit_rev;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -210,6 +213,20 @@ impl Render for MarketCapPanel {
 
         let is_compact = self.width < 380.0;
         let is_narrow = self.width < 280.0;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("MarketCap");
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(colors.background)
+                .overflow_hidden()
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Market Cap",
+                    Some(ce),
+                    is_compact,
+                    cx.theme(),
+                ));
+        }
 
         let raw_assets = self.assets.lock().unwrap().clone();
 
@@ -342,6 +359,7 @@ impl Render for MarketCapPanel {
                     .min_h_0()
                     .overflow_hidden()
                     .when(is_empty, |el| {
+                        let has_api = crate::data::client::is_api_url_configured();
                         el.child(
                             div()
                                 .size_full()
@@ -355,13 +373,17 @@ impl Render for MarketCapPanel {
                                         .text_sm()
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(colors.muted_foreground)
-                                        .child("Connecting to market cap stream…"),
+                                        .child(if has_api { "Connecting to market cap stream…" } else { "No data fetched" }),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(colors.muted_foreground.opacity(0.6))
-                                        .child("Streaming live capitalization from cap.coinwat.ch"),
+                                        .child(if has_api {
+                                            "Streaming live capitalization"
+                                        } else {
+                                            "Guest session: configure API URL in Settings to stream market cap"
+                                        }),
                                 ),
                         )
                     })
@@ -842,37 +864,66 @@ async fn run_market_cap_syncer(
     revision: Arc<AtomicU64>,
     cancel_token: CancellationToken,
 ) {
+    let api_url = std::env::var("FINTER_CAP_URL").ok().filter(|s| !s.trim().is_empty()).or_else(|| {
+        let base = crate::data::client::service_base_url();
+        if base.trim().is_empty() {
+            None
+        } else {
+            Some(format!("{}/market-caps?limit=50", base.trim_end_matches('/')))
+        }
+    });
+
     // REST is a snapshot fallback only; race it against panel cancellation.
-    let client = reqwest::Client::new();
-    let fetch = async {
-        if let Ok(res) = client
-            .get("https://cap.coinwat.ch/market-caps?limit=50")
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-        {
-            if let Ok(json) = res.json::<serde_json::Value>().await {
-                if let Some(arr) = json.get("data").and_then(|v| v.as_array()) {
-                    let parsed: Vec<MarketCapAsset> = arr
-                        .iter()
-                        .filter_map(|val| {
-                            serde_json::from_value::<MarketCapAsset>(val.clone()).ok()
-                        })
-                        .collect();
-                    if !parsed.is_empty() {
-                        if let Ok(mut lock) = assets_target.lock() {
-                            *lock = parsed;
-                            revision.fetch_add(1, Ordering::Relaxed);
+    if let Some(ref url) = api_url {
+        let client = reqwest::Client::new();
+        let fetch = async {
+            if let Ok(res) = client
+                .get(url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                if let Ok(json) = res.json::<serde_json::Value>().await {
+                    if let Some(arr) = json.get("data").and_then(|v| v.as_array()) {
+                        let parsed: Vec<MarketCapAsset> = arr
+                            .iter()
+                            .filter_map(|val| {
+                                serde_json::from_value::<MarketCapAsset>(val.clone()).ok()
+                            })
+                            .collect();
+                        if !parsed.is_empty() {
+                            if let Ok(mut lock) = assets_target.lock() {
+                                *lock = parsed;
+                                revision.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
             }
+        };
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            _ = fetch => {}
         }
-    };
-    tokio::select! {
-        _ = cancel_token.cancelled() => return,
-        _ = fetch => {}
     }
+
+    let ws_url = std::env::var("FINTER_CAP_WS_URL").ok().filter(|s| !s.trim().is_empty()).or_else(|| {
+        let base = crate::data::client::service_base_url();
+        let base = base.trim_end_matches('/');
+        if base.is_empty() {
+            None
+        } else if let Some(origin) = base.strip_prefix("https://") {
+            Some(format!("wss://{origin}/ws"))
+        } else if let Some(origin) = base.strip_prefix("http://") {
+            Some(format!("ws://{origin}/ws"))
+        } else {
+            Some(format!("wss://{base}/ws"))
+        }
+    });
+
+    let Some(ws_url) = ws_url else {
+        return;
+    };
 
     // 2. Connect to WebSocket stream for live updates
     loop {
@@ -882,7 +933,7 @@ async fn run_market_cap_syncer(
 
         let connection = tokio::select! {
             _ = cancel_token.cancelled() => break,
-            result = connect_async("wss://cap.coinwat.ch/ws") => result,
+            result = connect_async(&ws_url) => result,
         };
         match connection {
             Ok((ws_stream, _)) => {

@@ -159,7 +159,9 @@ impl ProfilePage {
                                 Button::new("profile-billing")
                                     .label("Manage billing")
                                     .primary()
-                                    .on_click(|_, _, _| { let _ = webbrowser::open("https://coinwat.ch/account/credits"); }),
+                                    .on_click(|_, _, _| {
+                                        crate::data::credits::CreditStore::open_billing_page(None);
+                                    }),
                             )),
                     )
                     .child(

@@ -21,7 +21,7 @@ impl ApiClient {
         // Try the coinwat.ch proxy first
         let proxy_result: std::result::Result<AuthResponse, _> = rt.block_on(async {
             let resp = http.post(&url)
-                .header("Origin", self.base_url.clone())
+                .header("Origin", self.base_url())
                 .json(&body)
                 .send().await?;
             let status = resp.status();
@@ -81,7 +81,7 @@ impl ApiClient {
 
         let auth: AuthResponse = rt.block_on(async {
             let resp = http.post(&url)
-                .header("Origin", self.base_url.clone())
+                .header("Origin", self.base_url())
                 .json(&body)
                 .send().await?;
             resp.json::<AuthResponse>()
@@ -133,7 +133,7 @@ impl ApiClient {
 
         let _ = rt.block_on(async { 
             http.post(&url)
-                .header("Origin", self.base_url.clone())
+                .header("Origin", self.base_url())
                 .send().await 
         });
 
@@ -160,7 +160,7 @@ impl ApiClient {
         // Try the proxy first
         let proxy_result: std::result::Result<AuthResponse, _> = rt.block_on(async {
             let resp = http.post(&url)
-                .header("Origin", self.base_url.clone())
+                .header("Origin", self.base_url())
                 .json(&body)
                 .send().await?;
             let status = resp.status();

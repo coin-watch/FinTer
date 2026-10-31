@@ -42,6 +42,20 @@ impl FearGreedPanel {
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
+        cx.spawn(async move |this, cx| {
+            let mut last_credit_rev = u64::MAX;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                if credit_rev != last_credit_rev {
+                    last_credit_rev = credit_rev;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }).detach();
+
         let mut panel = Self {
             value: None,
             classification: None,
@@ -116,6 +130,20 @@ impl FearGreedPanel {
 impl Render for FearGreedPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("FearGreed");
+        if let Some(ref ce) = credit_error {
+            return div()
+                .size_full()
+                .bg(colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Fear & Greed",
+                    Some(ce),
+                    self.height < 120.0 || self.width < 200.0,
+                    cx.theme(),
+                ))
+                .into_any_element();
+        }
 
         if self.is_loading {
             return div()

@@ -114,13 +114,16 @@ impl PositionsPanel {
         cx.spawn(async move |this, cx| {
             let mut last_feeds: Vec<u64> = feeds.iter().map(TickFeed::sequence).collect();
             let mut last_ver: u64 = 0;
+            let mut last_credit_rev: u64 = u64::MAX;
             loop {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 let current_feeds: Vec<u64> = feeds.iter().map(TickFeed::sequence).collect();
                 let current_ver = TradeStore::global().lock().unwrap().version;
-                let changed = current_feeds != last_feeds || current_ver != last_ver;
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                let changed = current_feeds != last_feeds || current_ver != last_ver || credit_rev != last_credit_rev;
                 last_feeds = current_feeds;
                 last_ver = current_ver;
+                last_credit_rev = credit_rev;
                 if this.update(cx, |_, cx| {
                     if changed {
                         cx.notify();
@@ -1471,6 +1474,19 @@ impl Render for PositionsPanel {
         let colors = &cx.theme().colors;
         let is_narrow = self.width > 0.0 && self.width < 500.0;
         let is_very_narrow = self.width > 0.0 && self.width < 340.0;
+
+        let credit_error = crate::data::credits::CreditStore::module_error("Positions");
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Positions",
+                    Some(ce),
+                    is_very_narrow,
+                    cx.theme(),
+                ));
+        }
 
         let (store_positions, store_orders, total_pnl, deployed_margin) = {
             let store = TradeStore::global().lock().unwrap();

@@ -1,4 +1,4 @@
-#![recursion_limit = "2048"]
+#![recursion_limit = "4096"]
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"

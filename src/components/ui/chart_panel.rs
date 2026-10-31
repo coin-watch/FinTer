@@ -216,6 +216,7 @@ impl ChartPanel {
             let mut last_ms = 0;
             let mut last_countdown_second = u64::MAX;
             let mut last_trade_ver = u64::MAX;
+            let mut last_credit_rev = u64::MAX;
             loop {
                 let ms = f.last_update_ms();
                 // Use the absolute Unix second as the invalidation key. The
@@ -229,14 +230,17 @@ impl ChartPanel {
                     .lock()
                     .map(|s| s.version)
                     .unwrap_or(0);
+                let credit_rev = crate::data::credits::CreditStore::revision();
                 let feed_changed = ms != last_ms;
                 let countdown_changed = countdown_second != last_countdown_second;
                 let trade_changed = trade_ver != last_trade_ver;
+                let credit_changed = credit_rev != last_credit_rev;
 
-                if feed_changed || countdown_changed || trade_changed {
+                if feed_changed || countdown_changed || trade_changed || credit_changed {
                     last_ms = ms;
                     last_countdown_second = countdown_second;
                     last_trade_ver = trade_ver;
+                    last_credit_rev = credit_rev;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -749,6 +753,7 @@ impl ChartPanel {
 
     fn render_empty(&self, cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
+        let is_configured = crate::data::client::is_api_url_configured();
         div()
             .size_full()
             .flex()
@@ -756,18 +761,23 @@ impl ChartPanel {
             .items_center()
             .justify_center()
             .gap_3()
-            .child(div().w(px(40.0)).h(px(2.0)).bg(colors.primary))
+            .child(div().w(px(40.0)).h(px(2.0)).bg(if is_configured { colors.primary } else { colors.muted_foreground.opacity(0.4) }))
             .child(
                 div()
                     .text_sm()
-                    .text_color(colors.muted_foreground)
-                    .child("LOADING MARKET DATA"),
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(if is_configured { colors.muted_foreground } else { colors.warning })
+                    .child(if is_configured { "LOADING MARKET DATA" } else { "NO DATA FETCHED" }),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(colors.muted_foreground)
-                    .child(format!("{} · {}", self.title, self.timeframe)),
+                    .child(if is_configured {
+                        format!("{} · {}", self.title, self.timeframe)
+                    } else {
+                        "Guest session: no API service URL configured. Configure in Settings to stream candles.".to_string()
+                    }),
             )
     }
 
@@ -804,6 +814,23 @@ impl ChartPanel {
 
 impl Render for ChartPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let credit_error = self.feed.credit_error().or_else(|| {
+            crate::data::credits::CreditStore::module_error("Chart")
+        });
+
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(cx.theme().colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "Chart Data",
+                    Some(ce),
+                    false,
+                    cx.theme(),
+                ))
+                .into_any_element();
+        }
+
         // The feed watcher and interaction handlers notify this entity. Avoid
         // scheduling an unconditional 60 FPS render loop when the chart is idle.
 
@@ -878,6 +905,20 @@ impl Render for ChartPanel {
                 Some(c)
             })
             .collect();
+
+        if let Some(mark) = crate::data::trade_store::TradeStore::global()
+            .lock()
+            .ok()
+            .and_then(|ts| ts.get_mark_price(&self.symbol))
+        {
+            if mark > 0.0 && mark.is_finite() {
+                if let Some(last) = candles.last_mut() {
+                    last.close = mark;
+                    last.high = last.high.max(mark);
+                    last.low = last.low.min(mark);
+                }
+            }
+        }
 
         if matches!(self.candle_type, CandleType::HeikinAshi) {
             let mut ha_candles = Vec::with_capacity(candles.len());
@@ -1639,7 +1680,14 @@ impl Render for ChartPanel {
                     let pos_mark = store
                         .get_mark_price(&p.symbol)
                         .filter(|m| m.is_finite() && *m > 0.0)
-                        .unwrap_or(chart_mark);
+                        .or_else(|| {
+                            if chart_mark.is_finite() && chart_mark > 0.0 {
+                                Some(chart_mark)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(p.entry_price);
                     PositionOverlaySpec {
                         id: p.id.clone(),
                         symbol: p.symbol.clone(),
@@ -2346,7 +2394,7 @@ impl Render for ChartPanel {
             .child(gpui::deferred(settings_panel))
             .child(gpui::deferred(self.render_indicator_library(cx)));
 
-        v_flex()
+        let root = v_flex()
             .id("chart_panel_root")
             .size_full()
             .bg(cx.theme().colors.background)
@@ -2359,9 +2407,9 @@ impl Render for ChartPanel {
                     }
                 }
             }))
-            .child(self.render_chart_toolbar(cx))
-            .child(chart_area)
-            .into_any_element()
+            .child(self.render_chart_toolbar(cx));
+
+        root.child(chart_area).into_any_element()
     }
 }
 

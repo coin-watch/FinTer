@@ -14,16 +14,17 @@ use crate::components::ui::title_bar::FinTerTitleBar;
 use crate::components::ui::update_banner::{UpdateBanner, UpdateBannerEvent};
 use crate::data::client::ApiClient;
 use crate::data::models::{LayoutPreset, Module, SettingsData};
-use crate::data::pane_tree::{ModuleData, PaneNode};
+use crate::data::pane_tree::PaneNode;
 use crate::data::theme::apply_theme;
 use crate::data::update_manager::UpdateManager;
 use crate::data::version::UpdateState;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, WindowControlArea, div, px,
+    Render, StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, WindowControlArea, div, px, rgb,
 };
-use gpui_component::button::ButtonVariants;
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, IconName};
 use gpui_component::Sizable;
 use gpui_component::theme::ActiveTheme;
 use std::sync::Arc;
@@ -163,6 +164,8 @@ pub struct MainView {
     /// Update notification banner entity
     update_banner: Option<Entity<UpdateBanner>>,
     update_check_started: bool,
+    /// Whether the guest "no data" banner has been dismissed for the current session.
+    guest_banner_dismissed: bool,
 }
 
 impl MainView {
@@ -194,6 +197,7 @@ impl MainView {
             update_manager: Arc::new(UpdateManager::new()),
             update_banner: None,
             update_check_started: false,
+            guest_banner_dismissed: false,
         }
     }
 
@@ -216,6 +220,7 @@ impl MainView {
     }
 
     /// Active settings file based on authentication state
+    #[allow(dead_code)]
     fn active_settings_path(&self) -> Option<std::path::PathBuf> {
         if self.is_authenticated {
             Self::cloud_settings_path()
@@ -253,6 +258,7 @@ impl MainView {
 
     /// Load saved local layout or fallback to a default trading terminal layout for guest users
     fn load_guest_layout(&mut self, cx: &mut Context<Self>) {
+        self.guest_banner_dismissed = false;
         // Load guest settings to apply theme/timezone independently of cloud user
         if let Some(path) = Self::guest_settings_path() {
             if let Ok(json) = std::fs::read_to_string(&path) {
@@ -320,13 +326,21 @@ impl MainView {
         }
         self.is_restoring = true;
 
-        // Synchronously load guest settings cache on initial startup
-        let startup_settings_path = Self::guest_settings_path().or_else(Self::cloud_settings_path);
+        // Synchronously load settings cache on initial startup
+        let has_saved_session = crate::data::session_store::load_session().ok().flatten().is_some();
+        let startup_settings_path = if has_saved_session {
+            Self::cloud_settings_path().filter(|p| p.exists()).or_else(Self::guest_settings_path)
+        } else {
+            Self::cloud_settings_path().filter(|p| p.exists()).or_else(Self::guest_settings_path)
+        };
         if let Some(path) = startup_settings_path {
             if let Ok(json) = std::fs::read_to_string(&path) {
                 if let Ok(settings) =
                     serde_json::from_str::<crate::data::models::SettingsData>(&json)
                 {
+                    if let Some(server_url) = &settings.server_url {
+                        self.api_client.set_base_url(server_url);
+                    }
                     let theme_name = settings
                         .theme
                         .clone()
@@ -337,7 +351,8 @@ impl MainView {
                         .map(|s| s == "dark")
                         .unwrap_or(false);
                     tracing::info!(
-                        "Loaded initial settings cache. Applying theme: {}",
+                        "Loaded initial settings cache from {}. Applying theme: {}",
+                        path.display(),
                         theme_name
                     );
                     apply_theme(&theme_name, dark_mode, cx);
@@ -370,6 +385,7 @@ impl MainView {
                         .refresh_for_session(token.as_deref());
                     // Load settings first, then modules with current_dashboard for auto-selection
                     this.load_settings_then_modules(cx);
+                    this.load_account_summary(cx);
                 } else {
                     this.is_authenticated = false;
                     this.account_summary = None;
@@ -421,7 +437,27 @@ impl MainView {
             let _ = this.update(cx, |view, cx| {
                 view.account_summary_loading = false;
                 match result {
-                    Ok(Ok(summary)) => view.account_summary = Some(summary),
+                    Ok(Ok(summary)) => {
+                        let balance = summary.pointer("/credits/balance")
+                            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .unwrap_or(0);
+                        let free_remaining = summary.pointer("/credits/monthly_free_remaining")
+                            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                            .unwrap_or(0);
+                        let base_url = view.api_client.base_url();
+                        if balance <= 0 && free_remaining <= 0 {
+                            crate::data::credits::CreditStore::record(
+                                "Account",
+                                "Credit balance exhausted. Add credits or upgrade your plan to resume market data.",
+                                balance,
+                                1,
+                                Some(&base_url),
+                            );
+                        } else if balance > 0 || free_remaining > 0 {
+                            crate::data::credits::CreditStore::clear();
+                        }
+                        view.account_summary = Some(summary);
+                    }
                     Ok(Err(error)) => tracing::warn!("profile summary unavailable: {error}"),
                     Err(error) => tracing::warn!("profile summary task failed: {error}"),
                 }
@@ -490,9 +526,19 @@ impl MainView {
     fn start_agent_context_refresh(&mut self, cx: &mut Context<Self>) {
         if self.agent_context_task.is_some() { return; }
         self.agent_context_task = Some(cx.spawn(async move |this, cx| {
+            let mut last_credit_rev = crate::data::credits::CreditStore::revision();
             loop {
-                cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
-                if this.update(cx, |view, cx| view.refresh_agent_context(cx)).is_err() {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                let credit_changed = credit_rev != last_credit_rev;
+                last_credit_rev = credit_rev;
+
+                if this.update(cx, |view, cx| {
+                    if credit_changed {
+                        cx.notify();
+                    }
+                    view.refresh_agent_context(cx);
+                }).is_err() {
                     break;
                 }
             }
@@ -829,6 +875,7 @@ impl MainView {
 
         // Load settings first, then modules with current_dashboard for auto-selection
         self.load_settings_then_modules(cx);
+        self.load_account_summary(cx);
 
         cx.notify();
     }
@@ -1130,6 +1177,9 @@ impl MainView {
                     // Store settings in MainView and apply theme
                     let settings_clone = user_settings.settings.clone();
                     let _ = this.update(cx, |view, cx| {
+                        if let Some(server_url) = &settings_clone.server_url {
+                            view.api_client.set_base_url(server_url);
+                        }
                         // Apply theme from loaded settings
                         let theme_name = settings_clone
                             .theme
@@ -2559,12 +2609,107 @@ impl Render for MainView {
             UpdateState::Idle | UpdateState::Checking
         );
 
+        // Inform user if guest session has no data fetched
+        let show_guest_banner = !self.is_authenticated
+            && !self.guest_banner_dismissed
+            && (current_page == Page::Home || current_page == Page::Dashboard)
+            && (!crate::data::client::is_api_url_configured()
+                || crate::data::gateway_registry::GatewayRegistry::global().fetch_failed());
+
+        let guest_banner = if show_guest_banner {
+            let no_api = !crate::data::client::is_api_url_configured();
+            let banner_msg = if no_api {
+                "Guest session: No API service URL configured. Remote market data streaming is disabled until an API endpoint is connected."
+            } else {
+                "Guest session: No data could be fetched from the configured API service. Check your connection or API URL in Settings."
+            };
+
+            Some(
+                div()
+                    .id("guest-no-data-banner")
+                    .w_full()
+                    .min_w_0()
+                    .px(px(16.0))
+                    .py(px(7.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .bg(rgb(0x1a2638))
+                    .border_b_1()
+                    .border_color(rgb(0x2a3e5c))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                Icon::new(IconName::Info)
+                                    .size(px(14.0))
+                                    .text_color(rgb(0x60a5fa))
+                                    .flex_shrink_0(),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0x93c5fd))
+                                    .child("Guest Session:"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xbfdbfe))
+                                    .truncate()
+                                    .child(banner_msg),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("guest-configure-api-btn")
+                                    .label("Configure in Settings")
+                                    .xsmall()
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.switch_page(Page::Settings);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("guest-dismiss-banner-btn")
+                                    .icon(IconName::Close)
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.guest_banner_dismissed = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         let content_with_title_bar = div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
             .child(FinTerTitleBar::new("").tabs(self.dashboard_tabs(entity.clone(), cx)))
+            .children(crate::components::ui::credit_alert::DashboardCreditBanner::render_opt())
+            .children(guest_banner)
             .when(show_update_banner, |this| {
                 if let Some(banner) = self.update_banner.as_ref() {
                     this.child(banner.clone())

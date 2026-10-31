@@ -108,6 +108,10 @@ struct CandleFeedInner {
     live_ticker_candle_ts: Option<i64>,
     /// Most recent live ticker price observed from tick_rx.
     latest_ticker_price: Option<f64>,
+    /// Latest credit exhaustion error, if any.
+    credit_error: Option<crate::data::credits::CreditExhaustedInfo>,
+    /// Latest network/API fetch error, if any.
+    fetch_error: Option<String>,
 }
 
 impl CandleFeed {
@@ -125,6 +129,8 @@ impl CandleFeed {
             version: 0,
             live_ticker_candle_ts: None,
             latest_ticker_price: None,
+            credit_error: None,
+            fetch_error: None,
         }));
 
         let drain_inner = Arc::clone(&inner);
@@ -197,10 +203,52 @@ impl CandleFeed {
             .version
     }
 
-    /// Always returns `None` — errors are now logged at the bridge level.
-    /// Kept for call-site compat with the old polling-based implementation.
+    /// Record a credit exhaustion error for this feed.
+    pub fn set_credit_error(&self, error: crate::data::credits::CreditExhaustedInfo) {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        inner.credit_error = Some(error);
+        inner.version = inner.version.saturating_add(1);
+    }
+
+    /// Clear any recorded credit exhaustion error.
+    pub fn clear_credit_error(&self) {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        if inner.credit_error.is_some() {
+            inner.credit_error = None;
+            inner.version = inner.version.saturating_add(1);
+        }
+    }
+
+    /// Retrieve the current credit exhaustion error, if any.
+    pub fn credit_error(&self) -> Option<crate::data::credits::CreditExhaustedInfo> {
+        self.inner
+            .lock()
+            .expect("CandleFeed mutex poisoned")
+            .credit_error
+            .clone()
+    }
+
+    /// Set a fetch/network error message.
+    pub fn set_error(&self, error: String) {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        inner.fetch_error = Some(error);
+        inner.version = inner.version.saturating_add(1);
+    }
+
+    /// Clear any recorded fetch error.
+    pub fn clear_error(&self) {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        if inner.fetch_error.is_some() {
+            inner.fetch_error = None;
+            inner.version = inner.version.saturating_add(1);
+        }
+    }
+
+    /// Returns the last credit or fetch error message if any, or `None`.
     pub fn last_error(&self) -> Option<String> {
-        None
+        let inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        inner.credit_error.as_ref().map(|e| e.message.clone())
+            .or_else(|| inner.fetch_error.clone())
     }
 }
 

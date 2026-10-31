@@ -1,7 +1,6 @@
 //! AI Agent module: read-only analysis of data from the active dashboards.
 use gpui::*;
 use gpui::prelude::FluentBuilder;
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::v_flex;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -43,7 +42,21 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        cx.spawn(async move |this, cx| {
+            let mut last_credit_rev = u64::MAX;
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                let credit_rev = crate::data::credits::CreditStore::revision();
+                if credit_rev != last_credit_rev {
+                    last_credit_rev = credit_rev;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }).detach();
+
         // When dashboard loads, Agent module starts with an empty new conversation as default.
         Self {
             conversation_id: None,
@@ -341,6 +354,20 @@ impl Render for AgentPanel {
                         )
                 );
             }
+        }
+
+        let credit_error = crate::data::credits::CreditStore::module_error("AI Agent");
+        if let Some(ref ce) = credit_error {
+            return v_flex()
+                .size_full()
+                .bg(colors.background)
+                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                    "AI Agent",
+                    Some(ce),
+                    self.height < 200.0 || self.width < 250.0,
+                    cx.theme(),
+                ))
+                .into_any_element();
         }
 
         div().size_full().w_full().min_w_0().min_h_0().p(px(padding)).flex().flex_col().gap(px(gap)).overflow_hidden().bg(colors.background)
