@@ -1,4 +1,4 @@
-#![recursion_limit = "4096"]
+#![recursion_limit = "1024"]
 
 pub mod chart;
 pub mod components;

@@ -1647,8 +1647,8 @@ mod tests {
         assert!(msg.data.is_some());
     }
 
-    #[test]
-    fn last_tick_and_orderbook_replay_on_subscribe() {
+    #[tokio::test]
+    async fn last_tick_and_orderbook_replay_on_subscribe() {
         let (tick_tx, _) = broadcast::channel(16);
         let (trade_tx, _) = broadcast::channel(16);
         let (ob_tx, _) = broadcast::channel(16);
@@ -1672,7 +1672,7 @@ mod tests {
             last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
             last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),
             cancel_token: CancellationToken::new(),
-            _supervisor_handle: tokio::spawn(async {}),
+            _supervisor: tokio::spawn(async {}),
         };
 
         // When a subscriber attaches after bridge startup, cached tick is replayed immediately
@@ -1718,7 +1718,7 @@ mod tests {
         cfg1.rest_base_url = format!("http://127.0.0.1:{port}");
         cfg1.symbol = "COALESCE/USDT".to_string();
 
-        let mut cfg2 = cfg1.clone();
+        let cfg2 = cfg1.clone();
 
         // Spawn two concurrent requests for the same symbol/exchange
         let handle1 = tokio::spawn(async move {
@@ -1733,8 +1733,8 @@ mod tests {
 
         assert!(res1.is_some());
         assert!(res2.is_some());
-        assert_eq!(res1.unwrap().price, 69000.0);
-        assert_eq!(res2.unwrap().price, 69000.0);
+        assert_eq!(res1.unwrap()["last"].as_f64(), Some(69000.0));
+        assert_eq!(res2.unwrap()["last"].as_f64(), Some(69000.0));
 
         // Only 1 outbound HTTP request was made because in-flight coalescing deduplicated them
         assert_eq!(REQ_COUNT.load(Ordering::SeqCst), 1);

@@ -3,7 +3,11 @@
 //! instant paper fills, leverage management, and position PnL tracking.
 
 use gpui::prelude::FluentBuilder;
-use gpui::*;
+use gpui::{
+    div, hsla, px, App, AppContext, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window,
+};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dock::{Panel, PanelEvent, PanelInfo, PanelState};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -2081,8 +2085,6 @@ impl Focusable for ExecutionPanel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_liquidation_calculation_long_and_short() {
         let entry = 50_000.0;

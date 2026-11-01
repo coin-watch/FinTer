@@ -42,6 +42,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libvulkan-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev \
             libssl-dev pkg-config
 
       - name: Run tests
