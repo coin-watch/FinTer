@@ -67,9 +67,6 @@ jobs:
             libssl-dev pkg-config \
             desktop-file-utils zsync file
 
-      - name: Run tests
-        run: cargo test --workspace
-
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 

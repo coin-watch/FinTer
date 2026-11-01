@@ -1,26 +1,56 @@
-# FinTer
+<div align="center">
 
-FinTer is a native desktop market-monitoring and charting application built with Rust and GPUI. It provides live cryptocurrency market data, interactive candlestick charts, technical indicators, dashboards, and local workspace persistence.
+<img src="assets/readme-icon.png" width="128" alt="FinTer application icon" />
 
-> **Status:** Early open-source development. APIs, storage formats, and UI behavior may change.
+<h1>FinTer</h1>
 
-## Features
+<p><strong>A native market terminal for people who read charts for a living.</strong></p>
 
-- Live OHLCV candle feeds with historical data and reconnect handling.
-- Interactive candlestick charts with pan, zoom, crosshair, volume, and Heikin Ashi views.
-- Technical indicators and exchange-aware price formatting.
-- Dashboard modules for market data, news, fear and greed, order books, and clocks.
-- Local-first dashboard and session persistence.
-- Optional login: run and use the terminal offline/locally as a guest with full layout and settings persistence, without needing an account.
-- Optional cloud account sync: when a compatible backend is configured, users can optionally sign in to sync dashboards and settings across devices.
-- OS keyring integration for authenticated session storage, with a restricted local fallback when a keyring is unavailable.
-- Verified HTTPS application updates using SHA-256 metadata checks.
-- Cross-platform builds for Linux, macOS, and Windows.
+<p>Live crypto markets, a real charting engine, and a workspace that remembers where you left it — built in Rust on GPUI.</p>
 
-## Requirements
+<p>
+  <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-039952?style=flat-square&logo=rust&logoColor=white">
+  <img alt="GPUI" src="https://img.shields.io/badge/UI-GPUI-171717?style=flat-square">
+  <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-039952?style=flat-square">
+  <img alt="Linux, macOS, Windows" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-171717?style=flat-square">
+</p>
 
-- Rust stable toolchain with Cargo.
-- Platform dependencies required by GPUI. On Ubuntu/Debian:
+</div>
+
+> **Early development.** APIs, storage formats, and UI behavior may change. Guest Mode is fully usable offline; cloud features are optional and require a compatible backend.
+
+## Why FinTer
+
+Most market tools ask you to choose between a browser tab that eats your RAM and a terminal that eats your afternoon. FinTer is a native desktop application: it starts fast, renders smoothly, and keeps your layout, symbols, and indicators on disk.
+
+- **Local-first by default** — Guest Mode runs without an account or a backend; layouts and settings persist locally.
+- **Optional cloud sync** — sign in only when you want dashboards and settings on more than one machine.
+- **Yours to inspect** — MIT-licensed Rust, from the chart engine to the keyring integration.
+
+## What's inside
+
+| **Charting** | **Market data** |
+| --- | --- |
+| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. | Live OHLCV over WebSocket with history and reconnect handling, order books, trade tape, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
+
+| **Workspace** | **Account & updates** |
+| --- | --- |
+| A resizable pane grid with dashboard modules, saved layouts, a dashboard manager, and local persistence for guest sessions. | Optional sign-in with cloud sync, tokens in the OS keyring, and verified HTTPS updates with SHA-256 metadata checks. |
+
+### Indicators
+
+Studies route to the main chart or to their own resizable sub-pane.
+
+| Trend | Momentum | Volatility | Volume |
+| --- | --- | --- | --- |
+| MA, EMA, SMA, BBI, SAR, TRIX | MACD, KDJ, RSI, WR, CCI, ROC, MTM, BIAS, PSY | BOLL, AVP | VOL, OBV, PVT |
+
+## Quick start
+
+**Requirements:** a stable Rust toolchain with Cargo, plus the platform libraries GPUI needs.
+
+<details>
+<summary><strong>Ubuntu / Debian dependencies</strong></summary>
 
 ```sh
 sudo apt-get update
@@ -31,69 +61,88 @@ sudo apt-get install -y \
   libssl-dev pkg-config
 ```
 
-## Build and test
+</details>
+
+```sh
+git clone https://github.com/coin-watch/FinTer.git
+cd FinTer
+cargo run --release
+```
+
+Verify a checkout before sending a change:
 
 ```sh
 cargo test --workspace
 cargo fmt --check
 cargo clippy -- -D warnings
-cargo run --release
 ```
 
-## Connecting to a Backend API (Optional)
+## Connect a backend (optional)
 
-FinTer is **local-first by default**: it runs offline in Guest Mode with local workspace and chart layout persistence, requiring no account or server. There is no pre-configured default API endpoint. If no endpoint is configured or market data cannot be fetched, guest sessions clearly display informative notifications and empty states across panels.
+FinTer ships with **no pre-configured API endpoint**. Without one it runs in Guest Mode, persists your layout and settings locally, and shows clear empty states when market data is unavailable.
 
-To connect to a custom backend or market gateway:
-- **Via In-App Settings**: Go to **Settings → Network & Server**, and configure your API Server URL (e.g. `http://localhost:5173` for local development).
-- **Via Environment Variable**: Set `FINTER_API_URL` before launching:
-  ```sh
-  FINTER_API_URL="http://localhost:5173" cargo run
-  ```
-- **Optional Gateway Overrides**:
-  - `FINTER_REST_URL`: Override the REST market gateway origin (defaults to the API origin).
-  - `FINTER_WS_URL`: Override the WebSocket market stream gateway.
-  - `FINTER_NEWS_API_URL` & `FINTER_NEWS_WS_URL`: News article feed endpoints.
+Point it at a backend in **Settings → Network & Server**, or set the environment variable before launch:
 
-### Authentication & Token Security
-When connecting to a backend service:
-1. FinTer communicates strictly over TLS (HTTPS/WSS) or local loopback (`http://localhost:*`).
-2. Authentication tokens (JWT `access_token` and `refresh_token`) are stored in the operating system's hardware credential vault via `keyring-rs` (Windows Credential Manager, macOS Keychain, Linux Secret Service).
-3. Plaintext passwords are never persisted to disk.
+```sh
+FINTER_API_URL="http://localhost:5173" cargo run
+```
 
-### Data Separation (Guest vs. Cloud Session)
-FinTer strictly isolates offline guest data from authenticated cloud data on disk:
-- **Guest / Offline Session**:
-  - Layout: `~/.config/finter/guest_layout.json`
-  - Settings: `~/.config/finter/guest_settings.json`
-  - Never synced to any remote server or overwritten by remote profiles.
-- **Cloud Account Session**:
-  - Layout: `~/.config/finter/cloud_layout.json` (cached locally, synchronized with database)
-  - Settings: `~/.config/finter/cloud_settings.json`
-  - Keyring Credential: OS Enclave (`finter/session`)
-- **Seamless Switching**: Logging out immediately restores the guest workspace without erasing or altering your cloud configurations.
+| Variable | Purpose |
+| --- | --- |
+| `FINTER_API_URL` | Backend API origin for account features and defaults. |
+| `FINTER_REST_URL` | REST market gateway; defaults to the API origin. |
+| `FINTER_WS_URL` | WebSocket market stream gateway. |
+| `FINTER_NEWS_API_URL` | News article API. |
+| `FINTER_NEWS_WS_URL` | News WebSocket stream. |
+| `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. |
+| `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
 
-## Configuration and privacy
+<details>
+<summary><strong>Authentication, storage &amp; data separation</strong></summary>
 
-FinTer does not include API keys, application credentials, user data, session tokens, database dumps, compiled artifacts, or vendored dependency build directories. Authentication tokens are obtained at runtime and stored through the operating system keyring where available. The fallback session file is placed in the per-user configuration directory and is restricted to the current user on Unix systems.
+**Transport.** FinTer communicates over TLS (HTTPS/WSS) or local loopback (`http://localhost:*`) only.
+
+**Credentials.** JWTs are stored in the operating system's credential vault through `keyring-rs` — Windows Credential Manager, macOS Keychain, or Linux Secret Service. Plaintext passwords are never persisted to disk.
+
+**Guest and cloud data never share files.**
+
+| | Guest / offline | Cloud account |
+| --- | --- | --- |
+| Layout | `~/.config/finter/guest_layout.json` | `~/.config/finter/cloud_layout.json` |
+| Settings | `~/.config/finter/guest_settings.json` | `~/.config/finter/cloud_settings.json` |
+| Credentials | — | OS keyring (`finter/session`) |
+
+Cloud files are cached locally and synchronized with the backend. Logging out restores the guest workspace immediately, without erasing or altering cloud configurations.
+
+</details>
+
+## Privacy & security
+
+FinTer does not ship API keys, application credentials, user data, session tokens, database dumps, compiled artifacts, or vendored dependency build directories. Authentication tokens are obtained at runtime and stored through the OS keyring where available. When a keyring is unavailable, the fallback session file lives in the per-user configuration directory and is restricted to the current user on Unix systems.
 
 Do not commit `.env` files, credentials, private keys, local session files, or generated build output. See [`.gitignore`](.gitignore).
 
-## Release builds
-
-Release automation is defined in [`.github/workflows`](.github/workflows). It runs tests before building platform binaries and produces SHA-256 checksums. Publishing update artifacts requires repository-hosted deployment secrets; those values must only be configured in GitHub Actions secrets and must never be committed to the repository.
-
-Before publishing, review the workflow endpoints, artifact names, update metadata URL, and repository permissions for your deployment environment.
-
 ## Project layout
 
-- `src/` — application, chart, UI, networking, authentication, and persistence code.
-- `assets/` — application icons, fonts, and UI assets.
-- `gpui-component-patched/` — the patched GPUI component dependency used by the application.
-- `tests/updater/` — isolated updater verification tests.
-- `scripts/` — release/publishing helpers.
-- `docs/` — product and engineering documentation.
+| Path | Contents |
+| --- | --- |
+| `src/` | Application, chart, UI, networking, authentication, and persistence code. |
+| `assets/` | Application icons, fonts, and UI assets. |
+| `gpui-component-patched/` | Patched GPUI component dependency used by the application. |
+| `tests/updater/` | Isolated updater verification tests. |
+| `scripts/` | Release and publishing helpers. |
+| `docs/` | Product and engineering documentation. |
+
+## Release builds
+
+Release automation lives in [`.github/workflows`](.github/workflows). It runs tests before building platform binaries and produces SHA-256 checksums. Publishing update artifacts requires repository-hosted deployment secrets; those values belong in GitHub Actions secrets and must never be committed.
+
+Before publishing, review the workflow endpoints, artifact names, update metadata URL, and repository permissions for your deployment environment. Update downloads require explicit user action, are size-bounded, and are re-verified against SHA-256 metadata before installation. SHA-256 detects corruption but does not authenticate publishers — treat the configured HTTPS update host as trusted code distribution infrastructure.
 
 ## License
 
 FinTer is released under the [MIT License](LICENSE).
+
+<div align="center">
+<sub>Built with Rust and GPUI · <a href="https://github.com/coin-watch/FinTer">github.com/coin-watch/FinTer</a></sub>
+</div>

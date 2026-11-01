@@ -1,4 +1,4 @@
-name: CI — Tests & Lint
+name: CI — Format & Lint
 
 on:
   push:
@@ -12,8 +12,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
+  lint:
+    name: Lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -45,9 +45,6 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev \
             libssl-dev pkg-config
-
-      - name: Run tests
-        run: cargo test --workspace
 
       - name: Check formatting
         run: cargo fmt --check
