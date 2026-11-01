@@ -133,3 +133,29 @@ jobs:
             target/${{ matrix.target }}/release/finter${{ matrix.extension }}.sha256
             target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage
             target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage.sha256
+
+  release:
+    name: Publish B2 updates
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/alpha' || github.ref == 'refs/heads/beta' || startsWith(github.ref, 'refs/tags/v')
+    concurrency:
+      group: b2-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.B2_REGION }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_PUBLIC_BASE_URL: ${{ secrets.B2_PUBLIC_BASE_URL }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Publish verified binaries then metadata
+        run: python3 scripts/publish_updates.py
+

@@ -6,7 +6,17 @@ Updates require explicit user action to download and install. Downloads are boun
 
 ## Release workflow
 
-The included GitHub Actions workflow currently builds and tests platform binaries. Publishing is intentionally not configured with FinTer hosting credentials. Before enabling deployment, review the workflow's branch/tag triggers, configure only repository-scoped GitHub Actions secrets, and ensure artifact URLs and metadata are hosted under your control.
+The included GitHub Actions workflow builds and tests platform binaries. On pushes to `alpha`, `beta`, or matching version tags (`v*`), it runs the `release` job to publish verified binaries to public Backblaze B2 using `scripts/publish_updates.py`.
+
+Alpha/beta builds stage under `<channel>/<sha>/` and update `<channel>/version.json`, pruning obsolete builds. Tagged releases stage under `releases/v<version>/` and update `latest/version.json`.
+
+Required GitHub Actions secrets:
+- `B2_KEY_ID`: Application key ID.
+- `B2_APPLICATION_KEY`: Application key secret.
+- `B2_ENDPOINT`: S3 endpoint URL (e.g. `https://s3.us-west-004.backblazeb2.com`).
+- `B2_REGION`: Bucket region (e.g. `us-west-004`).
+- `B2_BUCKET`: Target B2 bucket name.
+- `B2_PUBLIC_BASE_URL`: Public HTTPS origin serving the bucket files.
 
 ## Limits
 
