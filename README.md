@@ -19,6 +19,14 @@
 
 > **Early development.** APIs, storage formats, and UI behavior may change. Guest Mode is fully usable offline; cloud features are optional and require a compatible backend.
 
+## The workspace
+
+<div align="center">
+  <img src="assets/Screenshot.png" alt="FinTer desktop workspace showing a live candlestick chart and market data panels">
+  <br />
+  <sub><em>Live charting, market panels, and watchlists arranged in a resizable pane grid.</em></sub>
+</div>
+
 ## Why FinTer
 
 Most market tools ask you to choose between a browser tab that eats your RAM and a terminal that eats your afternoon. FinTer is a native desktop application: it starts fast, renders smoothly, and keeps your layout, symbols, and indicators on disk.
