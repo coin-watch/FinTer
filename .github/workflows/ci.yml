@@ -2,9 +2,10 @@ name: CI — Tests & Lint
 
 on:
   push:
-    branches: ['v*']
+    branches: [main, alpha, beta, release]
+    tags: ['v*']
   pull_request:
-    branches: [ main, alpha, beta, release]
+    branches: [main, alpha, beta, release]
 
 env:
   CARGO_TERM_COLOR: always

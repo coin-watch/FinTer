@@ -64,7 +64,8 @@ jobs:
             libwayland-dev libvulkan-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev \
-            libssl-dev pkg-config
+            libssl-dev pkg-config \
+            desktop-file-utils zsync file
 
       - name: Run tests
         run: cargo test --workspace
@@ -75,29 +76,75 @@ jobs:
       - name: Package Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          appdir="$RUNNER_TEMP/FinTer.AppDir"
-          mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications"
-          cp "target/${{ matrix.target }}/release/finter" "$appdir/usr/bin/finter"
-          cat > "$appdir/usr/share/applications/finter.desktop" <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=FinTer
-          Comment=FinTer desktop application
-          Exec=finter
-          Terminal=false
-          Categories=Utility;
-          EOF
-          curl -L --fail --retry 3 \
+
+          APPDIR="$RUNNER_TEMP/FinTer.AppDir"
+          OUT="target/$TARGET/release"
+          APPIMAGE="$OUT/finter-$TARGET.AppImage"
+
+          # appimagetool requires a very specific AppDir layout:
+          #   <AppDir>/AppRun                     executable launcher (mandatory)
+          #   <AppDir>/<name>.desktop             desktop file in the TOP LEVEL (mandatory)
+          #   <AppDir>/<Icon=value>.png           top-level icon used to create .DirIcon (mandatory)
+          #   <AppDir>/usr/bin/<binary>           the payload
+          # A desktop file only in usr/share/applications is NOT found by appimagetool,
+          # which is what produced "Desktop file not found, aborting".
+          rm -rf "$APPDIR"
+          mkdir -p \
+            "$APPDIR/usr/bin" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/1024x1024/apps" \
+            "$APPDIR/usr/share/pixmaps"
+
+          install -m 0755 "$OUT/finter" "$APPDIR/usr/bin/finter"
+
+          # Icon must be a PNG named after Icon= in the desktop file, in the top level.
+          install -m 0644 assets/app-icon.png "$APPDIR/finter.png"
+          install -m 0644 assets/app-icon.png "$APPDIR/usr/share/icons/hicolor/1024x1024/apps/finter.png"
+          install -m 0644 assets/app-icon.png "$APPDIR/usr/share/pixmaps/finter.png"
+
+          # Single source of truth: the desktop file shipped in assets/.
+          install -m 0644 assets/finter.desktop "$APPDIR/finter.desktop"
+          install -m 0644 assets/finter.desktop "$APPDIR/usr/share/applications/finter.desktop"
+
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/sh
+          set -e
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/finter" "$@"
+          APPRUN
+          chmod 0755 "$APPDIR/AppRun"
+
+          # appimagetool refuses to package files that other users cannot read.
+          chmod -R a+rX "$APPDIR"
+
+          if command -v desktop-file-validate >/dev/null; then
+            desktop-file-validate "$APPDIR/finter.desktop"
+          fi
+
+          curl -fsSL --retry 3 --retry-delay 2 \
             -o "$RUNNER_TEMP/appimagetool.AppImage" \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x "$RUNNER_TEMP/appimagetool.AppImage"
-          chmod +x "$appdir/usr/bin/finter"
-          ARCH=x86_64 "$RUNNER_TEMP/appimagetool.AppImage" --appimage-extract-and-run "$appdir" \
-            "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage"
-          sha256sum "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage" \
-            | cut -d ' ' -f 1 > "target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage.sha256"
+          chmod 0755 "$RUNNER_TEMP/appimagetool.AppImage"
+
+          rm -f "$APPIMAGE"
+          ARCH=x86_64 "$RUNNER_TEMP/appimagetool.AppImage" \
+            --appimage-extract-and-run --no-appstream \
+            "$APPDIR" "$APPIMAGE"
+
+          # Smoke test: unpack the result and make sure the AppImage really contains
+          # the launcher, the desktop file and the binary.
+          "$APPIMAGE" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          test -x squashfs-root/usr/bin/finter
+          test -f squashfs-root/finter.desktop
+          test -f squashfs-root/.DirIcon
+          rm -rf squashfs-root
+
+          sha256sum "$APPIMAGE" | cut -d ' ' -f 1 > "$APPIMAGE.sha256"
 
       - name: Self-sign macOS binary
         if: runner.os == 'macOS'
