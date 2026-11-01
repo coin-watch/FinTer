@@ -2,10 +2,10 @@ name: CI — Format & Lint
 
 on:
   push:
-    branches: [main, alpha, beta, release]
+    branches: [ alpha, beta, release]
     tags: ['v*']
   pull_request:
-    branches: [main, alpha, beta, release]
+    branches: [ alpha, beta, release]
 
 env:
   CARGO_TERM_COLOR: always
