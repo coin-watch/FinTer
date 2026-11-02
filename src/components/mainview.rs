@@ -1011,15 +1011,6 @@ impl MainView {
                                 });
                             }
                             view.load_and_apply_module(module_id.clone(), cx);
-                            
-                            // Save current dashboard selection to API
-                            if let Some(mut current_settings) = view.user_settings.clone() {
-                                if let Some(module) = view.active_module.clone() {
-                                    current_settings.current_dashboard = Some(module.module_name.clone());
-                                    view.user_settings = Some(current_settings.clone());
-                                    view.save_settings_to_api(current_settings, cx);
-                                }
-                            }
                         }
 
                         cx.notify();
@@ -1100,15 +1091,6 @@ impl MainView {
                                     });
                                 }
                                 view.load_and_apply_module(first_id.clone(), cx);
-                                
-                                // Save current dashboard selection to API
-                                if let Some(mut current_settings) = view.user_settings.clone() {
-                                    if let Some(module) = view.active_module.clone() {
-                                        current_settings.current_dashboard = Some(module.module_name.clone());
-                                        view.user_settings = Some(current_settings.clone());
-                                        view.save_settings_to_api(current_settings, cx);
-                                    }
-                                }
                             }
                         } else {
                             // No dashboards left, clear current_dashboard
@@ -1137,6 +1119,12 @@ impl MainView {
     fn load_settings_then_modules(&mut self, cx: &mut Context<Self>) {
         let client = self.api_client.clone();
         let rt = crate::data::client::tokio_runtime();
+        // Keep the locally cached selection so it can seed the server value
+        // when the API has no current dashboard yet (or is unreachable).
+        let local_dashboard = self
+            .user_settings
+            .as_ref()
+            .and_then(|settings| settings.current_dashboard.clone());
 
         cx.spawn(async move |this, cx| {
             let (settings_res, presets_res, modules_res) = rt
@@ -1223,9 +1211,7 @@ impl MainView {
             // If the API failed to give us a current dashboard, fallback to our local cache!
             let _ = this.update(cx, |view, cx| {
                 if current_dashboard.is_none() {
-                    if let Some(local) = &view.user_settings {
-                        current_dashboard = local.current_dashboard.clone();
-                    }
+                    current_dashboard = local_dashboard.clone();
                 }
                 // Done loading everything
                 view.is_restoring = false;
@@ -1634,6 +1620,14 @@ impl MainView {
                 dm.update(cx, |manager, cx| manager.set_active_module(module_id.clone(), cx));
             }
             self.current_page = Page::Home;
+
+            // Remember the dashboard the user last worked in so the next
+            // launch/login restores it instead of falling back to the first
+            // module. Keep this here (not only in the dashboard manager) so
+            // every entry point — tab clicks, closing a tab, reattaching a
+            // detached window — persists the selection.
+            self.remember_current_dashboard(&module.module_name, cx);
+
             cx.notify();
         } else {
             tracing::warn!(
@@ -1641,6 +1635,30 @@ impl MainView {
                 module_id
             );
         }
+    }
+
+    /// Persist the active dashboard name so it can be restored on the next
+    /// launch or login. No-op when the saved selection already matches.
+    fn remember_current_dashboard(&mut self, module_name: &str, cx: &mut Context<Self>) {
+        let already_current = self
+            .user_settings
+            .as_ref()
+            .and_then(|settings| settings.current_dashboard.as_deref())
+            == Some(module_name);
+
+        if already_current {
+            return;
+        }
+
+        // Without a settings record there is nothing safe to update; the
+        // selection will be persisted once settings finish loading.
+        let Some(mut settings) = self.user_settings.clone() else {
+            return;
+        };
+
+        settings.current_dashboard = Some(module_name.to_string());
+        self.user_settings = Some(settings.clone());
+        self.save_settings_to_api(settings, cx);
     }
 
     /// Build the secondary sidebar content panel
@@ -2140,15 +2158,6 @@ impl Render for MainView {
                                 manager.set_active_module(module_id.clone(), cx);
                             });
                             this.load_and_apply_module(module_id.clone(), cx);
-                            
-                            // Save current dashboard selection to API
-                            if let Some(mut current_settings) = this.user_settings.clone() {
-                                if let Some(module) = this.active_module.clone() {
-                                    current_settings.current_dashboard = Some(module.module_name.clone());
-                                    this.user_settings = Some(current_settings.clone());
-                                    this.save_settings_to_api(current_settings, cx);
-                                }
-                            }
                         }
                         crate::components::ui::dashboard_manager::DashboardManagerEvent::LoadPreset(tree) => {
                             tracing::info!("LoadPreset requested for layout preset: {:?}", tree);

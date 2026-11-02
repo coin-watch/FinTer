@@ -145,6 +145,13 @@ fn config_usize(config: Option<&serde_json::Map<String, serde_json::Value>>, key
         .unwrap_or(default)
 }
 
+fn config_bool(config: Option<&serde_json::Map<String, serde_json::Value>>, key: &str, default: bool) -> bool {
+    config
+        .and_then(|values| values.get(key))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(default)
+}
+
 fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Value, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |_window, cx| {
         let mut config = serde_json::Map::new();
@@ -2174,6 +2181,7 @@ impl PaneGridRenderer {
                                     let config = data.config.as_object();
                                     let exchange = config_str(config, "exchange", "binance");
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
+                                    let live_mode = config_bool(config, "live_mode", true);
                                     let mut execution_map = self.execution_views.borrow_mut();
                                     let needs_recreate = match execution_map.get(&pane_id) {
                                         Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
@@ -2198,6 +2206,7 @@ impl PaneGridRenderer {
                                                     p.set_size(content_w, content_h);
                                                     p.set_pane_id(pane_id.clone());
                                                     p.set_exchange(exchange.clone());
+                                                    p.set_live_mode(live_mode);
                                                     p
                                                 });
                                                 execution_map.insert(pane_id.clone(), ExecutionViewState {

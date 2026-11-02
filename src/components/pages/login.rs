@@ -5,6 +5,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::Icon;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The login page -- displayed when the user is not authenticated.
 /// Features a fully responsive, clean, user-friendly full-screen layout.
@@ -15,6 +17,10 @@ pub struct LoginPage {
     error_message: Option<String>,
     info_message: Option<String>,
     is_loading: bool,
+    /// Set while a Google OAuth flow is waiting for the browser callback.
+    google_in_progress: bool,
+    /// Cancellation token for the in-flight Google OAuth flow.
+    google_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl LoginPage {
@@ -29,6 +35,8 @@ impl LoginPage {
             error_message: None,
             info_message: None,
             is_loading: false,
+            google_in_progress: false,
+            google_cancel: None,
         }
     }
 
@@ -84,7 +92,11 @@ impl LoginPage {
 
         let client = self.api_client.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.login(&email, &password);
+            // `login` blocks on HTTP, so keep it off the UI thread.
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.login(&email, &password) })
+                .await;
             _ = this.update(cx, |this, cx| {
                 this.is_loading = false;
                 match result {
@@ -132,24 +144,43 @@ impl LoginPage {
     }
 
     fn do_google_login(&mut self, cx: &mut Context<Self>) {
-        if self.is_loading {
+        if self.is_loading || self.google_in_progress {
             return;
         }
 
         self.is_loading = true;
+        self.google_in_progress = true;
         self.error_message = None;
         self.info_message = Some("Connecting to Google in browser...".into());
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.google_cancel = Some(cancel.clone());
         cx.notify();
 
         let client = self.api_client.clone();
         cx.spawn(async move |this, cx| {
-            let result = client.login_with_google();
+            // `login_with_google` blocks until the browser hands back a session
+            // (or the timeout expires). Run it on the background executor so the
+            // UI stays responsive while the user finishes or abandons sign-in.
+            let cancel_for_task = cancel.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.login_with_google_cancellable(cancel_for_task) })
+                .await;
+            let was_cancelled = cancel.load(Ordering::Relaxed);
+
             _ = this.update(cx, |this, cx| {
                 this.is_loading = false;
+                this.google_in_progress = false;
+                this.google_cancel = None;
                 match result {
                     Ok(_session) => {
                         this.info_message = Some("Signed in with Google!".into());
                         cx.emit(AuthEvent::LoggedIn);
+                    }
+                    Err(_) if was_cancelled => {
+                        // User-initiated cancel: not an error worth alarming about.
+                        this.info_message = Some("Sign in cancelled.".into());
                     }
                     Err(e) => {
                         this.error_message = Some(format!("Google sign in failed: {}", e));
@@ -160,6 +191,26 @@ impl LoginPage {
             });
         })
         .detach();
+    }
+
+    /// Stop waiting for the Google OAuth callback. The background task notices
+    /// the flag within ~250ms, closes the loopback listener, and clears the
+    /// loading state.
+    fn cancel_google_login(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = self.google_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+            self.info_message = Some("Cancelling sign in...".into());
+            cx.notify();
+        }
+    }
+}
+
+impl Drop for LoginPage {
+    fn drop(&mut self) {
+        // Make sure an abandoned OAuth listener does not outlive the page.
+        if let Some(cancel) = self.google_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -183,6 +234,7 @@ impl Render for LoginPage {
         let error_message = self.error_message.clone();
         let info_message = self.info_message.clone();
         let is_loading = self.is_loading;
+        let google_in_progress = self.google_in_progress;
 
         let email_input = self.email.as_ref().unwrap().clone();
         let password_input = self.password.as_ref().unwrap().clone();
@@ -542,10 +594,18 @@ impl Render for LoginPage {
                                             .text_sm()
                                             .font_weight(gpui::FontWeight::MEDIUM)
                                             .text_color(fg)
-                                            .child("Continue with Google"),
+                                            .child(if google_in_progress {
+                                                "Cancel sign in"
+                                            } else {
+                                                "Continue with Google"
+                                            }),
                                     )
                                     .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.do_google_login(cx);
+                                        if this.google_in_progress {
+                                            this.cancel_google_login(cx);
+                                        } else {
+                                            this.do_google_login(cx);
+                                        }
                                     })),
                             )
                             // Divider
@@ -724,7 +784,10 @@ impl Render for LoginPage {
                                                     .size_3()
                                                     .text_color(muted),
                                             )
-                                            .on_click(cx.listener(|_this, _event, _window, cx| {
+                                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                                // Leaving for guest mode abandons any
+                                                // in-flight Google sign-in.
+                                                this.cancel_google_login(cx);
                                                 cx.emit(AuthEvent::ContinueAsGuest);
                                             })),
                                     ),

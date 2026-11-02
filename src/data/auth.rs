@@ -2,6 +2,170 @@ use crate::data::client::{ApiClient, tokio_runtime};
 use crate::data::error::{CoinWatchError, Result};
 use crate::data::models::{AuthResponse, AuthSession, LoginRequest, RefreshRequest};
 use crate::data::session_store;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Escape text before interpolating it into the loopback callback page.
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Public web origin used for links on the loopback callback page.
+/// Falls back to the production site when the app has no server configured.
+fn web_origin(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "https://coinwat.ch".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn callback_header(name: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes())
+        .expect("static callback header is valid")
+}
+
+/// CORS + Private Network Access headers let the coinwat.ch handoff page
+/// deliver the session to this loopback listener from a normal HTTPS page.
+fn callback_cors_headers() -> Vec<tiny_http::Header> {
+    vec![
+        callback_header("Access-Control-Allow-Origin", "*"),
+        callback_header("Access-Control-Allow-Methods", "GET, OPTIONS"),
+        callback_header("Access-Control-Allow-Headers", "*"),
+        callback_header("Access-Control-Allow-Private-Network", "true"),
+        callback_header("Access-Control-Max-Age", "600"),
+    ]
+}
+
+fn with_callback_cors<R: std::io::Read>(
+    response: tiny_http::Response<R>,
+) -> tiny_http::Response<R> {
+    callback_cors_headers()
+        .into_iter()
+        .fold(response, |response, header| response.with_header(header))
+}
+
+/// Branded fallback page shown if the browser navigates directly to the
+/// loopback listener instead of using the coinwat.ch handoff page.
+fn native_callback_page(web_origin: &str, success: bool, email: &str, message: &str) -> String {
+    let host = url::Url::parse(web_origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "coinwat.ch".to_string());
+
+    let (title, body, icon, accent, status) = if success {
+        (
+            "You're signed in",
+            "FinTer is ready. You can close this tab and return to the app.",
+            r#"<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"#,
+            "#039952",
+            "HANDOFF COMPLETE",
+        )
+    } else {
+        (
+            "Sign-in didn't complete",
+            message,
+            r#"<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>"#,
+            "#f87171",
+            "ACTION NEEDED",
+        )
+    };
+
+    let email_row = if success && !email.is_empty() {
+        format!(
+            r#"<div class="email">{}<span>Signed in with Google</span></div>"#,
+            escape_html(email)
+        )
+    } else {
+        String::new()
+    };
+
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>__TITLE__ — FinTer</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;background:#060908;color:#e8edea;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.grid{position:fixed;inset:0;background-image:linear-gradient(to right,rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(to bottom,rgba(255,255,255,.035) 1px,transparent 1px);background-size:56px 56px;mask-image:radial-gradient(ellipse at center,black 20%,transparent 75%);pointer-events:none}
+.glow{position:fixed;top:-18rem;left:50%;width:36rem;height:36rem;transform:translateX(-50%);border-radius:999px;background:__ACCENT__22;filter:blur(120px);pointer-events:none}
+header{position:relative;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 24px}
+.brand{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none}
+.brand img{width:36px;height:36px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:#0c1410}
+.brand strong{display:block;font-size:15px;letter-spacing:-.02em}
+.brand small{display:block;margin-top:4px;font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:#78857e}
+.badge{border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);border-radius:999px;padding:6px 12px;font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:#9aa69f;white-space:nowrap}
+main{position:relative;z-index:1;flex:1;display:flex;align-items:center;justify-content:center;padding:32px 16px}
+.card{width:100%;max-width:520px;overflow:hidden;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(10,15,12,.92);box-shadow:0 30px 80px -20px rgba(0,0,0,.9)}
+.line{height:1px;background:linear-gradient(90deg,transparent,__ACCENT__99,transparent)}
+.body{padding:32px}
+.status{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:24px}
+.icon{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:16px;border:1px solid __ACCENT__55;background:__ACCENT__18;color:__ACCENT__}
+h1{margin:0;font-size:28px;line-height:1.15;letter-spacing:-.03em}
+p{margin:8px 0 0;font-size:12px;line-height:1.7;color:#8b9891}
+.email{margin-top:24px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.025);border-radius:12px;padding:12px;font-size:11px;color:#c7d2cc;overflow-wrap:anywhere}
+.email span{display:block;margin-top:3px;font-size:10px;color:#78857e}
+.actions{display:flex;gap:8px;margin-top:28px;flex-wrap:wrap}
+a.button,button.button{flex:1;min-width:140px;display:inline-flex;align-items:center;justify-content:center;gap:8px;border-radius:8px;padding:11px 16px;font:inherit;font-size:11px;font-weight:600;text-decoration:none;cursor:pointer;border:1px solid transparent}
+.primary{background:#039952;color:#fff}
+.primary:hover{background:#04b862}
+.secondary{border-color:rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:#c7d2cc}
+.secondary:hover{background:rgba(255,255,255,.06)}
+.foot{border-top:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.02);padding:16px 32px;font-size:9px;color:#6f7c75;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.foot strong{color:#a7b3ac;font-weight:500}
+footer.page{position:relative;z-index:1;padding:0 24px 20px;text-align:center;font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:#4f5a54}
+@media(max-width:520px){.body{padding:24px}.foot{padding:16px 24px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="grid"></div>
+<div class="glow"></div>
+<header>
+<a class="brand" href="__ORIGIN__">
+<img src="__ORIGIN__/finter-logo.svg" alt="" referrerpolicy="no-referrer">
+<span><strong>FinTer</strong><small>CoinWatch terminal</small></span>
+</a>
+<span class="badge">__STATUS__</span>
+</header>
+<main>
+<div class="card">
+<div class="line"></div>
+<div class="body">
+<div class="status"><div class="icon">__ICON__</div></div>
+<h1>__TITLE__</h1>
+<p>__BODY__</p>
+__EMAIL_ROW__
+<div class="actions">
+<a class="button primary" href="__ORIGIN__">Open __HOST__</a>
+<button class="button secondary" type="button" onclick="window.close()">Close this tab</button>
+</div>
+</div>
+<div class="foot"><span>Served by <strong>FinTer</strong> on this device</span><span>__HOST__</span></div>
+</div>
+</main>
+<footer class="page">CoinWatch · FinTer native terminal</footer>
+</body>
+</html>"#
+        .replace("__ORIGIN__", &escape_html(web_origin))
+        .replace("__HOST__", &escape_html(&host))
+        .replace("__TITLE__", &escape_html(title))
+        .replace("__BODY__", &escape_html(body))
+        .replace("__ICON__", icon)
+        .replace("__ACCENT__", accent)
+        .replace("__STATUS__", status)
+        .replace("__EMAIL_ROW__", &email_row)
+}
 
 impl ApiClient {
     /// Log in with email and password.
@@ -301,18 +465,28 @@ impl ApiClient {
         }
     }
 
-    /// Login with Google OAuth via website.
+    /// Login with Google OAuth via the CoinWatch website.
     ///
     /// This method:
     /// 1. Starts a local HTTP server on a random port
-    /// 2. Opens the system browser to the OAuth URL
-    /// 3. Waits for the callback with session tokens
+    /// 2. Opens the system browser to the configured CoinWatch origin
+    ///    (staging.coinwat.ch / coinwat.ch), never a localhost page
+    /// 3. The website hands the session to the local listener in the background
     /// 4. Stores the session and returns it
     ///
     /// Blocking — run from a background thread.
     pub fn login_with_google(&self) -> Result<AuthSession> {
+        self.login_with_google_cancellable(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Same as [`Self::login_with_google`], but the wait loop aborts promptly
+    /// once `cancel` is set. This lets the UI stop waiting when the user
+    /// changes their mind instead of blocking until the 5 minute timeout.
+    ///
+    /// Blocking — run from a background thread.
+    pub fn login_with_google_cancellable(&self, cancel: Arc<AtomicBool>) -> Result<AuthSession> {
         use std::net::TcpListener;
-        use std::sync::{Arc, Mutex};
+        use std::sync::Mutex;
         use url::Url;
 
         // Find an available port
@@ -325,9 +499,11 @@ impl ApiClient {
 
         tracing::info!("OAuth callback server listening on port {}", port);
 
-        // Build OAuth URL - use the url() method to construct the full URL
-        let full_url = self.url("/auth/native");
-        let mut oauth_url = Url::parse(&full_url)
+        // Always send the browser to a real CoinWatch origin. The configured
+        // server URL is preferred; an unconfigured app falls back to production
+        // instead of trying to open a localhost URL.
+        let web_base = web_origin(&self.base_url());
+        let mut oauth_url = Url::parse(&format!("{}/auth/native", web_base))
             .map_err(|e| CoinWatchError::Auth(format!("Invalid URL: {}", e)))?;
         oauth_url
             .query_pairs_mut()
@@ -352,111 +528,145 @@ impl ApiClient {
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout {
-            if let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(1)) {
-                let url_str = format!("http://localhost{}", request.url());
+            // Abort promptly when the user cancels (or the page is closed)
+            // instead of keeping the loopback listener alive for 5 minutes.
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CoinWatchError::Auth("Sign in cancelled".into()));
+            }
 
-                if let Ok(url) = Url::parse(&url_str)
-                    && url.path() == "/callback"
-                {
-                    // Extract tokens from query params
-                    let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            let request = match server.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(Some(request)) => request,
+                Ok(None) => {
+                    if session_result.lock().unwrap().is_some() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            };
 
-                    let session = if let (
-                        Some(access_token),
-                        Some(refresh_token),
-                        Some(user_id),
-                        Some(email),
-                    ) = (
-                        params.get("access_token").map(|s| s.to_string()),
-                        params.get("refresh_token").map(|s| s.to_string()),
-                        params.get("user_id").map(|s| s.to_string()),
-                        params.get("email").map(|s| s.to_string()),
-                    ) {
-                        let expires_at =
-                            params.get("expires_at").and_then(|s| s.parse::<i64>().ok());
-                        // Extract optional name and avatar_url from OAuth callback
-                        let name = params
-                            .get("name")
-                            .map(|s| s.to_string())
-                            .filter(|s| !s.is_empty());
-                        let avatar_url = params
-                            .get("avatar_url")
-                            .map(|s| s.to_string())
-                            .filter(|s| !s.is_empty());
+            let method = request.method().clone();
+            let request_url = request.url().to_string();
 
-                        tracing::info!(
-                            "OAuth callback received - name: {:?}, avatar_url: {:?}",
-                            name,
-                            avatar_url
-                        );
+            // Browsers send a Private Network Access preflight before a public
+            // HTTPS page is allowed to call the loopback listener.
+            if method == tiny_http::Method::Options {
+                let response = with_callback_cors(tiny_http::Response::empty(204));
+                let _ = request.respond(response);
+                continue;
+            }
 
-                        let session = AuthSession {
-                            user_id,
-                            email,
-                            access_token,
-                            refresh_token,
-                            expires_at,
-                            name,
-                            avatar_url,
-                        };
-
-                        let _ = self.set_session(session.clone()).map_err(|e| {
-                            tracing::warn!(
-                                "session stored in memory but persistence failed: {}",
-                                e
-                            );
-                        });
-                        Ok(session)
-                    } else {
-                        Err(CoinWatchError::Auth(
-                            "Missing required OAuth parameters".into(),
-                        ))
-                    };
-
-                    // Send success response to browser
-                    let response_body = r#"
-                            <!DOCTYPE html>
-                            <html>
-                            <head>
-                                <title>Login Successful</title>
-                                <style>
-                                    body { font-family: system-ui; text-align: center; padding: 50px; }
-                                    h1 { color: #10b981; }
-                                </style>
-                            </head>
-                            <body>
-                                <h1>✓ Login Successful</h1>
-                                <p>You can now close this window and return to CoinWatch.</p>
-                                <script>window.close();</script>
-                            </body>
-                            </html>
-                        "#;
-
-                    let response = tiny_http::Response::from_string(response_body).with_header(
+            let url_str = format!("http://127.0.0.1{}", request_url);
+            let Ok(url) = Url::parse(&url_str) else {
+                let response = with_callback_cors(
+                    tiny_http::Response::from_string("Bad request").with_header(
                         tiny_http::Header::from_bytes(
                             &b"Content-Type"[..],
-                            &b"text/html; charset=utf-8"[..],
+                            &b"text/plain; charset=utf-8"[..],
                         )
                         .unwrap(),
-                    );
-                    let _ = request.respond(response);
+                    ),
+                );
+                let _ = request.respond(response);
+                continue;
+            };
 
-                    *session_result_clone.lock().unwrap() = Some(session);
-                    break;
-                }
+            if method != tiny_http::Method::Get || url.path() != "/callback" {
+                let response = with_callback_cors(
+                    tiny_http::Response::from_string("Not found").with_header(
+                        tiny_http::Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/plain; charset=utf-8"[..],
+                        )
+                        .unwrap(),
+                    ),
+                );
+                let _ = request.respond(response);
+                continue;
             }
 
-            // Check if we got a result
-            if session_result.lock().unwrap().is_some() {
-                break;
-            }
+            // Extract tokens from query params
+            let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+
+            let session = if let (
+                Some(access_token),
+                Some(refresh_token),
+                Some(user_id),
+                Some(email),
+            ) = (
+                params.get("access_token").map(|s| s.to_string()),
+                params.get("refresh_token").map(|s| s.to_string()),
+                params.get("user_id").map(|s| s.to_string()),
+                params.get("email").map(|s| s.to_string()),
+            ) {
+                let expires_at = params.get("expires_at").and_then(|s| s.parse::<i64>().ok());
+                let name = params
+                    .get("name")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+                let avatar_url = params
+                    .get("avatar_url")
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+
+                tracing::info!(
+                    "OAuth callback received - name: {:?}, avatar_url: {:?}",
+                    name,
+                    avatar_url
+                );
+
+                let session = AuthSession {
+                    user_id,
+                    email,
+                    access_token,
+                    refresh_token,
+                    expires_at,
+                    name,
+                    avatar_url,
+                };
+
+                let _ = self.set_session(session.clone()).map_err(|e| {
+                    tracing::warn!("session stored in memory but persistence failed: {}", e);
+                });
+                Ok(session)
+            } else {
+                Err(CoinWatchError::Auth(
+                    "Missing required OAuth parameters".into(),
+                ))
+            };
+
+            let success = session.is_ok();
+            let email = session
+                .as_ref()
+                .map(|session| session.email.as_str())
+                .unwrap_or("");
+            let message = session
+                .as_ref()
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            let response_body = native_callback_page(&web_base, success, email, &message);
+
+            let response = with_callback_cors(
+                tiny_http::Response::from_string(response_body).with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap(),
+                ),
+            );
+            let _ = request.respond(response);
+
+            *session_result_clone.lock().unwrap() = Some(session);
+            break;
         }
 
         // Extract result
         let result = session_result.lock().unwrap().take();
         result.unwrap_or_else(|| {
             Err(CoinWatchError::Auth(
-                "OAuth timeout or user cancelled".into(),
+                "Timed out waiting for sign in".into(),
             ))
         })
     }

@@ -37,6 +37,11 @@ pub struct ExecutionPanel {
     margin: f64,
     notification: Option<(bool /* is_error */, String)>,
     is_live_mode: bool,
+    /// Real quote-currency balance fetched from the selected exchange.
+    live_balance: Option<f64>,
+    live_balance_loading: bool,
+    live_balance_error: Option<String>,
+    last_live_balance_fetch: Option<std::time::Instant>,
     last_price: Option<f64>,
     price_direction: i8, // 1 = up, -1 = down, 0 = neutral
     limit_price: Option<f64>,
@@ -105,6 +110,15 @@ impl ExecutionPanel {
                                 .unwrap()
                                 .set_mark_price(&this.symbol, p);
                         }
+                        if this.is_live_mode {
+                            let due = this
+                                .last_live_balance_fetch
+                                .map(|t| t.elapsed() >= std::time::Duration::from_secs(30))
+                                .unwrap_or(true);
+                            if due {
+                                this.refresh_live_balance(cx);
+                            }
+                        }
                         if changed {
                             cx.notify();
                         }
@@ -122,6 +136,8 @@ impl ExecutionPanel {
             .ok()
             .and_then(|ts| ts.get_mark_price(&sym_str));
 
+        TradeStore::global().lock().unwrap().active_mode = TradingMode::Live;
+
         Self {
             feed,
             title: title_str,
@@ -136,7 +152,13 @@ impl ExecutionPanel {
             leverage: 10,
             margin: 100.0,
             notification: None,
-            is_live_mode: false,
+            // The desk opens in live mode by default; restored panes override
+            // this from their saved module config.
+            is_live_mode: true,
+            live_balance: None,
+            live_balance_loading: false,
+            live_balance_error: None,
+            last_live_balance_fetch: None,
             last_price: initial_price,
             price_direction: 0,
             limit_price: None,
@@ -171,6 +193,41 @@ impl ExecutionPanel {
 
     pub fn set_pane_id(&mut self, pane_id: impl Into<String>) {
         self.pane_id = Some(pane_id.into());
+    }
+
+    /// Apply the persisted live/paper mode when a pane is restored.
+    pub fn set_live_mode(&mut self, live: bool) {
+        self.is_live_mode = live;
+        TradeStore::global().lock().unwrap().active_mode = self.active_mode();
+    }
+
+    /// Persist the current live/paper mode into the pane's module config.
+    fn persist_live_mode(&self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.pane_id.clone() else {
+            return;
+        };
+        let live_mode = self.is_live_mode;
+        cx.spawn(async move |_this, cx| {
+            let mut config = serde_json::Map::new();
+            config.insert(
+                "live_mode".to_string(),
+                serde_json::Value::Bool(live_mode),
+            );
+            let _ = cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(
+                |global, cx| {
+                    let _ = global.view.update(cx, |view, cx| {
+                        view.handle_pane_event(
+                            &crate::components::ui::pane_grid::renderer::PaneGridEvent::UpdateModuleConfig {
+                                pane_id,
+                                config: serde_json::Value::Object(config),
+                            },
+                            cx,
+                        );
+                    });
+                },
+            );
+        })
+        .detach();
     }
 
     fn price(&self) -> Option<f64> {
@@ -223,13 +280,15 @@ impl ExecutionPanel {
     }
 
     fn quote_asset(&self) -> &str {
-        if let Some(pos) = self.symbol.find('/') {
+        let quote = if let Some(pos) = self.symbol.find('/') {
             &self.symbol[pos + 1..]
         } else if let Some(pos) = self.symbol.find('-') {
             &self.symbol[pos + 1..]
         } else {
             "USDT"
-        }
+        };
+        // Futures symbols may carry a settlement suffix, e.g. BTC/USDT:USDT.
+        quote.split(':').next().unwrap_or(quote)
     }
 
     fn calculate_liquidation(&self, entry: f64) -> f64 {
@@ -247,6 +306,72 @@ impl ExecutionPanel {
         } else {
             TradingMode::Paper
         }
+    }
+
+    /// Refresh the real account balance for the selected exchange.
+    ///
+    /// Runs the blocking CCXT request on the shared Tokio runtime and applies
+    /// the result back on the GPUI thread. The periodic timer calls this again
+    /// once the refresh interval has elapsed; results from a previous venue are
+    /// discarded if the desk switches exchanges mid-request.
+    fn refresh_live_balance(&mut self, cx: &mut Context<Self>) {
+        if !self.is_live_mode || self.live_balance_loading {
+            return;
+        }
+
+        let exchange = self.exchange.clone();
+        let exchange_for_result = exchange.clone();
+        let quote = self.quote_asset().to_string();
+        let quote_for_result = quote.clone();
+
+        self.live_balance_loading = true;
+        self.last_live_balance_fetch = Some(std::time::Instant::now());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        crate::data::client::tokio_runtime().spawn(async move {
+            let result =
+                crate::data::exchange_balance::fetch_available_balance(&exchange, &quote).await;
+            let _ = tx.send(result);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx
+                .await
+                .unwrap_or_else(|_| Err("Live balance request was cancelled".to_string()));
+            this.update(cx, |this, cx| {
+                // Ignore a response that arrived after the desk switched venues
+                // or changed to a symbol with a different quote currency.
+                if this.exchange != exchange_for_result
+                    || this.quote_asset() != quote_for_result.as_str()
+                {
+                    this.live_balance_loading = false;
+                    return;
+                }
+                this.live_balance_loading = false;
+                match result {
+                    Ok(balance) => {
+                        this.live_balance = Some(balance);
+                        this.live_balance_error = None;
+                        TradeStore::global()
+                            .lock()
+                            .unwrap()
+                            .set_live_balance(balance);
+                    }
+                    Err(error) => {
+                        // Avoid re-notifying the same failure on every refresh.
+                        let is_new_error =
+                            this.live_balance_error.as_deref() != Some(error.as_str());
+                        this.live_balance_error = Some(error.clone());
+                        if is_new_error && this.notification.is_none() {
+                            this.notification = Some((true, format!("LIVE BALANCE: {error}")));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn adjust_margin(&mut self, delta: f64, cx: &mut Context<Self>) {
@@ -284,9 +409,19 @@ impl ExecutionPanel {
         self.price_focused = false;
         self.margin_focused = false;
         self.size_focused = false;
+        self.live_balance = None;
+        self.live_balance_error = None;
+        // Allow a fresh request even if the previous venue's request is still
+        // in flight; its result is discarded by the exchange check below.
+        self.live_balance_loading = false;
         let symbols = GatewayRegistry::global().symbols(&new_exchange);
         if !symbols.is_empty() && !symbols.contains(&self.symbol) {
             self.symbol = symbols[0].clone();
+        }
+        // Refresh after the symbol update so the request uses the new venue's
+        // quote currency.
+        if self.is_live_mode {
+            self.refresh_live_balance(cx);
         }
 
         if let Some(ref pid) = self.pane_id {
@@ -321,11 +456,19 @@ impl ExecutionPanel {
         new_symbol: String,
         cx: &mut Context<Self>,
     ) {
+        let previous_quote = self.quote_asset().to_string();
         self.symbol = new_symbol.clone();
         self.limit_price = None;
         self.price_focused = false;
         self.margin_focused = false;
         self.size_focused = false;
+        // The live balance is denominated in the quote currency, so refresh it
+        // when the new symbol settles in a different currency.
+        if self.is_live_mode && self.quote_asset() != previous_quote.as_str() {
+            self.live_balance = None;
+            self.live_balance_loading = false;
+            self.refresh_live_balance(cx);
+        }
         if let Some(ref pid) = self.pane_id {
             let pane_id = pid.clone();
             let sym = self.symbol.clone();
@@ -653,11 +796,15 @@ impl ExecutionPanel {
 
     pub fn reset_balance(&mut self, cx: &mut Context<Self>) {
         if self.is_live_mode {
-            TradeStore::global().lock().unwrap().reset_live();
+            TradeStore::global()
+                .lock()
+                .unwrap()
+                .reset_live_positions();
             self.notification = Some((
                 false,
-                "Live trading desk reset: live simulated balance reset to $10,000.00 USDT.".to_string(),
+                "Live trading desk reset: simulated live positions and orders cleared.".to_string(),
             ));
+            self.refresh_live_balance(cx);
         } else {
             TradeStore::global().lock().unwrap().reset_paper();
             self.notification = Some((
@@ -795,6 +942,38 @@ impl Render for ExecutionPanel {
         let quote = self.quote_asset().to_string();
         let mono_font = cx.theme().mono_font_family.clone();
 
+        // In live mode the displayed balance is the real exchange balance. Until
+        // the first successful CCXT response arrives, show a placeholder rather
+        // than the simulated ledger value.
+        let live_balance_ready = !self.is_live_mode || self.live_balance.is_some();
+        let avail_header = if live_balance_ready {
+            format!("${avail_balance:.2} {quote}")
+        } else if self.live_balance_loading {
+            format!("syncing {quote}")
+        } else {
+            format!("— {quote}")
+        };
+        let avail_compact = if live_balance_ready {
+            format!("${avail_balance:.0}")
+        } else {
+            "—".to_string()
+        };
+        let avail_wide = if live_balance_ready {
+            format!("${avail_balance:.1}")
+        } else {
+            "—".to_string()
+        };
+        let equity_compact = if live_balance_ready {
+            format!("EQ ${total_equity:.0}")
+        } else {
+            "EQ —".to_string()
+        };
+        let equity_wide = if live_balance_ready {
+            format!("EQ: ${total_equity:.1}")
+        } else {
+            "EQ: —".to_string()
+        };
+
         // Responsive breakpoints based on pane dimensions
         let is_ultra_wide = self.width >= 700.0 && self.height < 450.0;
         let is_wide = !is_ultra_wide
@@ -907,7 +1086,6 @@ impl Render for ExecutionPanel {
                                     .px_2()
                                     .py(px(2.0))
                                     .cursor_pointer()
-                                    .rounded(px(4.0))
                                     .border_1()
                                     .border_color(if self.is_live_mode {
                                         c.danger.opacity(0.8)
@@ -956,6 +1134,10 @@ impl Render for ExecutionPanel {
                                                     "Switched to VIRTUAL PAPER Simulation Mode (Risk-Free)".to_string(),
                                                 ));
                                             }
+                                            if this.is_live_mode {
+                                                this.refresh_live_balance(cx);
+                                            }
+                                            this.persist_live_mode(cx);
                                             cx.notify();
                                         }),
                                     )
@@ -1037,7 +1219,6 @@ impl Render for ExecutionPanel {
                                 .cursor_pointer()
                                 .px_1()
                                 .py(px(0.5))
-                                .rounded(px(3.0))
                                 .hover(|s| s.bg(c.muted.opacity(0.5)))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1076,7 +1257,6 @@ impl Render for ExecutionPanel {
                                 px(8.0)
                             })
                             .cursor_pointer()
-                            .rounded(px(5.0))
                             .border_1()
                             .border_color(if is_long {
                                 c.bullish
@@ -1142,7 +1322,6 @@ impl Render for ExecutionPanel {
                                 px(8.0)
                             })
                             .cursor_pointer()
-                            .rounded(px(5.0))
                             .border_1()
                             .border_color(if !is_long {
                                 c.bearish
@@ -1199,7 +1378,6 @@ impl Render for ExecutionPanel {
                 let type_row = h_flex()
                     .w_full()
                     .p(px(2.0))
-                    .rounded(px(4.0))
                     .bg(c.muted.opacity(0.18))
                     .border_1()
                     .border_color(c.border.opacity(0.3))
@@ -1213,7 +1391,6 @@ impl Render for ExecutionPanel {
                             .justify_center()
                             .text_center()
                             .cursor_pointer()
-                            .rounded(px(3.0))
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .bg(if self.order_type == OrderType::Market {
@@ -1248,7 +1425,6 @@ impl Render for ExecutionPanel {
                             .justify_center()
                             .text_center()
                             .cursor_pointer()
-                            .rounded(px(3.0))
                             .text_xs()
                             .font_weight(FontWeight::BOLD)
                             .bg(if self.order_type == OrderType::Limit {
@@ -1367,7 +1543,6 @@ impl Render for ExecutionPanel {
                                     .text_center()
                                     .py(if is_micro_h { px(1.5) } else { px(2.5) })
                                     .cursor_pointer()
-                                    .rounded(px(3.0))
                                     .text_xs()
                                     .font_weight(FontWeight::BOLD)
                                     .font_family(mono_font.clone())
@@ -1375,19 +1550,31 @@ impl Render for ExecutionPanel {
                                     .border_color(if active {
                                         c.primary
                                     } else {
-                                        c.border.opacity(0.4)
+                                        c.border
                                     })
                                     .bg(if active {
                                         c.primary
                                     } else {
-                                        c.muted.opacity(0.2)
+                                        c.muted.opacity(0.35)
                                     })
                                     .text_color(if active {
                                         c.primary_foreground
                                     } else {
                                         c.muted_foreground
                                     })
-                                    .hover(|s| s.bg(c.muted.opacity(0.5)))
+                                    .hover(move |s| {
+                                        // Keep the selected chip on its primary palette so
+                                        // the foreground stays legible in dark themes.
+                                        if active {
+                                            s.bg(c.primary_hover)
+                                                .border_color(c.primary_hover)
+                                                .text_color(c.primary_foreground)
+                                        } else {
+                                            s.bg(c.muted.opacity(0.45))
+                                                .border_color(c.border)
+                                                .text_color(c.foreground)
+                                        }
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -1445,7 +1632,6 @@ impl Render for ExecutionPanel {
                                             .id("last-price-pill")
                                             .px_1()
                                             .py(px(0.5))
-                                            .rounded(px(2.0))
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
                                             .cursor_pointer()
@@ -1578,8 +1764,7 @@ impl Render for ExecutionPanel {
                                     .text_color(if self.is_live_mode { c.danger } else { c.muted_foreground })
                                     .font_weight(if self.is_live_mode { FontWeight::BOLD } else { FontWeight::NORMAL })
                                     .child(format!(
-                                        "Avail: ${:.2} {quote} [{}]",
-                                        avail_balance,
+                                        "Avail: {avail_header} [{}]",
                                         if self.is_live_mode { "LIVE" } else { "PAPER" }
                                     )),
                             ),
@@ -1600,7 +1785,6 @@ impl Render for ExecutionPanel {
                                     .justify_center()
                                     .text_center()
                                     .cursor_pointer()
-                                    .rounded(px(3.0))
                                     .bg(c.muted.opacity(0.25))
                                     .border_1()
                                     .border_color(c.border.opacity(0.5))
@@ -1632,7 +1816,6 @@ impl Render for ExecutionPanel {
                                         .justify_center()
                                         .text_center()
                                         .cursor_pointer()
-                                        .rounded(px(3.0))
                                         .bg(c.muted.opacity(0.18))
                                         .border_1()
                                         .border_color(c.border.opacity(0.4))
@@ -1666,7 +1849,6 @@ impl Render for ExecutionPanel {
                                         .justify_center()
                                         .text_center()
                                         .cursor_pointer()
-                                        .rounded(px(3.0))
                                         .text_xs()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .font_family(mono_font.clone())
@@ -1825,17 +2007,16 @@ impl Render for ExecutionPanel {
                     );
 
                 // 6. Tactical Execution Action Bar (Short & Compact)
-                let mode_action_tag = if self.is_live_mode { "⚡ LIVE" } else { "🛡 PAPER" };
-                let execute_btn_el = div()
+                let execute_btn_el = h_flex()
                     .id("submit-order-btn")
                     .w_full()
-                    .py(if is_micro_h {
-                        px(3.0)
+                    .h(px(if is_micro_h {
+                        25.0
                     } else if is_compact_h {
-                        px(4.0)
+                        27.0
                     } else {
-                        px(5.0)
-                    })
+                        29.0
+                    }))
                     .items_center()
                     .justify_center()
                     .text_center()
@@ -1857,19 +2038,50 @@ impl Render for ExecutionPanel {
                         }),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .child(if is_very_narrow {
-                                format!("{} {} {}", mode_action_tag, if is_long { "BUY" } else { "SELL" }, Self::fmt_size(qty))
-                            } else {
-                                format!(
-                                    "EXECUTE {} {} {} {base}",
-                                    mode_action_tag,
-                                    if is_long { "BUY" } else { "SELL" },
-                                    Self::fmt_size(qty)
+                        // Keep the emoji in its own element: emoji fallback fonts can
+                        // have very different ascent/descent metrics, which would shift
+                        // the label's shared baseline and make the text look off-center.
+                        h_flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(6.0))
+                            .when(!is_very_narrow, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .line_height(gpui::relative(1.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("EXECUTE"),
                                 )
-                            }),
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(gpui::relative(1.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(if self.is_live_mode { "⚡" } else { "🛡" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(gpui::relative(1.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(if is_very_narrow {
+                                        format!(
+                                            "{} {} {}",
+                                            if self.is_live_mode { "LIVE" } else { "PAPER" },
+                                            if is_long { "BUY" } else { "SELL" },
+                                            Self::fmt_size(qty)
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} {} {} {base}",
+                                            if self.is_live_mode { "LIVE" } else { "PAPER" },
+                                            if is_long { "BUY" } else { "SELL" },
+                                            Self::fmt_size(qty)
+                                        )
+                                    }),
+                            ),
                     );
 
                 v_flex()
@@ -1980,11 +2192,11 @@ impl Render for ExecutionPanel {
                                     .font_family(mono_font.clone())
                                     .text_color(c.muted_foreground)
                                     .child(if is_very_narrow {
-                                        format!("${:.0}", avail_balance)
+                                        avail_compact.clone()
                                     } else if is_narrow {
-                                        format!("{} ${:.0}", if self.is_live_mode { "LIVE" } else { "CASH" }, avail_balance)
+                                        format!("{} {}", if self.is_live_mode { "LIVE" } else { "CASH" }, avail_compact)
                                     } else {
-                                        format!("{}: ${:.1}", if self.is_live_mode { "LIVE CASH" } else { "PAPER CASH" }, avail_balance)
+                                        format!("{}: {}", if self.is_live_mode { "LIVE CASH" } else { "PAPER CASH" }, avail_wide)
                                     }),
                             )
                             .when(!is_narrow, |this| {
@@ -2019,12 +2231,10 @@ impl Render for ExecutionPanel {
                                     .font_weight(FontWeight::BOLD)
                                     .font_family(mono_font)
                                     .text_color(c.foreground)
-                                    .child(if is_very_narrow {
-                                        format!("EQ ${:.0}", total_equity)
-                                    } else if is_narrow {
-                                        format!("EQ ${:.0}", total_equity)
+                                    .child(if is_very_narrow || is_narrow {
+                                        equity_compact
                                     } else {
-                                        format!("EQ: ${:.1}", total_equity)
+                                        equity_wide
                                     }),
                             ),
                     )
@@ -2032,6 +2242,7 @@ impl Render for ExecutionPanel {
                         Button::new("reset-desk-btn")
                             .xsmall()
                             .ghost()
+                            .rounded(px(0.0))
                             .label(if is_narrow {
                                 "Reset"
                             } else if self.is_live_mode {
@@ -2070,7 +2281,8 @@ impl Panel for ExecutionPanel {
             info: PanelInfo::Panel(serde_json::json!({
                 "title": self.title,
                 "exchange": self.exchange,
-                "symbol": self.symbol
+                "symbol": self.symbol,
+                "live_mode": self.is_live_mode
             })),
         }
     }

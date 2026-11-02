@@ -7,6 +7,7 @@ pub mod client;
 pub mod credits;
 pub mod dashboard_store;
 pub mod error;
+pub mod exchange_balance;
 pub mod exchanges;
 pub mod feed;
 pub mod gateway_registry;

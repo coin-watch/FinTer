@@ -127,6 +127,19 @@ impl TradeStore {
         self.balance(self.active_mode)
     }
 
+    /// Replace the live cash balance with the real account balance fetched
+    /// from the selected exchange. The paper ledger is left untouched.
+    pub fn set_live_balance(&mut self, balance: f64) {
+        if !balance.is_finite() || balance < 0.0 {
+            return;
+        }
+        if (self.live_balance - balance).abs() <= f64::EPSILON {
+            return;
+        }
+        self.live_balance = balance;
+        self.version = self.version.wrapping_add(1);
+    }
+
     /// Record the latest live market price for `symbol`.
     ///
     /// Mark prices are stored under a single canonical key per logical symbol so
@@ -477,6 +490,14 @@ impl TradeStore {
 
     pub fn reset_live(&mut self) {
         self.live_balance = 10_000.0;
+        self.positions.retain(|p| p.mode != TradingMode::Live);
+        self.orders.retain(|o| o.mode != TradingMode::Live);
+        self.version = self.version.wrapping_add(1);
+    }
+
+    /// Clear simulated live positions/orders without touching the live cash
+    /// balance, which is sourced from the real exchange account.
+    pub fn reset_live_positions(&mut self) {
         self.positions.retain(|p| p.mode != TradingMode::Live);
         self.orders.retain(|o| o.mode != TradingMode::Live);
         self.version = self.version.wrapping_add(1);
