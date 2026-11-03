@@ -250,21 +250,72 @@ impl Render for LoginPage {
         let bullish = colors.bullish;
 
         let viewport = window.viewport_size();
-        let is_desktop = viewport.width >= px(860.0);
+        // The split layout only makes sense when the hero panel still has room
+        // to breathe next to the fixed-width auth card. Below this width we
+        // collapse to the centred, single-column form.
+        let is_desktop = viewport.width >= px(1000.0);
         let is_compact_height = viewport.height < px(700.0);
         let is_wide = viewport.width >= px(1120.0);
+
+        // The hero panel receives whatever width the fixed-width auth card
+        // leaves over. Derive its metrics from that actual space (and the
+        // available height) so the copy, icons and spacing grow/shrink to fit
+        // the container instead of overflowing it.
+        let auth_card_width = if is_wide { 520.0 } else { 460.0 };
+        let hero_width = if is_desktop {
+            (viewport.width - px(auth_card_width)).max(px(0.0))
+        } else {
+            viewport.width
+        };
+        let hero_height =
+            (viewport.height - crate::components::ui::title_bar::TITLE_BAR_HEIGHT).max(px(0.0));
+
+        // 0.0 = tightest layout, 1.0 = roomiest layout.
+        let hero_width_px = f32::from(hero_width);
+        let hero_height_px = f32::from(hero_height);
+        let width_scale = ((hero_width_px - 480.0) / (900.0 - 480.0)).clamp(0.0, 1.0);
+        let height_scale = ((hero_height_px - 480.0) / (800.0 - 480.0)).clamp(0.0, 1.0);
+        let hero_scale = width_scale.min(height_scale);
+        let scaled = move |min: f32, max: f32| px(min + (max - min) * hero_scale);
+
+        let hero_padding = scaled(24.0, 56.0);
+        let hero_section_gap = scaled(18.0, 32.0);
+        let hero_top_gap = scaled(14.0, 24.0);
+        let hero_headline_gap = scaled(6.0, 10.0);
+        let hero_features_gap = scaled(12.0, 20.0);
+        let hero_feature_gap = scaled(10.0, 14.0);
+        let hero_feature_text_gap = scaled(2.0, 3.0);
+        let hero_brand_gap = scaled(8.0, 12.0);
+        let hero_brand_icon = scaled(32.0, 40.0);
+        let hero_brand_glyph = scaled(19.0, 24.0);
+        let hero_brand_text = scaled(20.0, 24.0);
+        let hero_headline_size = scaled(22.0, 30.0);
+        let hero_subtitle_size = scaled(12.0, 14.0);
+        let hero_feature_icon = scaled(30.0, 38.0);
+        let hero_feature_glyph = scaled(14.0, 16.0);
+        let hero_feature_title = scaled(12.0, 14.0);
+        let hero_feature_desc = scaled(10.5, 12.0);
+        let hero_note_gap = scaled(6.0, 8.0);
+        let hero_note_padding_x = scaled(9.0, 12.0);
+        let hero_note_padding_y = scaled(6.0, 8.0);
+        let hero_note_dot = scaled(6.0, 7.0);
+        let hero_note_text = scaled(10.5, 12.0);
+        let hero_brand_radius = scaled(8.0, 10.0);
+        let hero_feature_radius = scaled(8.0, 10.0);
 
         // Friendly feature highlight row
         let feature_item = |icon_path: &'static str, title: &'static str, desc: &'static str| {
             div()
                 .flex()
                 .items_start()
-                .gap(px(14.0))
+                .gap(hero_feature_gap)
+                .w_full()
+                .min_w_0()
                 .child(
                     div()
-                        .w(px(38.0))
-                        .h(px(38.0))
-                        .rounded(px(10.0))
+                        .w(hero_feature_icon)
+                        .h(hero_feature_icon)
+                        .rounded(hero_feature_radius)
                         .bg(colors.muted.opacity(0.18))
                         .border_1()
                         .border_color(border.opacity(0.6))
@@ -272,34 +323,52 @@ impl Render for LoginPage {
                         .items_center()
                         .justify_center()
                         .flex_shrink_0()
-                        .child(Icon::default().path(icon_path).size_4().text_color(primary)),
+                        .child(
+                            Icon::default()
+                                .path(icon_path)
+                                .size(hero_feature_glyph)
+                                .text_color(primary),
+                        ),
                 )
                 .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(3.0))
+                        .flex_1()
+                        .gap(hero_feature_text_gap)
+                        .min_w_0()
                         .child(
                             div()
-                                .text_sm()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(hero_feature_title)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(fg)
+                                .whitespace_normal()
                                 .child(title),
                         )
                         .child(
                             div()
-                                .text_xs()
+                                .w_full()
+                                .min_w_0()
+                                .text_size(hero_feature_desc)
                                 .text_color(muted)
                                 .line_height(gpui::relative(1.4))
+                                .whitespace_normal()
                                 .child(desc),
                         ),
                 )
         };
 
         // Left brand hero panel (desktop)
+        // `min_w_0` is important: without it the flex item refuses to shrink
+        // below the text's min-content width and pushes the auth card off the
+        // right edge on narrow/high-DPI windows.
         let left_hero = div()
             .flex_1()
+            .min_w_0()
             .h_full()
+            .overflow_x_hidden()
             .overflow_y_scrollbar()
             .border_r_1()
             .border_color(border.opacity(0.6))
@@ -307,27 +376,33 @@ impl Render for LoginPage {
             .child(
                 div()
                     .min_h_full()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .justify_between()
-                    .p(if is_wide { px(56.0) } else { px(36.0) })
-                    .gap(px(32.0))
+                    .p(hero_padding)
+                    .gap(hero_section_gap)
                     // Top: Brand & Welcoming message
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(24.0))
+                            .gap(hero_top_gap)
+                            .w_full()
+                            .min_w_0()
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(12.0))
+                                    .gap(hero_brand_gap)
+                                    .w_full()
+                                    .min_w_0()
                                     .child(
                                         div()
-                                            .w(px(40.0))
-                                            .h(px(40.0))
-                                            .rounded(px(10.0))
+                                            .w(hero_brand_icon)
+                                            .h(hero_brand_icon)
+                                            .rounded(hero_brand_radius)
                                             .bg(primary)
                                             .flex()
                                             .items_center()
@@ -336,13 +411,13 @@ impl Render for LoginPage {
                                             .child(
                                                 Icon::default()
                                                     .path("icons/bull-mark.svg")
-                                                    .size_6()
+                                                    .size(hero_brand_glyph)
                                                     .text_color(primary_fg),
                                             ),
                                     )
                                     .child(
                                         div()
-                                            .text_2xl()
+                                            .text_size(hero_brand_text)
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(fg)
                                             .child("FinTer"),
@@ -352,20 +427,28 @@ impl Render for LoginPage {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap(px(10.0))
+                                    .gap(hero_headline_gap)
+                                    .w_full()
+                                    .min_w_0()
                                     .child(
                                         div()
-                                            .text_3xl()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(hero_headline_size)
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(fg)
                                             .line_height(gpui::relative(1.2))
+                                            .whitespace_normal()
                                             .child("All your markets in one clean view"),
                                     )
                                     .child(
                                         div()
-                                            .text_sm()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(hero_subtitle_size)
                                             .text_color(muted)
                                             .line_height(gpui::relative(1.5))
+                                            .whitespace_normal()
                                             .child("Follow live cryptocurrency prices, explore multi-timeframe charts, and organize your favorite trading pairs."),
                                     ),
                             ),
@@ -375,7 +458,9 @@ impl Render for LoginPage {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(20.0))
+                            .gap(hero_features_gap)
+                            .w_full()
+                            .min_w_0()
                             .child(feature_item(
                                 "icons/chart-candlestick.svg",
                                 "Live Market Charts",
@@ -397,30 +482,37 @@ impl Render for LoginPage {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
-                            .px(px(12.0))
-                            .py(px(8.0))
+                            .gap(hero_note_gap)
+                            .w_full()
+                            .min_w_0()
+                            .px(hero_note_padding_x)
+                            .py(hero_note_padding_y)
                             .rounded(px(8.0))
                             .bg(colors.muted.opacity(0.12))
                             .border_1()
                             .border_color(border.opacity(0.4))
                             .child(
                                 div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
+                                    .w(hero_note_dot)
+                                    .h(hero_note_dot)
                                     .rounded_full()
                                     .bg(bullish),
                             )
                             .child(
                                 div()
-                                    .text_xs()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(hero_note_text)
                                     .text_color(muted)
+                                    .whitespace_normal()
                                     .child("Free to use • Your settings stay saved on your device"),
                             ),
                     ),
             );
 
         // Right authentication card / form (fully responsive with vertical scrolling)
+        // Allow the card (and the single-column mobile form) to shrink instead
+        // of overflowing when the window is small.
         let auth_form = div()
             .when(is_desktop, |this| {
                 if is_wide {
@@ -430,12 +522,15 @@ impl Render for LoginPage {
                 }
             })
             .when(!is_desktop, |this| this.flex_1())
+            .min_w_0()
             .h_full()
+            .overflow_x_hidden()
             .overflow_y_scrollbar()
             .bg(bg)
             .child(
                 div()
                     .min_h_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .justify_center()
@@ -445,6 +540,7 @@ impl Render for LoginPage {
                         div()
                             .w_full()
                             .max_w(px(380.0))
+                            .min_w_0()
                             .flex()
                             .flex_col()
                             .gap(if is_compact_height { px(16.0) } else { px(20.0) })
@@ -487,6 +583,7 @@ impl Render for LoginPage {
                                     .flex()
                                     .flex_col()
                                     .gap(px(4.0))
+                                    .min_w_0()
                                     .child(
                                         div()
                                             .text_2xl()
@@ -699,9 +796,11 @@ impl Render for LoginPage {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .justify_center()
                                             .gap(px(4.0))
+                                            .min_w_0()
                                             .child(
                                                 div()
                                                     .text_xs()
