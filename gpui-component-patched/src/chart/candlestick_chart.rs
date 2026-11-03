@@ -635,13 +635,16 @@ where
         let bearish_color = cx.theme().bearish;
         
         let is_light = cx.theme().background.l > 0.5;
-        let (crosshair_bg_raw, crosshair_line_raw) = if is_light {
-            (gpui::rgb(0x686D76), gpui::rgb(0x76808F))
+        let crosshair_line: gpui::Hsla = if is_light {
+            gpui::rgb(0x76808F).into()
         } else {
-            (gpui::rgb(0x373a40), gpui::rgb(0x929AA5))
+            gpui::rgb(0x929AA5).into()
         };
-        let crosshair_bg: gpui::Hsla = crosshair_bg_raw.into();
-        let crosshair_line: gpui::Hsla = crosshair_line_raw.into();
+        // Crosshair labels follow the active theme instead of using fixed
+        // grays, so they stay legible and consistent with the X-axis
+        // timestamp pill in both light and dark modes.
+        let crosshair_bg = cx.theme().foreground;
+        let crosshair_fg = cx.theme().background;
         let candle_type = self.candle_type;
 
         // Per-candle slot width in pixels.
@@ -1950,7 +1953,7 @@ where
             self.paint_price_pill_with_width(
                 text,
                 bg,
-                gpui::white(),
+                crosshair_fg,
                 origin.x.as_f32() + chart_w,
                 centre_y,
                 shared_live_badge_w,

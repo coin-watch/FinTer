@@ -152,6 +152,43 @@ fn config_bool(config: Option<&serde_json::Map<String, serde_json::Value>>, key:
         .unwrap_or(default)
 }
 
+fn resolve_market_type(
+    config: Option<&serde_json::Map<String, serde_json::Value>>,
+    exchange: &str,
+    symbol: &str,
+) -> crate::data::trade_store::MarketType {
+    use crate::data::trade_store::MarketType;
+    let saved = config_str(config, "market_type", "");
+    let requested = if saved.is_empty() {
+        infer_market_type(exchange, symbol)
+    } else {
+        MarketType::from_str(&saved)
+    };
+    let available = MarketType::available_for_exchange(exchange);
+    if available.contains(&requested) {
+        requested
+    } else {
+        available[0]
+    }
+}
+
+fn infer_market_type(exchange: &str, symbol: &str) -> crate::data::trade_store::MarketType {
+    use crate::data::trade_store::{MarketType, symbol_matches};
+    // Dedicated futures venues are unambiguous, even before the gateway has
+    // loaded their symbol metadata.
+    if MarketType::is_dedicated_futures_exchange(exchange) {
+        return MarketType::Futures;
+    }
+    let infos = crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(exchange);
+    if let Some(info) = infos
+        .iter()
+        .find(|info| symbol_matches(&info.symbol, symbol))
+    {
+        return MarketType::from_symbol_type(&info.symbol_type);
+    }
+    MarketType::default_for_exchange(exchange)
+}
+
 fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Value, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |_window, cx| {
         let mut config = serde_json::Map::new();
@@ -172,15 +209,19 @@ fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Val
 
 fn update_exchange_config(pane_id: String, exchange: String, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |_window, cx| {
-        let symbol = crate::data::gateway_registry::GatewayRegistry::global()
-            .symbols(&exchange)
+        use crate::data::trade_store::MarketType;
+        let market_type = MarketType::default_for_exchange(&exchange);
+        let symbol = symbol_choices_for_market(&exchange, market_type)
             .into_iter()
             .next()
             .unwrap_or_else(|| "BTC/USDT".to_string());
         let mut config = serde_json::Map::new();
         config.insert("exchange".to_string(), serde_json::Value::String(exchange));
         config.insert("symbol".to_string(), serde_json::Value::String(symbol));
-        config.insert("market".to_string(), serde_json::Value::String("spot".to_string()));
+        config.insert(
+            "market_type".to_string(),
+            serde_json::Value::String(market_type.as_str().to_string()),
+        );
         cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(|global, cx| {
             let _ = global.view.update(cx, |view, cx| {
                 view.handle_pane_event(
@@ -305,6 +346,28 @@ fn symbol_choices(exchange: &str) -> Vec<String> {
 
 fn symbol_choices_for_menu(exchange: &str, _current_symbol: &str) -> Vec<String> {
     symbol_choices(exchange)
+}
+
+fn symbol_choices_for_market(
+    exchange: &str,
+    market_type: crate::data::trade_store::MarketType,
+) -> Vec<String> {
+    use crate::data::trade_store::MarketType;
+    // Dedicated futures venues may not have rich symbol metadata loaded yet.
+    if MarketType::is_dedicated_futures_exchange(exchange) {
+        return symbol_choices(exchange);
+    }
+    let infos = crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(exchange);
+    let filtered: Vec<String> = infos
+        .iter()
+        .filter(|info| MarketType::from_symbol_type(&info.symbol_type) == market_type)
+        .map(|info| info.symbol.clone())
+        .collect();
+    if filtered.is_empty() {
+        symbol_choices(exchange)
+    } else {
+        filtered
+    }
 }
 
 fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
@@ -1024,6 +1087,8 @@ impl PaneGridRenderer {
                 let chart_type = config_str(config_map, "type", "candle_solid");
                 let current_exchange = config_str(config_map, "exchange", "binance");
                 let current_symbol = config_str(config_map, "symbol", "BTC/USDT");
+                let current_market_type =
+                    resolve_market_type(config_map, &current_exchange, &current_symbol);
                 let current_timezone = config_str(config_map, "timezone", &self.timezone);
 
                 let is_active = self.active_pane_id.as_ref() == Some(&pane_id);
@@ -1768,7 +1833,7 @@ impl PaneGridRenderer {
                                                             }
 
                                                             menu = menu.label("Symbol");
-                                                            for symbol in symbol_choices_for_menu(&current_exchange, &current_symbol) {
+                                                            for symbol in symbol_choices_for_market(&current_exchange, current_market_type) {
                                                                 let pane_id = pane_id_cfg.clone();
                                                                 let selected = current_symbol == symbol;
                                                                 let value = symbol.clone();
@@ -2182,6 +2247,8 @@ impl PaneGridRenderer {
                                     let exchange = config_str(config, "exchange", "binance");
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
                                     let live_mode = config_bool(config, "live_mode", true);
+                                    let market_type =
+                                        resolve_market_type(config, &exchange, &symbol);
                                     let mut execution_map = self.execution_views.borrow_mut();
                                     let needs_recreate = match execution_map.get(&pane_id) {
                                         Some(existing) => existing.exchange != exchange || existing.symbol != symbol,
@@ -2207,6 +2274,7 @@ impl PaneGridRenderer {
                                                     p.set_pane_id(pane_id.clone());
                                                     p.set_exchange(exchange.clone());
                                                     p.set_live_mode(live_mode);
+                                                    p.set_market_type(market_type);
                                                     p
                                                 });
                                                 execution_map.insert(pane_id.clone(), ExecutionViewState {

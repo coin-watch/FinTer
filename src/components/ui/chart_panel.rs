@@ -1023,10 +1023,12 @@ impl Render for ChartPanel {
         let mut subpane_legends = Vec::new();
         let legend_ui = if let Some(c) = active_candle {
             let is_bull = c.close >= c.open;
+            // Match the chart candles so the crosshair OHLCV readout follows
+            // the active theme's bullish/bearish colors in light and dark mode.
             let c_color: gpui::Hsla = if is_bull {
-                gpui::rgba(0x2ebd85ff).into()
+                cx.theme().bullish
             } else {
-                gpui::rgba(0xf6465dff).into()
+                cx.theme().bearish
             };
             let prec = precision.clone();
             let fmt_price = move |p: f64| format_price(p, prec.as_ref());

@@ -1,9 +1,18 @@
 use crate::components::pages::api_management_view::ApiManagementView;
 use crate::data::models::SettingsData;
 use crate::data::theme;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::button::Button;
+use gpui_component::checkbox::Checkbox;
+use gpui_component::popover::Popover;
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::Sizable;
 use gpui_component::{
-    setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+    setting::{
+        NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
+        Settings,
+    },
     ActiveTheme,
 };
 use std::sync::Arc;
@@ -98,6 +107,10 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     pub sync_dashboard_tabs: bool,
     pub default_timezone: gpui::SharedString,
+    /// Local-only startup tab behavior; never included in SettingsData.
+    pub startup_tabs_mode: SharedString,
+    /// Local-only dashboard ids selected for `StartupTabMode::Selected`.
+    pub startup_tab_ids: Vec<String>,
     /// Local-only Agent configuration; never included in SettingsData.
     pub agent_base_url: SharedString,
     pub agent_api_key: SharedString,
@@ -111,6 +124,8 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         let saved_creds = crate::data::api_management::load();
+        let tab_preferences =
+            crate::data::tab_settings::load(crate::data::tab_settings::TabProfile::Guest);
         let initial_ex = saved_creds
             .first()
             .map(|c| c.exchange.clone())
@@ -139,6 +154,8 @@ impl Default for AppSettings {
             auto_check_updates: true,
             sync_dashboard_tabs: true,
             default_timezone: "UTC".into(),
+            startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
+            startup_tab_ids: tab_preferences.selected_tab_ids,
             agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
             agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
             api_exchange: initial_ex.into(),
@@ -150,7 +167,11 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    pub fn from_settings_data(data: &SettingsData) -> Self {
+    pub fn from_settings_data(
+        data: &SettingsData,
+        profile: crate::data::tab_settings::TabProfile,
+    ) -> Self {
+        let tab_preferences = crate::data::tab_settings::load(profile);
         Self {
             server_url: data
                 .server_url
@@ -189,6 +210,8 @@ impl AppSettings {
                 .unwrap_or_else(|| "UTC".into())
                 .into(),
             auto_check_updates: data.auto_check_updates.unwrap_or(true),
+            startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
+            startup_tab_ids: tab_preferences.selected_tab_ids,
             agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
             agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
             api_exchange: crate::data::api_management::load().first().map(|c| c.exchange.clone()).unwrap_or_else(|| "binance".into()).into(),
@@ -227,11 +250,140 @@ impl AppSettings {
     }
 }
 
+/// Multi-select control for the dashboards that should open on startup.
+///
+/// The trigger summarizes the current selection and opens a checkbox list.
+/// Selections are written to the draft settings entity immediately; the Tabs
+/// page's Save Section button commits them.
+fn dashboard_multi_select(
+    settings: Entity<AppSettings>,
+    dashboards: Vec<(String, String)>,
+    options: &RenderOptions,
+    cx: &mut App,
+) -> AnyElement {
+    let selected_ids = settings.read(cx).startup_tab_ids.clone();
+    let selected_count = dashboards
+        .iter()
+        .filter(|(id, _)| selected_ids.contains(id))
+        .count();
+    let label = if dashboards.is_empty() {
+        "No dashboards available".to_string()
+    } else if selected_count == 0 {
+        "Select dashboards".to_string()
+    } else if selected_count == dashboards.len() {
+        "All dashboards".to_string()
+    } else {
+        format!("{selected_count} dashboards selected")
+    };
+
+    let trigger = Button::new("tabs-dashboard-multiselect")
+        .when(options.layout == Axis::Vertical, |this| this.w_full())
+        .label(label)
+        .dropdown_caret(true)
+        .outline()
+        .with_size(options.size);
+
+    let content_settings = settings.clone();
+    let content_dashboards = dashboards.clone();
+
+    Popover::new("tabs-dashboard-multiselect-popover")
+        .anchor(Corner::TopRight)
+        .trigger(trigger)
+        .content(move |_state, _window, cx| {
+            let settings = content_settings.clone();
+            let dashboards = content_dashboards.clone();
+            let selected_ids = settings.read(cx).startup_tab_ids.clone();
+            let all_selected = !dashboards.is_empty()
+                && dashboards
+                    .iter()
+                    .all(|(id, _)| selected_ids.contains(id));
+
+            let select_all_settings = settings.clone();
+            let select_all_dashboards = dashboards.clone();
+            let select_all = Checkbox::new("tabs-dashboard-select-all")
+                .label(if all_selected {
+                    "Clear all"
+                } else {
+                    "Select all"
+                })
+                .checked(all_selected)
+                .on_click(move |checked, _window, cx| {
+                    let ids = select_all_dashboards
+                        .iter()
+                        .map(|(id, _)| id.clone())
+                        .collect::<Vec<_>>();
+                    select_all_settings.update(cx, |saved, _| {
+                        if *checked {
+                            for id in ids {
+                                if !saved.startup_tab_ids.contains(&id) {
+                                    saved.startup_tab_ids.push(id);
+                                }
+                            }
+                        } else {
+                            saved.startup_tab_ids.clear();
+                        }
+                    });
+                    cx.refresh_windows();
+                });
+
+            let mut list = div()
+                .w(px(280.0))
+                .max_h(px(320.0))
+                .overflow_y_scrollbar()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .p(px(6.0))
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(4.0))
+                        .border_b_1()
+                        .border_color(cx.theme().colors.border)
+                        .child(select_all),
+                );
+
+            for (id, name) in dashboards {
+                let checked = selected_ids.contains(&id);
+                let checkbox_settings = settings.clone();
+                let checkbox_id = id.clone();
+                list = list.child(
+                    div().px(px(6.0)).py(px(3.0)).child(
+                        Checkbox::new(ElementId::Name(SharedString::from(format!(
+                            "tabs-dashboard-{id}"
+                        ))))
+                        .label(name)
+                        .checked(checked)
+                        .on_click(move |checked, _window, cx| {
+                            checkbox_settings.update(cx, |saved, _| {
+                                if *checked {
+                                    if !saved.startup_tab_ids.contains(&checkbox_id) {
+                                        saved.startup_tab_ids.push(checkbox_id.clone());
+                                    }
+                                } else {
+                                    saved
+                                        .startup_tab_ids
+                                        .retain(|saved_id| saved_id != &checkbox_id);
+                                }
+                            });
+                            cx.refresh_windows();
+                        }),
+                    ),
+                );
+            }
+
+            list.into_any_element()
+        })
+        .into_any_element()
+}
+
 pub struct SettingsPage {
     settings: Entity<AppSettings>,
     committed: Entity<AppSettings>,
     on_change: OnChangeFn,
     api_management: Entity<ApiManagementView>,
+    /// Live dashboard list used by the Tabs settings page.
+    dashboards: Vec<(String, String)>,
 }
 
 impl SettingsPage {
@@ -241,16 +393,45 @@ impl SettingsPage {
             committed: cx.new(|_| AppSettings::default()),
             on_change: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
+            dashboards: Vec::new(),
         }
     }
 
-    pub fn new_with_data(data: &SettingsData, cx: &mut App) -> Self {
+    pub fn new_with_data(
+        data: &SettingsData,
+        profile: crate::data::tab_settings::TabProfile,
+        cx: &mut App,
+    ) -> Self {
         Self {
-            settings: cx.new(|_| AppSettings::from_settings_data(data)),
-            committed: cx.new(|_| AppSettings::from_settings_data(data)),
+            settings: cx.new(|_| AppSettings::from_settings_data(data, profile)),
+            committed: cx.new(|_| AppSettings::from_settings_data(data, profile)),
             on_change: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
+            dashboards: Vec::new(),
         }
+    }
+
+    pub fn with_dashboards(mut self, dashboards: Vec<(String, String)>) -> Self {
+        self.dashboards = dashboards;
+        self
+    }
+
+    /// Refresh the dashboard list shown on the Tabs settings page.
+    pub fn update_dashboards(&mut self, dashboards: Vec<(String, String)>, cx: &mut Context<Self>) {
+        self.dashboards = dashboards;
+        cx.notify();
+    }
+
+    /// Read the local-only startup tab preference from the committed settings.
+    pub fn tab_preferences(
+        &self,
+        cx: &App,
+    ) -> (crate::data::tab_settings::StartupTabMode, Vec<String>) {
+        let settings = self.committed.read(cx);
+        (
+            crate::data::tab_settings::StartupTabMode::from_value(&settings.startup_tabs_mode),
+            settings.startup_tab_ids.clone(),
+        )
     }
 
     pub fn with_on_change(mut self, callback: Arc<dyn Fn(&mut App) + Send + Sync>) -> Self {
@@ -287,6 +468,7 @@ impl SettingsPage {
             .page(self.build_alerts_page(settings.clone(), on_change.clone()))
             .page(self.build_performance_page(settings.clone(), on_change.clone()))
             .page(self.build_layout_page(settings.clone(), on_change.clone()))
+            .page(self.build_tabs_page(settings.clone(), on_change.clone()))
             .page(self.build_updates_page(settings.clone(), on_change.clone()))
     }
 
@@ -306,6 +488,7 @@ impl SettingsPage {
                             "alerts" => { saved.enable_price_alerts = values.enable_price_alerts.clone(); saved.enable_sound_alerts = values.enable_sound_alerts.clone(); saved.enable_desktop_notifications = values.enable_desktop_notifications.clone(); },
                             "performance" => { saved.max_fps = values.max_fps.clone(); saved.data_update_frequency = values.data_update_frequency.clone(); },
                             "layout" => { saved.sync_dashboard_tabs = values.sync_dashboard_tabs.clone(); saved.default_timezone = values.default_timezone.clone(); saved.auto_save_dashboard = values.auto_save_dashboard.clone(); },
+                            "tabs" => { saved.startup_tabs_mode = values.startup_tabs_mode.clone(); saved.startup_tab_ids = values.startup_tab_ids.clone(); },
                             "updates" => { saved.auto_check_updates = values.auto_check_updates.clone(); },
                             _ => {}
                         }
@@ -777,6 +960,62 @@ impl SettingsPage {
                     ),
             )
             .group(self.save_section("layout", settings.clone(), on_change.clone()))
+    }
+
+    fn build_tabs_page(&self, settings: Entity<AppSettings>, on_change: OnChangeFn) -> SettingPage {
+        let mode_settings = settings.clone();
+        let dashboard_settings = settings.clone();
+        let dashboards = self.dashboards.clone();
+
+        SettingPage::new("Tabs")
+            .description("Choose which dashboard tabs open when FinTer starts. These preferences are stored locally on this machine and are never synced to your account.")
+            .group(
+                SettingGroup::new()
+                    .title("Startup behavior")
+                    .item(
+                        SettingItem::new(
+                            "Tabs on startup",
+                            SettingField::dropdown(
+                                vec![
+                                    ("restore".into(), "Restore last session".into()),
+                                    ("all".into(), "Open all dashboards".into()),
+                                    ("empty".into(), "Start as empty".into()),
+                                    ("selected".into(), "Open selected dashboards".into()),
+                                ],
+                                {
+                                    let settings = mode_settings.clone();
+                                    move |cx| settings.read(cx).startup_tabs_mode.clone()
+                                },
+                                {
+                                    let settings = mode_settings.clone();
+                                    move |value: SharedString, cx| {
+                                        settings.update(cx, |saved, _| {
+                                            saved.startup_tabs_mode = value;
+                                        });
+                                        cx.refresh_windows();
+                                    }
+                                },
+                            )
+                            .default_value(SharedString::from("restore")),
+                        )
+                        .description("Restore reopens the tabs you had open last time. Open all shows every dashboard. Start as empty opens no tabs. Selected uses the dashboards chosen below."),
+                    )
+                    .item(
+                        SettingItem::new(
+                            "Dashboards to open",
+                            SettingField::render(move |options, _, cx| {
+                                dashboard_multi_select(
+                                    dashboard_settings.clone(),
+                                    dashboards.clone(),
+                                    options,
+                                    cx,
+                                )
+                            }),
+                        )
+                        .description("Choose multiple dashboards. Used when startup behavior is set to \"Open selected dashboards\"."),
+                    ),
+            )
+            .group(self.save_section("tabs", settings.clone(), on_change.clone()))
     }
 
     fn build_updates_page(

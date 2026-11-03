@@ -18,8 +18,8 @@ use crate::data::api_management;
 use crate::data::feed::TickFeed;
 use crate::data::gateway_registry::GatewayRegistry;
 pub use crate::data::trade_store::{
-    DeskPosition, TradeOrder as PaperOrder, TradeOrderType as OrderType, TradeSide as Side,
-    TradeStore, TradingMode,
+    DeskPosition, MarketType, TradeOrder as PaperOrder, TradeOrderType as OrderType,
+    TradeSide as Side, TradeStore, TradingMode,
 };
 
 pub struct ExecutionPanel {
@@ -37,6 +37,8 @@ pub struct ExecutionPanel {
     margin: f64,
     notification: Option<(bool /* is_error */, String)>,
     is_live_mode: bool,
+    /// Explicit venue account type: spot, margin, or futures.
+    market_type: MarketType,
     /// Real quote-currency balance fetched from the selected exchange.
     live_balance: Option<f64>,
     live_balance_loading: bool,
@@ -137,6 +139,7 @@ impl ExecutionPanel {
             .and_then(|ts| ts.get_mark_price(&sym_str));
 
         TradeStore::global().lock().unwrap().active_mode = TradingMode::Live;
+        let market_type = MarketType::default_for_exchange(&ex);
 
         Self {
             feed,
@@ -155,6 +158,7 @@ impl ExecutionPanel {
             // The desk opens in live mode by default; restored panes override
             // this from their saved module config.
             is_live_mode: true,
+            market_type,
             live_balance: None,
             live_balance_loading: false,
             live_balance_error: None,
@@ -199,6 +203,48 @@ impl ExecutionPanel {
     pub fn set_live_mode(&mut self, live: bool) {
         self.is_live_mode = live;
         TradeStore::global().lock().unwrap().active_mode = self.active_mode();
+    }
+
+    /// Apply the persisted market type when a pane is restored.
+    pub fn set_market_type(&mut self, market_type: MarketType) {
+        self.market_type = market_type;
+        if market_type == MarketType::Spot {
+            self.leverage = 1;
+            self.side = Side::Long;
+        }
+        // The live balance is account-type specific, so drop the cached value.
+        self.live_balance = None;
+        self.live_balance_error = None;
+        self.live_balance_loading = false;
+    }
+
+    /// Persist the current market type into the pane's module config.
+    fn persist_market_type(&self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.pane_id.clone() else {
+            return;
+        };
+        let market_type = self.market_type.as_str().to_string();
+        cx.spawn(async move |_this, cx| {
+            let mut config = serde_json::Map::new();
+            config.insert(
+                "market_type".to_string(),
+                serde_json::Value::String(market_type),
+            );
+            let _ = cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(
+                |global, cx| {
+                    let _ = global.view.update(cx, |view, cx| {
+                        view.handle_pane_event(
+                            &crate::components::ui::pane_grid::renderer::PaneGridEvent::UpdateModuleConfig {
+                                pane_id,
+                                config: serde_json::Value::Object(config),
+                            },
+                            cx,
+                        );
+                    });
+                },
+            );
+        })
+        .detach();
     }
 
     /// Persist the current live/paper mode into the pane's module config.
@@ -269,6 +315,26 @@ impl ExecutionPanel {
         }
     }
 
+    /// Pick black or white text for a filled button so the label stays legible
+    /// regardless of the selected theme's bullish/bearish colors.
+    fn contrasting_text(bg: gpui::Hsla) -> gpui::Hsla {
+        let rgb = bg.to_rgb();
+        let linear = |channel: f32| {
+            if channel <= 0.03928 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luma = 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+        // 0.179 is the luminance where black and white text have equal contrast.
+        if luma > 0.179 {
+            gpui::black()
+        } else {
+            gpui::white()
+        }
+    }
+
     fn base_asset(&self) -> &str {
         if let Some(pos) = self.symbol.find('/') {
             &self.symbol[..pos]
@@ -289,6 +355,22 @@ impl ExecutionPanel {
         };
         // Futures symbols may carry a settlement suffix, e.g. BTC/USDT:USDT.
         quote.split(':').next().unwrap_or(quote)
+    }
+
+    /// When the gateway has typed symbol metadata, return the first symbol that
+    /// matches `market` if the current symbol belongs to a different market.
+    fn symbol_for_market(&self, market: MarketType) -> Option<String> {
+        let infos = GatewayRegistry::global().symbol_infos(&self.exchange);
+        let current = infos
+            .iter()
+            .find(|info| crate::data::trade_store::symbol_matches(&info.symbol, &self.symbol))?;
+        if MarketType::from_symbol_type(&current.symbol_type) == market {
+            return None;
+        }
+        infos
+            .iter()
+            .find(|info| MarketType::from_symbol_type(&info.symbol_type) == market)
+            .map(|info| info.symbol.clone())
     }
 
     fn calculate_liquidation(&self, entry: f64) -> f64 {
@@ -323,14 +405,20 @@ impl ExecutionPanel {
         let exchange_for_result = exchange.clone();
         let quote = self.quote_asset().to_string();
         let quote_for_result = quote.clone();
+        let market_type = self.market_type;
+        let market_type_for_result = market_type;
 
         self.live_balance_loading = true;
         self.last_live_balance_fetch = Some(std::time::Instant::now());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         crate::data::client::tokio_runtime().spawn(async move {
-            let result =
-                crate::data::exchange_balance::fetch_available_balance(&exchange, &quote).await;
+            let result = crate::data::exchange_balance::fetch_available_balance(
+                &exchange,
+                &quote,
+                market_type,
+            )
+            .await;
             let _ = tx.send(result);
         });
 
@@ -343,6 +431,7 @@ impl ExecutionPanel {
                 // or changed to a symbol with a different quote currency.
                 if this.exchange != exchange_for_result
                     || this.quote_asset() != quote_for_result.as_str()
+                    || this.market_type != market_type_for_result
                 {
                     this.live_balance_loading = false;
                     return;
@@ -414,12 +503,20 @@ impl ExecutionPanel {
         // Allow a fresh request even if the previous venue's request is still
         // in flight; its result is discarded by the exchange check below.
         self.live_balance_loading = false;
+        let available_markets = MarketType::available_for_exchange(&new_exchange);
+        if !available_markets.contains(&self.market_type) {
+            self.market_type = available_markets[0];
+        }
+        if self.market_type == MarketType::Spot {
+            self.leverage = 1;
+            self.side = Side::Long;
+        }
         let symbols = GatewayRegistry::global().symbols(&new_exchange);
         if !symbols.is_empty() && !symbols.contains(&self.symbol) {
             self.symbol = symbols[0].clone();
         }
         // Refresh after the symbol update so the request uses the new venue's
-        // quote currency.
+        // quote currency and account type.
         if self.is_live_mode {
             self.refresh_live_balance(cx);
         }
@@ -428,10 +525,15 @@ impl ExecutionPanel {
             let pane_id = pid.clone();
             let ex = self.exchange.clone();
             let sym = self.symbol.clone();
+            let market_type = self.market_type.as_str().to_string();
             cx.spawn(async move |_this, cx| {
                 let mut config = serde_json::Map::new();
                 config.insert("exchange".to_string(), serde_json::Value::String(ex));
                 config.insert("symbol".to_string(), serde_json::Value::String(sym));
+                config.insert(
+                    "market_type".to_string(),
+                    serde_json::Value::String(market_type),
+                );
                 let _ = cx.update_global::<crate::components::pages::home::GlobalHomeView, _>(
                     |global, cx| {
                         let _ = global.view.update(cx, |view, cx| {
@@ -742,8 +844,9 @@ impl ExecutionPanel {
             return;
         }
 
-        let result = TradeStore::global().lock().unwrap().execute_order(
+        let result = TradeStore::global().lock().unwrap().execute_order_typed(
             mode,
+            self.market_type,
             self.symbol.clone(),
             self.side,
             self.order_type,
@@ -778,7 +881,8 @@ impl ExecutionPanel {
                 self.notification = Some((
                     false,
                     format!(
-                        "{mode_prefix} {}: {type_str} {side_str} {} {base} @ ${} (Notional: ${:.2})",
+                        "{mode_prefix} [{}] {}: {type_str} {side_str} {} {base} @ ${} (Notional: ${:.2})",
+                        self.market_type.label(),
                         order.status,
                         Self::fmt_size(order.quantity),
                         Self::fmt_price(exec_price),
@@ -788,7 +892,10 @@ impl ExecutionPanel {
             }
             Err(err) => {
                 let mode_str = if mode == TradingMode::Live { "LIVE" } else { "PAPER" };
-                self.notification = Some((true, format!("[{mode_str}] {err}")));
+                self.notification = Some((
+                    true,
+                    format!("[{mode_str} · {}] {err}", self.market_type.label()),
+                ));
             }
         }
         cx.notify();
@@ -1219,7 +1326,7 @@ impl Render for ExecutionPanel {
                                 .cursor_pointer()
                                 .px_1()
                                 .py(px(0.5))
-                                .hover(|s| s.bg(c.muted.opacity(0.5)))
+                                .hover(|s| s.bg(c.muted.opacity(0.6)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
@@ -1230,7 +1337,7 @@ impl Render for ExecutionPanel {
                                 .child(
                                     Icon::new(IconName::Close)
                                         .size(px(11.))
-                                        .text_color(c.muted_foreground),
+                                        .text_color(c.foreground),
                                 ),
                         ),
                 )
@@ -1238,6 +1345,77 @@ impl Render for ExecutionPanel {
             // ── Main Body Station ────────────────────────────────────────────
             .child({
                 let is_long = self.side == Side::Long;
+                let is_spot = self.market_type == MarketType::Spot;
+
+                // 0. Explicit venue account type (spot / margin / futures)
+                let market_row = h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .flex_wrap()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(c.muted_foreground)
+                            .child("MARKET"),
+                    )
+                    .children(
+                        MarketType::available_for_exchange(&self.exchange)
+                            .into_iter()
+                            .map(|market| {
+                                let active = self.market_type == market;
+                                div()
+                                    .id(ElementId::Name(
+                                        format!("market-{}", market.as_str()).into(),
+                                    ))
+                                    .px_2()
+                                    .py(px(1.5))
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(if active { c.primary } else { c.border })
+                                    .bg(if active {
+                                        c.primary
+                                    } else {
+                                        c.muted.opacity(0.35)
+                                    })
+                                    .text_color(if active {
+                                        c.primary_foreground
+                                    } else {
+                                        c.muted_foreground
+                                    })
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .hover(move |s| {
+                                        if active {
+                                            s.bg(c.primary_hover)
+                                                .border_color(c.primary_hover)
+                                                .text_color(c.primary_foreground)
+                                        } else {
+                                            s.bg(c.muted.opacity(0.55))
+                                                .border_color(c.border)
+                                                .text_color(c.foreground)
+                                        }
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            if this.market_type != market {
+                                                this.set_market_type(market);
+                                                if let Some(symbol) = this.symbol_for_market(market) {
+                                                    this.switch_symbol(symbol, cx);
+                                                }
+                                                this.persist_market_type(cx);
+                                                if this.is_live_mode {
+                                                    this.refresh_live_balance(cx);
+                                                }
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(market.label())
+                            }),
+                    );
 
                 // 1. Dual Tactical Long / Short Pods
                 let pods_el = h_flex()
@@ -1261,12 +1439,12 @@ impl Render for ExecutionPanel {
                             .border_color(if is_long {
                                 c.bullish
                             } else {
-                                c.border.opacity(0.5)
+                                c.border
                             })
                             .bg(if is_long {
                                 c.bullish.opacity(0.12)
                             } else {
-                                c.muted.opacity(0.15)
+                                c.muted.opacity(0.22)
                             })
                             .hover(|s| s.border_color(c.bullish.opacity(0.8)))
                             .on_mouse_down(
@@ -1323,24 +1501,31 @@ impl Render for ExecutionPanel {
                             })
                             .cursor_pointer()
                             .border_1()
-                            .border_color(if !is_long {
+                            .border_color(if is_spot {
+                                c.border
+                            } else if !is_long {
                                 c.bearish
                             } else {
-                                c.border.opacity(0.5)
+                                c.border
                             })
-                            .bg(if !is_long {
+                            .bg(if is_spot {
+                                c.muted.opacity(0.15)
+                            } else if !is_long {
                                 c.bearish.opacity(0.12)
                             } else {
-                                c.muted.opacity(0.15)
+                                c.muted.opacity(0.22)
                             })
-                            .hover(|s| s.border_color(c.bearish.opacity(0.8)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.side = Side::Short;
-                                    cx.notify();
-                                }),
-                            )
+                            .when(is_spot, |this| this.opacity(0.55))
+                            .when(!is_spot, |this| {
+                                this.hover(|s| s.border_color(c.bearish.opacity(0.8)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.side = Side::Short;
+                                            cx.notify();
+                                        }),
+                                    )
+                            })
                             .child(
                                 h_flex()
                                     .justify_between()
@@ -1349,14 +1534,16 @@ impl Render for ExecutionPanel {
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(if !is_long {
+                                            .text_color(if is_spot {
+                                                c.muted_foreground
+                                            } else if !is_long {
                                                 c.bearish
                                             } else {
                                                 c.muted_foreground
                                             })
                                             .child(if is_very_narrow { "▼ SELL" } else { "▼ SELL / SHORT" }),
                                     )
-                                    .when(!is_long && !is_very_narrow, |this| {
+                                    .when(!is_long && !is_spot && !is_very_narrow, |this| {
                                         this.child(
                                             Icon::new(IconName::Check)
                                                 .size(px(12.))
@@ -1369,7 +1556,11 @@ impl Render for ExecutionPanel {
                                     div()
                                         .text_xs()
                                         .text_color(c.muted_foreground)
-                                        .child("Profit on market drawdown"),
+                                        .child(if is_spot {
+                                            "Spot market: long only"
+                                        } else {
+                                            "Profit on market drawdown"
+                                        }),
                                 )
                             }),
                     );
@@ -1378,9 +1569,9 @@ impl Render for ExecutionPanel {
                 let type_row = h_flex()
                     .w_full()
                     .p(px(2.0))
-                    .bg(c.muted.opacity(0.18))
+                    .bg(c.muted.opacity(0.28))
                     .border_1()
-                    .border_color(c.border.opacity(0.3))
+                    .border_color(c.border.opacity(0.5))
                     .gap(px(2.0))
                     .child(
                         div()
@@ -1404,7 +1595,7 @@ impl Render for ExecutionPanel {
                                 c.muted_foreground
                             })
                             .when(self.order_type == OrderType::Market, |s| {
-                                s.shadow_xs().border_1().border_color(c.border.opacity(0.4))
+                                s.shadow_xs().border_1().border_color(c.border)
                             })
                             .hover(|s| s.text_color(c.foreground))
                             .on_mouse_down(
@@ -1438,7 +1629,7 @@ impl Render for ExecutionPanel {
                                 c.muted_foreground
                             })
                             .when(self.order_type == OrderType::Limit, |s| {
-                                s.shadow_xs().border_1().border_color(c.border.opacity(0.4))
+                                s.shadow_xs().border_1().border_color(c.border)
                             })
                             .hover(|s| s.text_color(c.foreground))
                             .on_mouse_down(
@@ -1497,21 +1688,27 @@ impl Render for ExecutionPanel {
                                                 .rounded(px(2.0))
                                                 .text_xs()
                                                 .font_weight(FontWeight::BOLD)
-                                                .bg(if self.leverage <= 5 {
+                                                .bg(if is_spot {
+                                                    c.primary.opacity(0.18)
+                                                } else if self.leverage <= 5 {
                                                     c.bullish.opacity(0.18)
                                                 } else if self.leverage <= 20 {
                                                     c.warning.opacity(0.18)
                                                 } else {
                                                     c.danger.opacity(0.18)
                                                 })
-                                                .text_color(if self.leverage <= 5 {
+                                                .text_color(if is_spot {
+                                                    c.primary
+                                                } else if self.leverage <= 5 {
                                                     c.bullish
                                                 } else if self.leverage <= 20 {
                                                     c.warning
                                                 } else {
                                                     c.danger
                                                 })
-                                                .child(if self.leverage <= 5 {
+                                                .child(if is_spot {
+                                                    "SPOT"
+                                                } else if self.leverage <= 5 {
                                                     "SAFE"
                                                 } else if self.leverage <= 20 {
                                                     "TACTICAL"
@@ -1530,63 +1727,73 @@ impl Render for ExecutionPanel {
                                     .child(format!("{}x", self.leverage)),
                             ),
                     )
-                    .child(
-                        h_flex().flex_wrap().gap_1().children(
-                            lev_chips.into_iter().map(|lev| {
-                                let active = self.leverage == lev;
-                                div()
-                                    .id(ElementId::Name(format!("lev-{lev}").into()))
-                                    .flex_1()
-                                    .min_w(px(22.0))
-                                    .items_center()
-                                    .justify_center()
-                                    .text_center()
-                                    .py(if is_micro_h { px(1.5) } else { px(2.5) })
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .font_family(mono_font.clone())
-                                    .border_1()
-                                    .border_color(if active {
-                                        c.primary
-                                    } else {
-                                        c.border
-                                    })
-                                    .bg(if active {
-                                        c.primary
-                                    } else {
-                                        c.muted.opacity(0.35)
-                                    })
-                                    .text_color(if active {
-                                        c.primary_foreground
-                                    } else {
-                                        c.muted_foreground
-                                    })
-                                    .hover(move |s| {
-                                        // Keep the selected chip on its primary palette so
-                                        // the foreground stays legible in dark themes.
-                                        if active {
-                                            s.bg(c.primary_hover)
-                                                .border_color(c.primary_hover)
-                                                .text_color(c.primary_foreground)
+                    .when(!is_spot, |this| {
+                        this.child(
+                            h_flex().flex_wrap().gap_1().children(
+                                lev_chips.into_iter().map(|lev| {
+                                    let active = self.leverage == lev;
+                                    div()
+                                        .id(ElementId::Name(format!("lev-{lev}").into()))
+                                        .flex_1()
+                                        .min_w(px(22.0))
+                                        .items_center()
+                                        .justify_center()
+                                        .text_center()
+                                        .py(if is_micro_h { px(1.5) } else { px(2.5) })
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .font_family(mono_font.clone())
+                                        .border_1()
+                                        .border_color(if active {
+                                            c.primary
                                         } else {
-                                            s.bg(c.muted.opacity(0.45))
-                                                .border_color(c.border)
-                                                .text_color(c.foreground)
-                                        }
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.leverage = lev;
-                                            this.size_focused = false;
-                                            cx.notify();
-                                        }),
-                                    )
-                                    .child(format!("{lev}x"))
-                            }),
-                        ),
-                    );
+                                            c.border
+                                        })
+                                        .bg(if active {
+                                            c.primary
+                                        } else {
+                                            c.muted.opacity(0.35)
+                                        })
+                                        .text_color(if active {
+                                            c.primary_foreground
+                                        } else {
+                                            c.muted_foreground
+                                        })
+                                        .hover(move |s| {
+                                            // Keep the selected chip on its primary palette so
+                                            // the foreground stays legible in dark themes.
+                                            if active {
+                                                s.bg(c.primary_hover)
+                                                    .border_color(c.primary_hover)
+                                                    .text_color(c.primary_foreground)
+                                            } else {
+                                                s.bg(c.muted.opacity(0.45))
+                                                    .border_color(c.border)
+                                                    .text_color(c.foreground)
+                                            }
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.leverage = lev;
+                                                this.size_focused = false;
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .child(format!("{lev}x"))
+                                }),
+                            ),
+                        )
+                    })
+                    .when(is_spot, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(c.muted_foreground)
+                                .child("Spot settlement · 1x only (no leverage)"),
+                        )
+                    });
 
                 let pct_chips: Vec<(f64, &str)> = if is_very_narrow {
                     vec![(0.25, "25%"), (0.50, "50%"), (1.00, "MAX")]
@@ -1635,9 +1842,9 @@ impl Render for ExecutionPanel {
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
                                             .cursor_pointer()
-                                            .bg(c.muted.opacity(0.4))
-                                            .hover(|s| s.bg(c.accent.opacity(0.3)).text_color(c.primary))
-                                            .text_color(c.muted_foreground)
+                                            .bg(c.muted.opacity(0.5))
+                                            .hover(|s| s.bg(c.accent.opacity(0.35)).text_color(c.primary))
+                                            .text_color(c.foreground)
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
@@ -1729,7 +1936,7 @@ impl Render for ExecutionPanel {
                                 .font_weight(FontWeight::MEDIUM)
                                 .w(px(46.0))
                                 .mr_1()
-                                .child("Margin"),
+                                .child(if is_spot { "Amount" } else { "Margin" }),
                         )
                         .suffix(
                             div()
@@ -1785,13 +1992,13 @@ impl Render for ExecutionPanel {
                                     .justify_center()
                                     .text_center()
                                     .cursor_pointer()
-                                    .bg(c.muted.opacity(0.25))
+                                    .bg(c.muted.opacity(0.35))
                                     .border_1()
-                                    .border_color(c.border.opacity(0.5))
+                                    .border_color(c.border)
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(c.muted_foreground)
-                                    .hover(|s| s.bg(c.accent.opacity(0.3)).text_color(c.foreground))
+                                    .hover(|s| s.bg(c.accent.opacity(0.35)).text_color(c.foreground))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -1816,14 +2023,14 @@ impl Render for ExecutionPanel {
                                         .justify_center()
                                         .text_center()
                                         .cursor_pointer()
-                                        .bg(c.muted.opacity(0.18))
+                                        .bg(c.muted.opacity(0.3))
                                         .border_1()
-                                        .border_color(c.border.opacity(0.4))
+                                        .border_color(c.border)
                                         .text_xs()
                                         .font_weight(FontWeight::BOLD)
                                         .font_family(mono_font.clone())
                                         .text_color(c.foreground)
-                                        .hover(|s| s.bg(c.muted.opacity(0.5)))
+                                        .hover(|s| s.bg(c.muted.opacity(0.55)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -1853,9 +2060,9 @@ impl Render for ExecutionPanel {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .font_family(mono_font.clone())
                                         .bg(if active {
-                                            c.accent.opacity(0.3)
+                                            c.accent.opacity(0.35)
                                         } else {
-                                            c.muted.opacity(0.15)
+                                            c.muted.opacity(0.3)
                                         })
                                         .text_color(if active {
                                             c.foreground
@@ -1866,7 +2073,18 @@ impl Render for ExecutionPanel {
                                         .border_color(if active {
                                             c.primary
                                         } else {
-                                            c.border.opacity(0.3)
+                                            c.border
+                                        })
+                                        .hover(move |s| {
+                                            if active {
+                                                s.bg(c.accent.opacity(0.5))
+                                                    .text_color(c.foreground)
+                                                    .border_color(c.primary)
+                                            } else {
+                                                s.bg(c.muted.opacity(0.55))
+                                                    .text_color(c.foreground)
+                                                    .border_color(c.border)
+                                            }
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1930,81 +2148,91 @@ impl Render for ExecutionPanel {
                                 ),
                         )
                     })
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .text_xs()
-                            .child(
-                                div().text_color(c.muted_foreground).child(if is_very_narrow { "Liq Price:" } else { "Est. Liquidation Price:" }),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .font_family(mono_font.clone())
-                                    .text_color(if self.leverage >= 50 {
-                                        c.danger
-                                    } else {
-                                        c.warning
-                                    })
-                                    .child(format!(
-                                        "${}",
-                                        liq_price.map(Self::fmt_price).unwrap_or_else(|| "—".into())
-                                    )),
-                            ),
-                    )
-                    // Visual Liquidation Buffer Gauge Bar (Relative width to fit dynamic pane)
-                    .child(
-                        v_flex()
-                            .gap(px(2.0))
-                            .mt(px(2.0))
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .text_xs()
-                                    .child(
-                                        div()
-                                            .text_color(c.muted_foreground)
-                                            .child(if is_very_narrow { "Buffer:" } else { "Liquidation Buffer:" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::BOLD)
-                                            .font_family(mono_font.clone())
-                                            .text_color(if liq_buffer_pct > 20.0 {
-                                                c.bullish
-                                            } else if liq_buffer_pct > 8.0 {
-                                                c.warning
-                                            } else {
-                                                c.danger
-                                            })
-                                            .child(if is_very_narrow {
-                                                format!("{liq_buffer_pct:.1}%")
-                                            } else {
-                                                format!("{liq_buffer_pct:.1}% buffer")
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .h(px(4.0))
-                                    .rounded(px(2.0))
-                                    .bg(c.background)
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .w(gpui::relative((liq_buffer_pct.min(100.0) / 100.0) as f32))
-                                            .h_full()
-                                            .bg(if liq_buffer_pct > 20.0 {
-                                                c.bullish
-                                            } else if liq_buffer_pct > 8.0 {
-                                                c.warning
-                                            } else {
-                                                c.danger
-                                            }),
-                                    ),
-                            ),
-                    );
+                    .when(!is_spot, |this| {
+                        this.child(
+                            h_flex()
+                                .justify_between()
+                                .text_xs()
+                                .child(
+                                    div().text_color(c.muted_foreground).child(if is_very_narrow { "Liq Price:" } else { "Est. Liquidation Price:" }),
+                                )
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::BOLD)
+                                        .font_family(mono_font.clone())
+                                        .text_color(if self.leverage >= 50 {
+                                            c.danger
+                                        } else {
+                                            c.warning
+                                        })
+                                        .child(format!(
+                                            "${}",
+                                            liq_price.map(Self::fmt_price).unwrap_or_else(|| "—".into())
+                                        )),
+                                ),
+                        )
+                        // Visual Liquidation Buffer Gauge Bar (Relative width to fit dynamic pane)
+                        .child(
+                            v_flex()
+                                .gap(px(2.0))
+                                .mt(px(2.0))
+                                .child(
+                                    h_flex()
+                                        .justify_between()
+                                        .text_xs()
+                                        .child(
+                                            div()
+                                                .text_color(c.muted_foreground)
+                                                .child(if is_very_narrow { "Buffer:" } else { "Liquidation Buffer:" }),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::BOLD)
+                                                .font_family(mono_font.clone())
+                                                .text_color(if liq_buffer_pct > 20.0 {
+                                                    c.bullish
+                                                } else if liq_buffer_pct > 8.0 {
+                                                    c.warning
+                                                } else {
+                                                    c.danger
+                                                })
+                                                .child(if is_very_narrow {
+                                                    format!("{liq_buffer_pct:.1}%")
+                                                } else {
+                                                    format!("{liq_buffer_pct:.1}% buffer")
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .h(px(4.0))
+                                        .rounded(px(2.0))
+                                        .bg(c.background)
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .w(gpui::relative((liq_buffer_pct.min(100.0) / 100.0) as f32))
+                                                .h_full()
+                                                .bg(if liq_buffer_pct > 20.0 {
+                                                    c.bullish
+                                                } else if liq_buffer_pct > 8.0 {
+                                                    c.warning
+                                                } else {
+                                                    c.danger
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(is_spot, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(c.muted_foreground)
+                                .child("Spot settlement · no liquidation price"),
+                        )
+                    });
 
                 // 6. Tactical Execution Action Bar (Short & Compact)
                 let execute_btn_el = h_flex()
@@ -2028,7 +2256,11 @@ impl Render for ExecutionPanel {
                         c.bearish.opacity(0.8)
                     })
                     .bg(if is_long { c.bullish } else { c.bearish })
-                    .text_color(c.primary_foreground)
+                    .text_color(Self::contrasting_text(if is_long {
+                        c.bullish
+                    } else {
+                        c.bearish
+                    }))
                     .shadow_sm()
                     .hover(|s| s.opacity(0.92))
                     .on_mouse_down(
@@ -2106,6 +2338,7 @@ impl Render for ExecutionPanel {
                                     .flex_1()
                                     .min_w_0()
                                     .gap_2()
+                                    .child(market_row)
                                     .child(pods_el)
                                     .child(type_row),
                             )
@@ -2136,6 +2369,7 @@ impl Render for ExecutionPanel {
                                     .flex_1()
                                     .min_w_0()
                                     .gap(if is_compact_h { px(4.0) } else { px(6.0) })
+                                    .child(market_row)
                                     .child(pods_el)
                                     .child(type_row)
                                     .child(inputs_el)
@@ -2160,6 +2394,7 @@ impl Render for ExecutionPanel {
                             } else {
                                 px(8.0)
                             })
+                            .child(market_row)
                             .child(pods_el)
                             .child(type_row)
                             .child(inputs_el)
@@ -2282,7 +2517,8 @@ impl Panel for ExecutionPanel {
                 "title": self.title,
                 "exchange": self.exchange,
                 "symbol": self.symbol,
-                "live_mode": self.is_live_mode
+                "live_mode": self.is_live_mode,
+                "market_type": self.market_type.as_str()
             })),
         }
     }

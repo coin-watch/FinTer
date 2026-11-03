@@ -6,6 +6,7 @@
 //! first configured API credential for that venue.
 
 use crate::data::api_management;
+use crate::data::trade_store::MarketType;
 use ccxt::{Config, Params, TypedExchangeExt};
 
 /// Fetch the free balance of `quote` for `exchange`.
@@ -14,7 +15,11 @@ use ccxt::{Config, Params, TypedExchangeExt};
 /// when the venue does not expose a free balance. The amount is expressed in
 /// the quote currency (e.g. USDT), which is what the trade desk uses to size
 /// margin.
-pub async fn fetch_available_balance(exchange: &str, quote: &str) -> Result<f64, String> {
+pub async fn fetch_available_balance(
+    exchange: &str,
+    quote: &str,
+    market_type: MarketType,
+) -> Result<f64, String> {
     let exchange_id = exchange.trim().to_lowercase();
     if exchange_id.is_empty() {
         return Err("No exchange selected".to_string());
@@ -41,6 +46,11 @@ pub async fn fetch_available_balance(exchange: &str, quote: &str) -> Result<f64,
     if credential.is_testnet {
         config = config.sandbox(true);
     }
+    // Dedicated futures venues already configure their own account type. For
+    // unified venues, make the selected market explicit.
+    if !MarketType::is_dedicated_futures_exchange(&exchange_id) {
+        config = config.option_str("defaultType", market_type.ccxt_type(&exchange_id));
+    }
 
     let mut client = ccxt::from_id(&exchange_id, config.into_option()).ok_or_else(|| {
         format!(
@@ -49,14 +59,24 @@ pub async fn fetch_available_balance(exchange: &str, quote: &str) -> Result<f64,
         )
     })?;
 
-    // Some venues resolve balance currency codes from their market list.
-    client.load_markets(false).await;
-
-    let balances = client.fetch_balance(Params::none()).await.map_err(|err| {
-        format!(
-            "{} balance request failed: {err}",
-            exchange_id.to_uppercase()
-        )
+    let balance_params = if MarketType::is_dedicated_futures_exchange(&exchange_id) {
+        Params::none()
+    } else {
+        Params::new().with_str("type", market_type.ccxt_type(&exchange_id))
+    };
+    let balances = client.fetch_balance(balance_params).await.map_err(|err| {
+        let message = err.to_string();
+        if message.contains("AuthenticationError") || message.contains("Invalid API-key") {
+            format!(
+                "{} rejected the API credentials (check key, secret, IP whitelist and permissions)",
+                exchange_id.to_uppercase()
+            )
+        } else {
+            format!(
+                "{} balance request failed: {message}",
+                exchange_id.to_uppercase()
+            )
+        }
     })?;
 
     let code = quote.trim().to_uppercase();

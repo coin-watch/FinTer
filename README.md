@@ -122,6 +122,8 @@ FINTER_API_URL="http://localhost:5173" cargo run
 
 Cloud files are cached locally and synchronized with the backend. Logging out restores the guest workspace immediately, without erasing or altering cloud configurations.
 
+Tab preferences (which dashboard tabs open on startup) are local-only and stored in `~/.config/finter/guest_tab_settings.json` and `~/.config/finter/cloud_tab_settings.json`; they are never synced.
+
 </details>
 
 ## Privacy & security

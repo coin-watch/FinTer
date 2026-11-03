@@ -17,7 +17,26 @@ use gpui_component::Root;
 #[cfg(not(target_os = "linux"))]
 use gpui_component::TitleBar;
 
+/// CCXT's generated exchange cores signal API errors with `panic!`; its typed
+/// wrappers catch those panics and return `Result`. The default panic hook
+/// still prints them, which makes ordinary auth/network failures look like
+/// crashes. Suppress only panics that originate inside the ccxt crates.
+fn install_ccxt_panic_filter() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let from_ccxt = info
+            .location()
+            .map(|location| location.file().contains("ccxt-"))
+            .unwrap_or(false);
+        if !from_ccxt {
+            default_hook(info);
+        }
+    }));
+}
+
 fn main() {
+    install_ccxt_panic_filter();
+
     // Initialise tracing so bridge logs (info!, warn!, debug!) are visible.
     // Respects RUST_LOG env var; defaults to info level.
     tracing_subscriber::fmt()

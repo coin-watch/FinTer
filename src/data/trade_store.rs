@@ -35,6 +35,119 @@ impl TradingMode {
     }
 }
 
+/// How the selected venue is traded.
+///
+/// The desk keeps this explicit instead of inferring it from the exchange id:
+/// unified venues (Bybit, OKX, Binance) can expose more than one account type,
+/// and spot orders must not be treated as leveraged positions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketType {
+    Spot,
+    Margin,
+    Futures,
+}
+
+impl Default for MarketType {
+    fn default() -> Self {
+        MarketType::Spot
+    }
+}
+
+impl MarketType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarketType::Spot => "spot",
+            MarketType::Margin => "margin",
+            MarketType::Futures => "futures",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MarketType::Spot => "SPOT",
+            MarketType::Margin => "MARGIN",
+            MarketType::Futures => "FUTURES",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "margin" => MarketType::Margin,
+            "futures" | "future" | "swap" | "perpetual" => MarketType::Futures,
+            _ => MarketType::Spot,
+        }
+    }
+
+    /// Map a gateway `SymbolInfo.symbol_type` value onto a market type.
+    pub fn from_symbol_type(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "margin" => MarketType::Margin,
+            "swap" | "future" | "futures" | "perpetual" => MarketType::Futures,
+            _ => MarketType::Spot,
+        }
+    }
+
+    /// Default market type for an exchange id when the pane has no saved value.
+    pub fn default_for_exchange(exchange: &str) -> Self {
+        let ex = exchange.trim().to_ascii_lowercase();
+        if ex.contains("usdm")
+            || ex.contains("coinm")
+            || ex.contains("futures")
+            || ex.contains("perp")
+        {
+            MarketType::Futures
+        } else {
+            MarketType::Spot
+        }
+    }
+
+    /// Market types that make sense for the selected exchange id.
+    ///
+    /// Dedicated futures venues only trade futures. Unified venues can expose
+    /// spot, margin, and futures accounts. The remaining venues are treated as
+    /// spot/margin venues; if a venue does not actually support margin, the
+    /// balance request will surface a clear exchange error.
+    pub fn available_for_exchange(exchange: &str) -> Vec<MarketType> {
+        let ex = exchange.trim().to_ascii_lowercase();
+        if ex.contains("usdm")
+            || ex.contains("coinm")
+            || ex.contains("futures")
+            || ex.contains("perp")
+        {
+            vec![MarketType::Futures]
+        } else if ex == "bybit" || ex == "okx" {
+            vec![MarketType::Spot, MarketType::Margin, MarketType::Futures]
+        } else {
+            vec![MarketType::Spot, MarketType::Margin]
+        }
+    }
+
+    pub fn is_dedicated_futures_exchange(exchange: &str) -> bool {
+        let ex = exchange.trim().to_ascii_lowercase();
+        ex.contains("usdm") || ex.contains("coinm") || ex.contains("futures") || ex.contains("perp")
+    }
+
+    /// CCXT `options.defaultType` / `fetch_balance` type for this market.
+    pub fn ccxt_type(self, exchange: &str) -> &'static str {
+        let ex = exchange.trim().to_ascii_lowercase();
+        match self {
+            MarketType::Spot => "spot",
+            // Bybit exposes margin trading through its spot/unified account;
+            // "margin" is not a valid defaultType there.
+            MarketType::Margin if ex == "bybit" => "spot",
+            MarketType::Margin => "margin",
+            MarketType::Futures => {
+                if ex == "binance" {
+                    "future"
+                } else {
+                    "swap"
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TradeSide {
     Long,
@@ -61,6 +174,7 @@ pub struct TradeOrder {
     pub margin: f64,
     pub status: &'static str,
     pub mode: TradingMode,
+    pub market_type: MarketType,
     pub initial_mark: Option<f64>,
 }
 
@@ -75,6 +189,7 @@ pub struct DeskPosition {
     pub leverage: u32,
     pub timestamp: u64,
     pub mode: TradingMode,
+    pub market_type: MarketType,
 }
 
 pub struct TradeStore {
@@ -248,6 +363,8 @@ impl TradeStore {
             .unwrap_or(pos.entry_price)
     }
 
+    /// Backwards-compatible entry point used by older callers/tests. Treats the
+    /// order as a futures/margin position.
     pub fn execute_order(
         &mut self,
         mode: TradingMode,
@@ -258,6 +375,41 @@ impl TradeStore {
         margin: f64,
         leverage: u32,
     ) -> Result<TradeOrder, String> {
+        self.execute_order_typed(
+            mode,
+            MarketType::Futures,
+            symbol,
+            side,
+            order_type,
+            price,
+            margin,
+            leverage,
+        )
+    }
+
+    /// Execute an order with an explicit market type.
+    ///
+    /// Spot orders are settled at 1x and cannot be shorted. Margin and futures
+    /// orders use the leveraged position model.
+    pub fn execute_order_typed(
+        &mut self,
+        mode: TradingMode,
+        market_type: MarketType,
+        symbol: String,
+        side: TradeSide,
+        order_type: TradeOrderType,
+        price: f64,
+        margin: f64,
+        leverage: u32,
+    ) -> Result<TradeOrder, String> {
+        if market_type == MarketType::Spot {
+            if side == TradeSide::Short {
+                return Err("Spot market does not support short selling.".to_string());
+            }
+            if leverage != 1 {
+                return Err("Spot orders must use 1x leverage.".to_string());
+            }
+        }
         if margin <= 0.0 {
             return Err("Margin amount must be greater than 0.".to_string());
         }
@@ -303,6 +455,7 @@ impl TradeStore {
             margin,
             status,
             mode,
+            market_type,
             initial_mark: mark_opt,
         };
 
@@ -324,6 +477,7 @@ impl TradeStore {
                 leverage,
                 timestamp: now_sec,
                 mode,
+                market_type,
             };
             self.positions.push(position);
             // Note: do not overwrite mark_prices here; mark prices are driven solely by live feeds.
@@ -403,6 +557,7 @@ impl TradeStore {
                     leverage: order.leverage,
                     timestamp: now_sec,
                     mode: order.mode,
+                    market_type: order.market_type,
                 });
             }
         }
@@ -473,6 +628,7 @@ impl TradeStore {
             margin: 0.0,
             status: "CLOSED",
             mode: pos.mode,
+            market_type: pos.market_type,
             initial_mark: Some(mark),
         };
 
@@ -622,6 +778,63 @@ mod tests {
         assert_eq!(store.positions.len(), 0);
         assert_eq!(store.orders.len(), 2);
         assert_eq!(store.paper_balance, 101_000.0); // 99k + (1k margin + 1k pnl)
+    }
+
+    #[test]
+    fn test_spot_market_rules_and_settlement() {
+        let mut store = TradeStore::new();
+        store.set_mark_price("BTC/USDT", 50_000.0);
+
+        // Spot cannot be shorted.
+        let short = store.execute_order_typed(
+            TradingMode::Paper,
+            MarketType::Spot,
+            "BTC/USDT".to_string(),
+            TradeSide::Short,
+            TradeOrderType::Market,
+            50_000.0,
+            1_000.0,
+            1,
+        );
+        assert!(short.is_err());
+
+        // Spot must settle at 1x.
+        let leveraged = store.execute_order_typed(
+            TradingMode::Paper,
+            MarketType::Spot,
+            "BTC/USDT".to_string(),
+            TradeSide::Long,
+            TradeOrderType::Market,
+            50_000.0,
+            1_000.0,
+            5,
+        );
+        assert!(leveraged.is_err());
+
+        // 1x spot buy: $1,000 notional -> 0.02 BTC.
+        let order = store
+            .execute_order_typed(
+                TradingMode::Paper,
+                MarketType::Spot,
+                "BTC/USDT".to_string(),
+                TradeSide::Long,
+                TradeOrderType::Market,
+                50_000.0,
+                1_000.0,
+                1,
+            )
+            .expect("spot buy should succeed");
+        assert_eq!(order.market_type, MarketType::Spot);
+        assert_eq!(order.quantity, 0.02);
+        assert_eq!(store.paper_balance, 99_000.0);
+        assert_eq!(store.positions[0].market_type, MarketType::Spot);
+
+        // +10% move -> +$100 PnL; close returns the full notional + PnL.
+        let close = store
+            .close_position(&order.id, Some(55_000.0))
+            .expect("spot close should succeed");
+        assert_eq!(close.market_type, MarketType::Spot);
+        assert_eq!(store.paper_balance, 100_100.0);
     }
 
     #[test]

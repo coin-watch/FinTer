@@ -125,9 +125,45 @@ pub fn save(items: &[ExchangeCredential]) -> Result<()> {
     Ok(())
 }
 
+/// Exchange ids that share the same API credentials.
+///
+/// CCXT exposes some venues as several market-specific ids even though the
+/// venue issues one API key for all of them. Binance spot/USDⓈ-M/COIN-M and
+/// KuCoin spot/futures are the common cases. Aliases for rebranded venues are
+/// included so credentials saved under an older id keep working.
+///
+/// Note: Kraken Futures, Coinbase Exchange, Binance US, OKX US, and the
+/// regional Bybit/Gate entities issue separate keys and are intentionally not
+/// merged here.
+pub fn credential_family(exchange: &str) -> Vec<String> {
+    let ex = exchange.trim().to_ascii_lowercase();
+    let members: &[&str] = match ex.as_str() {
+        "binance" | "binanceusdm" | "binancecoinm" => &["binance", "binanceusdm", "binancecoinm"],
+        "kucoin" | "kucoinfutures" => &["kucoin", "kucoinfutures"],
+        "htx" | "huobi" => &["htx", "huobi"],
+        "gate" | "gateio" => &["gate", "gateio"],
+        "okx" | "okex" => &["okx", "okex"],
+        "mexc" | "mxc" => &["mexc", "mxc"],
+        _ => return vec![ex],
+    };
+    members.iter().map(|id| (*id).to_string()).collect()
+}
+
 pub fn get_credential(id_or_exchange: &str) -> Option<ExchangeCredential> {
-    let target = id_or_exchange.to_lowercase();
-    load().into_iter().find(|c| c.id.to_lowercase() == target || c.exchange.to_lowercase() == target)
+    let target = id_or_exchange.trim().to_lowercase();
+    let all = load();
+    if let Some(found) = all
+        .iter()
+        .find(|c| c.id.to_lowercase() == target || c.exchange.to_lowercase() == target)
+    {
+        return Some(found.clone());
+    }
+    let family = credential_family(&target);
+    if family.len() <= 1 {
+        return None;
+    }
+    all.into_iter()
+        .find(|c| family.iter().any(|id| c.exchange.to_lowercase() == *id))
 }
 
 pub fn get_all_credentials() -> Vec<ExchangeCredential> {
@@ -135,8 +171,23 @@ pub fn get_all_credentials() -> Vec<ExchangeCredential> {
 }
 
 pub fn get_credentials_for_exchange(exchange: &str) -> Vec<ExchangeCredential> {
-    let ex_lower = exchange.to_lowercase();
-    load().into_iter().filter(|c| c.exchange.to_lowercase() == ex_lower).collect()
+    let ex_lower = exchange.trim().to_lowercase();
+    let all = load();
+    let exact: Vec<ExchangeCredential> = all
+        .iter()
+        .filter(|c| c.exchange.to_lowercase() == ex_lower)
+        .cloned()
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let family = credential_family(&ex_lower);
+    if family.len() <= 1 {
+        return Vec::new();
+    }
+    all.into_iter()
+        .filter(|c| family.iter().any(|id| c.exchange.to_lowercase() == *id))
+        .collect()
 }
 
 pub fn has_credential(exchange: &str) -> bool {
@@ -204,6 +255,29 @@ pub fn supported_api_exchanges() -> Vec<(SharedString, SharedString)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_credential_families_share_keys() {
+        assert!(credential_family("binanceusdm").contains(&"binance".to_string()));
+        assert!(credential_family("binancecoinm").contains(&"binance".to_string()));
+        assert!(credential_family("kucoinfutures").contains(&"kucoin".to_string()));
+        assert!(credential_family("huobi").contains(&"htx".to_string()));
+
+        // Separate venues/entities must not share credentials.
+        assert_eq!(
+            credential_family("krakenfutures"),
+            vec!["krakenfutures".to_string()]
+        );
+        assert_eq!(
+            credential_family("binanceus"),
+            vec!["binanceus".to_string()]
+        );
+        assert_eq!(credential_family("bybiteu"), vec!["bybiteu".to_string()]);
+        assert_eq!(
+            credential_family("coinbaseexchange"),
+            vec!["coinbaseexchange".to_string()]
+        );
+    }
 
     #[test]
     fn test_exchange_credential_serialization_and_defaults() {

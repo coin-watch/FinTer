@@ -256,6 +256,99 @@ impl MainView {
         }
     }
 
+    /// Local tab preferences are kept per guest/cloud profile.
+    fn tab_profile(&self) -> crate::data::tab_settings::TabProfile {
+        if self.is_authenticated {
+            crate::data::tab_settings::TabProfile::Cloud
+        } else {
+            crate::data::tab_settings::TabProfile::Guest
+        }
+    }
+
+    /// Reorder dashboards so the tab strip matches the order saved in the
+    /// previous session. Dashboards that were not open keep their relative
+    /// order after the restored tabs.
+    fn reorder_modules_to_match(&mut self, ordered_ids: &[String]) {
+        let mut reordered = Vec::with_capacity(self.dashboard_modules.len());
+        for id in ordered_ids {
+            if let Some(position) = self
+                .dashboard_modules
+                .iter()
+                .position(|module| module.id.as_ref() == Some(id))
+            {
+                reordered.push(self.dashboard_modules.remove(position));
+            }
+        }
+        reordered.append(&mut self.dashboard_modules);
+        self.dashboard_modules = reordered;
+    }
+
+    /// Persist the set of open dashboard tabs to the local tab settings file.
+    fn persist_open_tabs(&self) {
+        let open_ids: Vec<String> = self
+            .dashboard_modules
+            .iter()
+            .filter_map(|module| module.id.clone())
+            .filter(|id| !self.closed_dashboard_tabs.contains(id))
+            .collect();
+
+        let mut preferences = crate::data::tab_settings::load(self.tab_profile());
+        // "Start as empty" should not erase the last restored session; keep it
+        // available if the user switches back to "Restore last session".
+        if preferences.startup_mode == crate::data::tab_settings::StartupTabMode::Empty
+            && open_ids.is_empty()
+        {
+            return;
+        }
+        if preferences.open_tab_ids == open_ids {
+            return;
+        }
+        preferences.open_tab_ids = open_ids;
+        if let Err(error) = crate::data::tab_settings::save(self.tab_profile(), &preferences) {
+            tracing::warn!(?error, "Failed to persist open dashboard tabs");
+        }
+    }
+
+    /// Apply the local "tabs on startup" preference to the current dashboard
+    /// list and return the ids that should be open.
+    fn apply_startup_tab_preferences(&mut self) -> Vec<String> {
+        let available_ids: Vec<String> = self
+            .dashboard_modules
+            .iter()
+            .filter_map(|module| module.id.clone())
+            .collect();
+        let preferences = crate::data::tab_settings::load(self.tab_profile());
+        let open_ids = preferences.resolve_open_tabs(&available_ids);
+
+        if preferences.startup_mode == crate::data::tab_settings::StartupTabMode::Restore {
+            self.reorder_modules_to_match(&open_ids);
+        }
+
+        self.closed_dashboard_tabs = available_ids
+            .iter()
+            .filter(|id| !open_ids.contains(id))
+            .cloned()
+            .collect();
+
+        self.persist_open_tabs();
+        open_ids
+    }
+
+    /// Keep the Settings → Tabs dashboard list in sync with the live module
+    /// list. The Settings page is created lazily, so this is a no-op until it
+    /// exists.
+    fn sync_settings_dashboards(&mut self, cx: &mut Context<Self>) {
+        let Some(settings_page) = &self.settings_page else {
+            return;
+        };
+        let dashboards = self
+            .dashboard_modules
+            .iter()
+            .filter_map(|module| Some((module.id.clone()?, module.module_name.clone())))
+            .collect::<Vec<_>>();
+        settings_page.update(cx, |page, cx| page.update_dashboards(dashboards, cx));
+    }
+
     /// Load saved local layout or fallback to a default trading terminal layout for guest users
     fn load_guest_layout(&mut self, cx: &mut Context<Self>) {
         self.guest_banner_dismissed = false;
@@ -298,23 +391,39 @@ impl MainView {
                 created_at: None,
                 updated_at: None,
             };
-            self.active_module = Some(module.clone());
             self.dashboard_modules = vec![module.clone()];
+            let open_ids = self.apply_startup_tab_preferences();
+            let start_empty = open_ids.is_empty();
+            if start_empty {
+                self.active_module = None;
+                self.home_page = None;
+                self.pending_module_load = None;
+                self.dashboard_views.clear();
+            } else {
+                self.active_module = Some(module.clone());
+            }
             if let Some(dm) = &self.dashboard_manager {
                 dm.update(cx, |manager, cx| {
                     manager.update_modules(vec![module.clone()], cx);
-                    manager.set_active_module("local-default".to_string(), cx);
+                    if start_empty {
+                        manager.clear_active_module(cx);
+                    } else {
+                        manager.set_active_module("local-default".to_string(), cx);
+                    }
                 });
             }
-            if let Some(home) = &self.home_page {
-                home.update(cx, |page, cx| {
-                    page.request_module_load(tree_value, "local-default".to_string(), cx);
-                });
-            } else {
-                self.pending_module_load = Some(PendingModuleLoad {
-                    module_id: "local-default".to_string(),
-                    module,
-                });
+            self.sync_settings_dashboards(cx);
+            if !start_empty {
+                if let Some(home) = &self.home_page {
+                    home.update(cx, |page, cx| {
+                        page.request_module_load(tree_value, "local-default".to_string(), cx);
+                    });
+                } else {
+                    self.pending_module_load = Some(PendingModuleLoad {
+                        module_id: "local-default".to_string(),
+                        module,
+                    });
+                }
             }
         }
     }
@@ -548,10 +657,13 @@ impl MainView {
     /// Share a bounded, read-only snapshot of all loaded/open dashboard layouts.
     fn refresh_agent_context(&self, cx: &mut Context<Self>) {
         let mut homes = self.dashboard_views.clone();
-        if let Some(home) = &self.home_page {
-            let id = self.active_module.as_ref().and_then(|m| m.id.clone())
-                .unwrap_or_else(|| "local-workspace".to_string());
-            homes.entry(id).or_insert_with(|| home.clone());
+        if let (Some(home), Some(active_id)) = (
+            &self.home_page,
+            self.active_module
+                .as_ref()
+                .and_then(|module| module.id.clone()),
+        ) {
+            homes.entry(active_id).or_insert_with(|| home.clone());
         }
         let dashboards: Vec<serde_json::Value> = homes.iter()
             .filter(|(id, _)| !self.closed_dashboard_tabs.contains(*id))
@@ -844,6 +956,7 @@ impl MainView {
             let modules = self.dashboard_modules.clone();
             manager.update(cx, |manager, cx| manager.update_modules(modules, cx));
         }
+        self.persist_open_tabs();
         cx.notify();
     }
 
@@ -860,6 +973,7 @@ impl MainView {
                 self.active_module = None;
             }
         }
+        self.persist_open_tabs();
         cx.notify();
     }
 
@@ -868,6 +982,8 @@ impl MainView {
         self.is_authenticated = true;
         self.current_page = Page::Home;
         self.is_restoring = true;
+        // Rebuild the settings page with the cloud account's preferences.
+        self.settings_page = None;
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -885,6 +1001,8 @@ impl MainView {
         self.is_authenticated = true;
         self.current_page = Page::Home;
         self.is_restoring = true;
+        // Rebuild the settings page with the new account's preferences.
+        self.settings_page = None;
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -915,25 +1033,54 @@ impl MainView {
             if let Ok(modules) = modules_res {
                 let _ = this.update(cx, |view, cx| {
                     view.dashboard_modules = modules.clone();
+                    let open_ids = view.apply_startup_tab_preferences();
+                    let start_empty = open_ids.is_empty();
+
                     if let Some(dm) = &view.dashboard_manager {
                         dm.update(cx, |manager, cx| {
-                            manager.update_modules(modules.clone(), cx);
+                            manager.update_modules(view.dashboard_modules.clone(), cx);
+                            if start_empty {
+                                manager.clear_active_module(cx);
+                            }
                         });
                     }
+                    view.sync_settings_dashboards(cx);
 
-                    if let Some(module) = modules
-                        .iter()
-                        .find(|m| m.module_name == crate::data::modules::DEFAULT_MODULE_NAME)
-                        && let Some(module_id) = &module.id
-                    {
-                        if let Some(dm) = &view.dashboard_manager {
-                            dm.update(cx, |manager, cx| {
-                                manager.set_active_module(module_id.clone(), cx);
+                    if start_empty {
+                        view.active_module = None;
+                        view.home_page = None;
+                        view.dashboard_views.clear();
+                    } else {
+                        let target = modules
+                            .iter()
+                            .find(|module| {
+                                module.module_name == crate::data::modules::DEFAULT_MODULE_NAME
+                                    && module
+                                        .id
+                                        .as_ref()
+                                        .is_some_and(|id| open_ids.contains(id))
+                            })
+                            .or_else(|| {
+                                modules.iter().find(|module| {
+                                    module
+                                        .id
+                                        .as_ref()
+                                        .is_some_and(|id| open_ids.contains(id))
+                                })
                             });
+
+                        if let Some(module) = target
+                            && let Some(module_id) = &module.id
+                        {
+                            if let Some(dm) = &view.dashboard_manager {
+                                dm.update(cx, |manager, cx| {
+                                    manager.set_active_module(module_id.clone(), cx);
+                                });
+                            }
+                            view.load_and_apply_module(module_id.clone(), cx);
                         }
-                        view.load_and_apply_module(module_id.clone(), cx);
                     }
-                    
+
                     view.is_restoring = false;
                     cx.notify();
                 });
@@ -970,6 +1117,7 @@ impl MainView {
                 });
             }
             self.load_and_apply_module(new_id, cx);
+            self.sync_settings_dashboards(cx);
             cx.notify();
             return;
         }
@@ -1013,6 +1161,7 @@ impl MainView {
                             view.load_and_apply_module(module_id.clone(), cx);
                         }
 
+                        view.sync_settings_dashboards(cx);
                         cx.notify();
                     });
                 }
@@ -1026,6 +1175,7 @@ impl MainView {
     /// Delete a layout by module ID
     fn delete_dashboard(&mut self, module_id: String, cx: &mut Context<Self>) {
         self.dashboard_views.remove(&module_id);
+        self.closed_dashboard_tabs.remove(&module_id);
         if !self.is_authenticated {
             let is_active = self.active_module.as_ref().and_then(|m| m.id.as_ref()) == Some(&module_id);
             self.dashboard_modules.retain(|m| m.id.as_ref() != Some(&module_id));
@@ -1053,6 +1203,8 @@ impl MainView {
                     });
                 }
             }
+            self.persist_open_tabs();
+            self.sync_settings_dashboards(cx);
             cx.notify();
             return;
         }
@@ -1111,6 +1263,9 @@ impl MainView {
                             }
                         }
                     }
+
+                    view.persist_open_tabs();
+                    view.sync_settings_dashboards(cx);
                 });
             }
         })
@@ -1294,24 +1449,58 @@ impl MainView {
         crate::data::gateway_registry::GatewayRegistry::global()
             .prefetch_for_modules(&module_exchanges_vec, token.as_deref());
 
-        // Update the dashboard manager with fetched modules and layout presets
+        // Keep the live module list in sync with the fetched payload before
+        // applying tab preferences (which may reorder the list).
+        self.dashboard_modules = modules.clone();
+
+        // Apply the local "tabs on startup" preference. This also restores the
+        // previous tab order and computes the closed-tab set.
+        let open_ids = self.apply_startup_tab_preferences();
+
+        // Update the dashboard manager with the (possibly reordered) modules
+        // and layout presets.
         if let Some(dm) = &self.dashboard_manager {
             dm.update(cx, |manager, cx| {
-                manager.update_modules(modules.clone(), cx);
+                manager.update_modules(self.dashboard_modules.clone(), cx);
                 manager.update_layout_presets(presets, cx);
             });
         }
+        self.sync_settings_dashboards(cx);
 
-        // Auto-select the last used module based on current_dashboard name
+        // "Start as empty" intentionally opens no tabs and leaves the
+        // workspace blank until the user picks a dashboard.
+        let startup_mode = crate::data::tab_settings::load(self.tab_profile()).startup_mode;
+        if startup_mode == crate::data::tab_settings::StartupTabMode::Empty {
+            self.active_module = None;
+            self.home_page = None;
+            self.pending_module_load = None;
+            self.dashboard_views.clear();
+            if let Some(dm) = &self.dashboard_manager {
+                dm.update(cx, |manager, cx| manager.clear_active_module(cx));
+            }
+            cx.notify();
+            return;
+        }
+
+        // Auto-select the last used module based on current_dashboard name.
+        // Only consider tabs that are actually open for this session.
         tracing::info!("=== AUTO-SELECTING DASHBOARD ===");
-        // Determine the module to load: either the current_dashboard or the first one as fallback
         let target_module = if let Some(dashboard_name) = &current_dashboard {
-            modules.iter().find(|m| m.module_name == *dashboard_name)
+            modules.iter().find(|module| {
+                module.module_name == *dashboard_name
+                    && module.id.as_ref().is_some_and(|id| open_ids.contains(id))
+            })
         } else {
             None
         };
 
-        let module_to_load = target_module.or_else(|| modules.first());
+        let module_to_load = target_module
+            .or_else(|| {
+                modules
+                    .iter()
+                    .find(|module| module.id.as_ref().is_some_and(|id| open_ids.contains(id)))
+            })
+            .or_else(|| modules.first());
 
         if let Some(module) = module_to_load {
             if let Some(module_id) = &module.id {
@@ -1321,6 +1510,9 @@ impl MainView {
                     module_id
                 );
 
+                // The active dashboard must always be visible, even if the
+                // saved selection filtered it out.
+                self.closed_dashboard_tabs.remove(module_id);
                 if let Some(dm) = &self.dashboard_manager {
                     dm.update(cx, |manager, cx| {
                         manager.set_active_module(module_id.clone(), cx);
@@ -1431,6 +1623,22 @@ impl MainView {
             // Get the current settings data from the settings page
             let mut settings_data = settings_page.read(cx).get_settings_data(cx);
 
+            // Tab preferences are local-only; keep them out of SettingsData so
+            // they never sync to the backend.
+            let (startup_mode, selected_tab_ids) = settings_page.read(cx).tab_preferences(cx);
+            let mut tab_preferences = crate::data::tab_settings::load(self.tab_profile());
+            let mode_changed = tab_preferences.startup_mode != startup_mode;
+            let selection_changed = tab_preferences.selected_tab_ids != selected_tab_ids;
+            let should_apply_tabs = mode_changed
+                || (startup_mode == crate::data::tab_settings::StartupTabMode::Selected
+                    && selection_changed);
+
+            tab_preferences.startup_mode = startup_mode;
+            tab_preferences.selected_tab_ids = selected_tab_ids;
+            if let Err(error) = crate::data::tab_settings::save(self.tab_profile(), &tab_preferences) {
+                tracing::error!(?error, "Failed to save local tab settings");
+            }
+
             tracing::info!(
                 "Saving settings from settings page: theme={:?}, dark_mode={:?}",
                 settings_data.theme,
@@ -1481,6 +1689,40 @@ impl MainView {
             // Save to API / local storage
             if let Some(settings) = self.user_settings.clone() {
                 self.save_settings_to_api(settings, cx);
+            }
+
+            if should_apply_tabs {
+                let mode = crate::data::tab_settings::load(self.tab_profile()).startup_mode;
+                let open_ids = self.apply_startup_tab_preferences();
+
+                if mode == crate::data::tab_settings::StartupTabMode::Empty
+                    || open_ids.is_empty()
+                {
+                    self.active_module = None;
+                    self.home_page = None;
+                    self.pending_module_load = None;
+                    self.dashboard_views.clear();
+                    if let Some(manager) = &self.dashboard_manager {
+                        manager.update(cx, |manager, cx| manager.clear_active_module(cx));
+                    }
+                } else {
+                    let active_is_open = self
+                        .active_module
+                        .as_ref()
+                        .and_then(|module| module.id.as_ref())
+                        .is_some_and(|id| open_ids.contains(id));
+                    if !active_is_open
+                        && let Some(module_id) = open_ids.first()
+                    {
+                        self.load_and_apply_module(module_id.clone(), cx);
+                    }
+                }
+
+                if let Some(manager) = &self.dashboard_manager {
+                    let modules = self.dashboard_modules.clone();
+                    manager.update(cx, |manager, cx| manager.update_modules(modules, cx));
+                }
+                self.sync_settings_dashboards(cx);
             }
 
             cx.notify();
@@ -1564,6 +1806,7 @@ impl MainView {
                 this.dashboard_page = None;
                 this.user_settings = None;
                 this.active_module = None;
+                this.settings_page = None;
                 this.load_guest_layout(cx);
                 cx.notify();
             });
@@ -1614,6 +1857,7 @@ impl MainView {
             cx.set_global(crate::components::pages::home::GlobalHomeView { view: home.downgrade() });
             self.home_page = Some(home);
             self.closed_dashboard_tabs.remove(&module_id);
+            self.persist_open_tabs();
             self.active_module = Some(module.clone());
             self.refresh_agent_context(cx);
             if let Some(dm) = &self.dashboard_manager {
@@ -2334,6 +2578,12 @@ impl Render for MainView {
             if self.settings_page.is_none() {
                 let settings_data = self.user_settings.clone().unwrap_or_default();
                 let settings_entity = entity.clone();
+                let tab_profile = self.tab_profile();
+                let dashboards = self
+                    .dashboard_modules
+                    .iter()
+                    .filter_map(|module| Some((module.id.clone()?, module.module_name.clone())))
+                    .collect::<Vec<_>>();
 
                 let on_setting_changed = Arc::new(move |cx: &mut App| {
                     if let Some(e) = settings_entity.upgrade() {
@@ -2344,7 +2594,8 @@ impl Render for MainView {
                 });
 
                 self.settings_page = Some(cx.new(move |cx| {
-                    SettingsPage::new_with_data(&settings_data, cx)
+                    SettingsPage::new_with_data(&settings_data, tab_profile, cx)
+                        .with_dashboards(dashboards.clone())
                         .with_on_change(on_setting_changed.clone())
                 }));
             }
@@ -2447,7 +2698,10 @@ impl Render for MainView {
 
         // Create home page lazily (main trading view)
         if self.home_page.is_none() {
-            let active_id = self.active_module.as_ref().and_then(|m| m.id.clone()).unwrap_or_else(|| "default".to_string());
+            let active_id = self
+                .active_module
+                .as_ref()
+                .and_then(|m| m.id.clone());
             let home_page = cx.new(HomePage::new);
 
             // Subscribe to HomePage events to handle immediate layout saves
@@ -2472,7 +2726,11 @@ impl Render for MainView {
                 }
             }
 
-            self.dashboard_views.insert(active_id, home_page.clone());
+            // Only real dashboards belong in the view cache. When starting
+            // empty, `home_page` is a temporary blank workspace.
+            if let Some(active_id) = active_id {
+                self.dashboard_views.insert(active_id, home_page.clone());
+            }
             self.home_page = Some(home_page);
         }
 
