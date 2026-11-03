@@ -488,6 +488,113 @@ impl TradeStore {
         Ok(order)
     }
 
+    /// Sell an existing spot holding at `price`.
+    ///
+    /// Unlike [`Self::execute_order_typed`], this never opens a short position:
+    /// it reduces the base-asset holding FIFO and credits the quote proceeds to
+    /// the active ledger. Market sells settle immediately; limit sells rest as
+    /// OPEN orders and reserve the quantity until they fill or are cancelled.
+    pub fn execute_spot_sell(
+        &mut self,
+        mode: TradingMode,
+        symbol: String,
+        order_type: TradeOrderType,
+        price: f64,
+        quantity: f64,
+    ) -> Result<TradeOrder, String> {
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return Err("Sell quantity must be greater than 0.".to_string());
+        }
+        if !price.is_finite() || price <= 0.0 {
+            return Err("Invalid execution price.".to_string());
+        }
+
+        let available = self.available_spot_quantity(mode, &symbol);
+        if quantity > available + 1e-9 {
+            return Err(format!(
+                "Insufficient spot holdings: available {available:.8}, requested {quantity:.8}"
+            ));
+        }
+
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let is_market = order_type == TradeOrderType::Market;
+
+        let order = TradeOrder {
+            id,
+            timestamp: now_sec,
+            symbol: symbol.clone(),
+            side: TradeSide::Short,
+            order_type,
+            price,
+            quantity,
+            notional: quantity * price,
+            leverage: 1,
+            // Selling an asset does not reserve quote cash; the holding itself
+            // is the collateral, so margin stays at zero.
+            margin: 0.0,
+            status: if is_market { "FILLED" } else { "OPEN" },
+            mode,
+            market_type: MarketType::Spot,
+            initial_mark: self.get_mark_price(&symbol),
+        };
+
+        self.orders.insert(0, order.clone());
+        if is_market {
+            self.settle_spot_sell(&order);
+        }
+        self.version = self.version.wrapping_add(1);
+        Ok(order)
+    }
+
+    /// Reduce spot positions FIFO and credit the sale proceeds to `mode`.
+    fn settle_spot_sell(&mut self, order: &TradeOrder) -> f64 {
+        let mut remaining = order.quantity;
+        let mut idx = 0;
+
+        while idx < self.positions.len() && remaining > 1e-12 {
+            let matches = {
+                let p = &self.positions[idx];
+                p.mode == order.mode
+                    && p.market_type == MarketType::Spot
+                    && p.side == TradeSide::Long
+                    && symbol_matches(&p.symbol, &order.symbol)
+            };
+            if !matches {
+                idx += 1;
+                continue;
+            }
+
+            let pos_qty = self.positions[idx].quantity;
+            if pos_qty <= 1e-12 {
+                self.positions.remove(idx);
+                continue;
+            }
+            let take = remaining.min(pos_qty);
+            if take >= pos_qty - 1e-12 {
+                self.positions.remove(idx);
+            } else {
+                let fraction = take / pos_qty;
+                let pos = &mut self.positions[idx];
+                pos.quantity -= take;
+                pos.margin *= 1.0 - fraction;
+                idx += 1;
+            }
+            remaining -= take;
+        }
+
+        let sold = order.quantity - remaining;
+        let proceeds = sold * order.price;
+        match order.mode {
+            TradingMode::Paper => self.paper_balance += proceeds,
+            TradingMode::Live => self.live_balance += proceeds,
+        }
+        proceeds
+    }
+
     pub fn cancel_order(&mut self, order_id: &str) -> Result<TradeOrder, String> {
         let order = self
             .orders
@@ -516,6 +623,7 @@ impl TradeStore {
             .unwrap_or(0);
 
         let mut newly_filled = Vec::new();
+        let mut filled_spot_sells = Vec::new();
 
         for order in self.orders.iter_mut() {
             if order.status != "OPEN" || !symbol_matches(&order.symbol, symbol) {
@@ -547,23 +655,34 @@ impl TradeStore {
 
             if should_fill {
                 order.status = "FILLED";
-                newly_filled.push(DeskPosition {
-                    id: order.id.clone(),
-                    symbol: order.symbol.clone(),
-                    side: order.side,
-                    entry_price: order.price,
-                    quantity: order.quantity,
-                    margin: order.margin,
-                    leverage: order.leverage,
-                    timestamp: now_sec,
-                    mode: order.mode,
-                    market_type: order.market_type,
-                });
+                if order.market_type == MarketType::Spot && order.side == TradeSide::Short {
+                    // Spot sells reduce an existing holding instead of opening
+                    // a new short position.
+                    filled_spot_sells.push(order.clone());
+                } else {
+                    newly_filled.push(DeskPosition {
+                        id: order.id.clone(),
+                        symbol: order.symbol.clone(),
+                        side: order.side,
+                        entry_price: order.price,
+                        quantity: order.quantity,
+                        margin: order.margin,
+                        leverage: order.leverage,
+                        timestamp: now_sec,
+                        mode: order.mode,
+                        market_type: order.market_type,
+                    });
+                }
             }
         }
 
         if !newly_filled.is_empty() {
             self.positions.extend(newly_filled);
+            self.version = self.version.wrapping_add(1);
+        }
+
+        for sell in filled_spot_sells {
+            self.settle_spot_sell(&sell);
             self.version = self.version.wrapping_add(1);
         }
     }
@@ -584,6 +703,45 @@ impl TradeStore {
             .collect()
     }
 
+    /// Total base-asset quantity held as spot positions for `symbol`.
+    ///
+    /// Spot holdings are represented as long positions, so this is the amount
+    /// the desk can sell without opening a short.
+    pub fn spot_holding_quantity(&self, mode: TradingMode, symbol: &str) -> f64 {
+        self.positions
+            .iter()
+            .filter(|p| {
+                p.mode == mode
+                    && p.market_type == MarketType::Spot
+                    && p.side == TradeSide::Long
+                    && symbol_matches(&p.symbol, symbol)
+            })
+            .map(|p| p.quantity)
+            .sum()
+    }
+
+    /// Base-asset quantity already committed to open spot sell orders.
+    pub fn reserved_spot_sell_quantity(&self, mode: TradingMode, symbol: &str) -> f64 {
+        self.orders
+            .iter()
+            .filter(|o| {
+                o.status == "OPEN"
+                    && o.mode == mode
+                    && o.market_type == MarketType::Spot
+                    && o.side == TradeSide::Short
+                    && symbol_matches(&o.symbol, symbol)
+            })
+            .map(|o| o.quantity)
+            .sum()
+    }
+
+    /// Spot quantity that can still be sold without overselling the holding.
+    pub fn available_spot_quantity(&self, mode: TradingMode, symbol: &str) -> f64 {
+        (self.spot_holding_quantity(mode, symbol)
+            - self.reserved_spot_sell_quantity(mode, symbol))
+        .max(0.0)
+    }
+
     pub fn close_position(&mut self, pos_id: &str, current_price: Option<f64>) -> Result<TradeOrder, String> {
         let pos_idx = self
             .positions
@@ -592,6 +750,22 @@ impl TradeStore {
             .ok_or_else(|| "Position not found".to_string())?;
 
         let pos = self.positions.remove(pos_idx);
+
+        // A spot holding is fungible per symbol, so closing it invalidates any
+        // resting sell orders that were reserving that quantity.
+        if pos.market_type == MarketType::Spot {
+            for order in self.orders.iter_mut() {
+                if order.status == "OPEN"
+                    && order.mode == pos.mode
+                    && order.market_type == MarketType::Spot
+                    && order.side == TradeSide::Short
+                    && symbol_matches(&order.symbol, &pos.symbol)
+                {
+                    order.status = "CANCELLED";
+                }
+            }
+        }
+
         let mark = current_price
             .or_else(|| self.get_mark_price(&pos.symbol))
             .unwrap_or(pos.entry_price);
@@ -835,6 +1009,178 @@ mod tests {
             .expect("spot close should succeed");
         assert_eq!(close.market_type, MarketType::Spot);
         assert_eq!(store.paper_balance, 100_100.0);
+    }
+
+    #[test]
+    fn test_spot_sell_reduces_holding_and_credits_proceeds() {
+        let mut store = TradeStore::new();
+        store.set_mark_price("BTC/USDT", 50_000.0);
+
+        let buy = store
+            .execute_order_typed(
+                TradingMode::Paper,
+                MarketType::Spot,
+                "BTC/USDT".to_string(),
+                TradeSide::Long,
+                TradeOrderType::Market,
+                50_000.0,
+                1_000.0,
+                1,
+            )
+            .expect("spot buy should succeed");
+        assert_eq!(buy.quantity, 0.02);
+        assert_eq!(store.spot_holding_quantity(TradingMode::Paper, "BTC/USDT"), 0.02);
+        assert_eq!(store.paper_balance, 99_000.0);
+
+        // Sell half at a profit: 0.01 BTC * $55,000 = $550 proceeds.
+        let sell = store
+            .execute_spot_sell(
+                TradingMode::Paper,
+                "BTC/USDT".to_string(),
+                TradeOrderType::Market,
+                55_000.0,
+                0.01,
+            )
+            .expect("spot sell should succeed");
+        assert_eq!(sell.status, "FILLED");
+        assert_eq!(sell.side, TradeSide::Short);
+        assert_eq!(sell.market_type, MarketType::Spot);
+        assert!((store.paper_balance - 99_550.0).abs() < 1e-9);
+        assert!((store.spot_holding_quantity(TradingMode::Paper, "BTC/USDT") - 0.01).abs() < 1e-12);
+        assert_eq!(store.positions.len(), 1);
+        assert_eq!(store.positions[0].side, TradeSide::Long);
+
+        // Sell the remainder; the holding is gone and no short was opened.
+        store
+            .execute_spot_sell(
+                TradingMode::Paper,
+                "BTC/USDT".to_string(),
+                TradeOrderType::Market,
+                55_000.0,
+                0.01,
+            )
+            .expect("remaining spot sell should succeed");
+        assert!(store.positions.is_empty());
+        assert!((store.paper_balance - 100_100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_spot_sell_rejects_more_than_holding() {
+        let mut store = TradeStore::new();
+        store.set_mark_price("BTC/USDT", 50_000.0);
+
+        let empty = store.execute_spot_sell(
+            TradingMode::Paper,
+            "BTC/USDT".to_string(),
+            TradeOrderType::Market,
+            50_000.0,
+            0.01,
+        );
+        assert!(empty.is_err());
+        assert!(empty.unwrap_err().contains("Insufficient spot holdings"));
+
+        store
+            .execute_order_typed(
+                TradingMode::Paper,
+                MarketType::Spot,
+                "BTC/USDT".to_string(),
+                TradeSide::Long,
+                TradeOrderType::Market,
+                50_000.0,
+                1_000.0,
+                1,
+            )
+            .expect("spot buy should succeed");
+
+        let oversized = store.execute_spot_sell(
+            TradingMode::Paper,
+            "BTC/USDT".to_string(),
+            TradeOrderType::Market,
+            50_000.0,
+            0.03,
+        );
+        assert!(oversized.is_err());
+        assert!(oversized.unwrap_err().contains("Insufficient spot holdings"));
+    }
+
+    #[test]
+    fn test_spot_limit_sell_reserves_quantity_until_filled() {
+        let mut store = TradeStore::new();
+        store.set_mark_price("BTC/USDT", 50_000.0);
+
+        store
+            .execute_order_typed(
+                TradingMode::Paper,
+                MarketType::Spot,
+                "BTC/USDT".to_string(),
+                TradeSide::Long,
+                TradeOrderType::Market,
+                50_000.0,
+                1_000.0,
+                1,
+            )
+            .expect("spot buy should succeed");
+
+        let sell = store
+            .execute_spot_sell(
+                TradingMode::Paper,
+                "BTC/USDT".to_string(),
+                TradeOrderType::Limit,
+                60_000.0,
+                0.02,
+            )
+            .expect("spot limit sell should succeed");
+        assert_eq!(sell.status, "OPEN");
+        assert_eq!(store.spot_holding_quantity(TradingMode::Paper, "BTC/USDT"), 0.02);
+        assert_eq!(store.reserved_spot_sell_quantity(TradingMode::Paper, "BTC/USDT"), 0.02);
+        assert_eq!(store.available_spot_quantity(TradingMode::Paper, "BTC/USDT"), 0.0);
+
+        // Below the limit the order stays open and the holding is untouched.
+        store.set_mark_price("BTC/USDT", 55_000.0);
+        assert_eq!(store.orders[0].status, "OPEN");
+        assert_eq!(store.positions.len(), 1);
+
+        // At the limit the sell fills, reduces the holding and credits proceeds.
+        store.set_mark_price("BTC/USDT", 60_000.0);
+        assert_eq!(store.orders[0].status, "FILLED");
+        assert!(store.positions.is_empty());
+        assert!((store.paper_balance - 100_200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cancelled_spot_sell_releases_reserved_quantity() {
+        let mut store = TradeStore::new();
+        store.set_mark_price("BTC/USDT", 50_000.0);
+
+        store
+            .execute_order_typed(
+                TradingMode::Paper,
+                MarketType::Spot,
+                "BTC/USDT".to_string(),
+                TradeSide::Long,
+                TradeOrderType::Market,
+                50_000.0,
+                1_000.0,
+                1,
+            )
+            .expect("spot buy should succeed");
+
+        let sell = store
+            .execute_spot_sell(
+                TradingMode::Paper,
+                "BTC/USDT".to_string(),
+                TradeOrderType::Limit,
+                60_000.0,
+                0.01,
+            )
+            .expect("spot limit sell should succeed");
+        assert_eq!(store.available_spot_quantity(TradingMode::Paper, "BTC/USDT"), 0.01);
+
+        store
+            .cancel_order(&sell.id)
+            .expect("spot sell cancel should succeed");
+        assert_eq!(store.available_spot_quantity(TradingMode::Paper, "BTC/USDT"), 0.02);
+        assert_eq!(store.positions.len(), 1);
     }
 
     #[test]

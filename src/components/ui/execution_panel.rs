@@ -390,6 +390,41 @@ impl ExecutionPanel {
         }
     }
 
+    /// Maximum amount the desk can commit for the current side and market.
+    ///
+    /// Buys are capped by the quote cash balance. Spot sells are capped by the
+    /// base-asset holding, priced in the quote currency.
+    fn max_order_amount(&self, mode: TradingMode) -> f64 {
+        if self.market_type == MarketType::Spot && self.side == Side::Short {
+            let price = match self.order_type {
+                OrderType::Limit => self.limit_price.or_else(|| self.price()),
+                OrderType::Market => self.price(),
+            }
+            .unwrap_or(0.0);
+            let qty = TradeStore::global()
+                .lock()
+                .map(|store| store.available_spot_quantity(mode, &self.symbol))
+                .unwrap_or(0.0);
+            (qty * price).max(0.0)
+        } else {
+            TradeStore::global()
+                .lock()
+                .map(|store| store.balance(mode))
+                .unwrap_or(0.0)
+        }
+    }
+
+    /// Clamp helper that keeps the historical $10 floor for cash orders while
+    /// letting spot sells use the full holding value even when it is small.
+    fn amount_cap(&self, mode: TradingMode) -> f64 {
+        let max = self.max_order_amount(mode);
+        if self.market_type == MarketType::Spot && self.side == Side::Short {
+            max
+        } else {
+            max.max(10.0)
+        }
+    }
+
     /// Refresh the real account balance for the selected exchange.
     ///
     /// Runs the blocking CCXT request on the shared Tokio runtime and applies
@@ -465,8 +500,13 @@ impl ExecutionPanel {
 
     pub fn adjust_margin(&mut self, delta: f64, cx: &mut Context<Self>) {
         let mode = self.active_mode();
-        let balance = TradeStore::global().lock().unwrap().balance(mode);
-        let new_margin = (self.margin + delta).max(10.0).min(balance.max(10.0));
+        let cap = self.amount_cap(mode);
+        let floor = if self.market_type == MarketType::Spot && self.side == Side::Short {
+            0.0
+        } else {
+            10.0
+        };
+        let new_margin = (self.margin + delta).max(floor).min(cap.max(floor));
         self.margin = (new_margin * 100.0).round() / 100.0;
         self.margin_focused = false;
         self.size_focused = false;
@@ -475,14 +515,19 @@ impl ExecutionPanel {
 
     pub fn set_margin_percent(&mut self, pct: f64, cx: &mut Context<Self>) {
         let mode = self.active_mode();
-        let balance = TradeStore::global().lock().unwrap().balance(mode);
-        let raw = balance * pct;
+        let cap = self.amount_cap(mode);
+        let raw = cap * pct;
         let rounded = if raw >= 100.0 {
             (raw / 25.0).round() * 25.0
         } else {
             (raw * 10.0).round() / 10.0
         };
-        self.margin = rounded.max(10.0).min(balance.max(10.0));
+        let floor = if self.market_type == MarketType::Spot && self.side == Side::Short {
+            0.0
+        } else {
+            10.0
+        };
+        self.margin = rounded.max(floor).min(cap.max(floor));
         self.margin_focused = false;
         self.size_focused = false;
         cx.notify();
@@ -564,6 +609,16 @@ impl ExecutionPanel {
         self.price_focused = false;
         self.margin_focused = false;
         self.size_focused = false;
+        // A spot sell side is only valid while the new symbol has a holding.
+        if self.market_type == MarketType::Spot && self.side == Side::Short {
+            let has_holding = TradeStore::global()
+                .lock()
+                .map(|store| store.available_spot_quantity(self.active_mode(), &self.symbol) > 0.0)
+                .unwrap_or(false);
+            if !has_holding {
+                self.side = Side::Long;
+            }
+        }
         // The live balance is denominated in the quote currency, so refresh it
         // when the new symbol settles in a different currency.
         if self.is_live_mode && self.quote_asset() != previous_quote.as_str() {
@@ -662,8 +717,8 @@ impl ExecutionPanel {
                     if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
                         if val >= 0.0 && val.is_finite() {
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
-                            this.margin = val.min(balance.max(10.0));
+                            let cap = this.amount_cap(mode);
+                            this.margin = val.min(cap);
                         }
                     }
                     cx.notify();
@@ -673,8 +728,8 @@ impl ExecutionPanel {
                     if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
                         if val >= 0.0 && val.is_finite() {
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
-                            this.margin = val.min(balance.max(10.0));
+                            let cap = this.amount_cap(mode);
+                            this.margin = val.min(cap);
                             cx.notify();
                         }
                     }
@@ -684,8 +739,8 @@ impl ExecutionPanel {
                     if let Ok(val) = text.trim().replace('$', "").replace(',', "").parse::<f64>() {
                         if val >= 0.0 && val.is_finite() {
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
-                            this.margin = val.min(balance.max(10.0));
+                            let cap = this.amount_cap(mode);
+                            this.margin = val.min(cap);
                             cx.notify();
                         }
                     }
@@ -730,9 +785,9 @@ impl ExecutionPanel {
                             };
                             let lev = this.leverage.max(1) as f64;
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let cap = this.amount_cap(mode);
                             let computed_margin = (qty * exec_price) / lev;
-                            this.margin = computed_margin.min(balance.max(10.0));
+                            this.margin = computed_margin.min(cap);
                         }
                     }
                     cx.notify();
@@ -749,9 +804,9 @@ impl ExecutionPanel {
                             };
                             let lev = this.leverage.max(1) as f64;
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let cap = this.amount_cap(mode);
                             let computed_margin = (qty * exec_price) / lev;
-                            this.margin = computed_margin.min(balance.max(10.0));
+                            this.margin = computed_margin.min(cap);
                             cx.notify();
                         }
                     }
@@ -768,9 +823,9 @@ impl ExecutionPanel {
                             };
                             let lev = this.leverage.max(1) as f64;
                             let mode = this.active_mode();
-                            let balance = TradeStore::global().lock().unwrap().balance(mode);
+                            let cap = this.amount_cap(mode);
                             let computed_margin = (qty * exec_price) / lev;
-                            this.margin = computed_margin.min(balance.max(10.0));
+                            this.margin = computed_margin.min(cap);
                         }
                     }
                     cx.notify();
@@ -844,22 +899,40 @@ impl ExecutionPanel {
             return;
         }
 
-        let result = TradeStore::global().lock().unwrap().execute_order_typed(
-            mode,
-            self.market_type,
-            self.symbol.clone(),
-            self.side,
-            self.order_type,
-            exec_price,
-            self.margin,
-            self.leverage,
-        );
+        let result = if self.market_type == MarketType::Spot && self.side == Side::Short {
+            // Spot sells dispose of an existing holding; they are never naked
+            // shorts. The quote amount is converted to base quantity at the
+            // execution price (spot always settles at 1x).
+            let quantity = self.margin / exec_price;
+            TradeStore::global().lock().unwrap().execute_spot_sell(
+                mode,
+                self.symbol.clone(),
+                self.order_type,
+                exec_price,
+                quantity,
+            )
+        } else {
+            TradeStore::global().lock().unwrap().execute_order_typed(
+                mode,
+                self.market_type,
+                self.symbol.clone(),
+                self.side,
+                self.order_type,
+                exec_price,
+                self.margin,
+                self.leverage,
+            )
+        };
 
         match result {
             Ok(order) => {
-                let side_str = match self.side {
-                    Side::Long => "BUY / LONG",
-                    Side::Short => "SELL / SHORT",
+                let side_str = if self.market_type == MarketType::Spot && self.side == Side::Short {
+                    "SELL"
+                } else {
+                    match self.side {
+                        Side::Long => "BUY / LONG",
+                        Side::Short => "SELL / SHORT",
+                    }
                 };
                 let type_str = match self.order_type {
                     OrderType::Limit => "LIMIT",
@@ -1039,6 +1112,25 @@ impl Render for ExecutionPanel {
             let eq = store.total_equity(mode);
             (bal, dep, upnl, eq)
         };
+
+        // Spot holdings drive whether the SELL pod is actionable. This is the
+        // ledger holding for the active mode, minus quantity reserved by open
+        // spot sell orders.
+        let (spot_holding_qty, spot_available_qty) = if self.market_type == MarketType::Spot {
+            let store = TradeStore::global().lock().unwrap();
+            (
+                store.spot_holding_quantity(mode, &self.symbol),
+                store.available_spot_quantity(mode, &self.symbol),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let can_sell_spot = spot_available_qty > 0.0;
+        // A short side only makes sense while a spot holding remains; reset it
+        // after the last unit is sold or when switching to a symbol with none.
+        if self.market_type == MarketType::Spot && self.side == Side::Short && !can_sell_spot {
+            self.side = Side::Long;
+        }
 
         let liq_buffer_pct = match (mark, liq_price) {
             (Some(m), Some(l)) if m > 0.0 => ((m - l).abs() / m) * 100.0,
@@ -1501,27 +1593,35 @@ impl Render for ExecutionPanel {
                             })
                             .cursor_pointer()
                             .border_1()
-                            .border_color(if is_spot {
+                            .border_color(if is_spot && !can_sell_spot {
                                 c.border
                             } else if !is_long {
                                 c.bearish
                             } else {
                                 c.border
                             })
-                            .bg(if is_spot {
+                            .bg(if is_spot && !can_sell_spot {
                                 c.muted.opacity(0.15)
                             } else if !is_long {
                                 c.bearish.opacity(0.12)
                             } else {
                                 c.muted.opacity(0.22)
                             })
-                            .when(is_spot, |this| this.opacity(0.55))
-                            .when(!is_spot, |this| {
+                            .when(is_spot && !can_sell_spot, |this| this.opacity(0.55))
+                            .when(!is_spot || can_sell_spot, |this| {
                                 this.hover(|s| s.border_color(c.bearish.opacity(0.8)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             this.side = Side::Short;
+                                            // Never default a spot sell above the
+                                            // quantity actually held.
+                                            if this.market_type == MarketType::Spot {
+                                                let cap = this.max_order_amount(this.active_mode());
+                                                if cap > 0.0 && this.margin > cap {
+                                                    this.margin = cap;
+                                                }
+                                            }
                                             cx.notify();
                                         }),
                                     )
@@ -1534,16 +1634,20 @@ impl Render for ExecutionPanel {
                                         div()
                                             .text_xs()
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_spot {
+                                            .text_color(if is_spot && !can_sell_spot {
                                                 c.muted_foreground
                                             } else if !is_long {
                                                 c.bearish
                                             } else {
                                                 c.muted_foreground
                                             })
-                                            .child(if is_very_narrow { "▼ SELL" } else { "▼ SELL / SHORT" }),
+                                            .child(if is_spot || is_very_narrow {
+                                                "▼ SELL"
+                                            } else {
+                                                "▼ SELL / SHORT"
+                                            }),
                                     )
-                                    .when(!is_long && !is_spot && !is_very_narrow, |this| {
+                                    .when(!is_long && (!is_spot || can_sell_spot) && !is_very_narrow, |this| {
                                         this.child(
                                             Icon::new(IconName::Check)
                                                 .size(px(12.))
@@ -1557,7 +1661,13 @@ impl Render for ExecutionPanel {
                                         .text_xs()
                                         .text_color(c.muted_foreground)
                                         .child(if is_spot {
-                                            "Spot market: long only"
+                                            if can_sell_spot {
+                                                "Sell your spot holdings"
+                                            } else if spot_holding_qty > 0.0 {
+                                                "Holdings reserved by open sells"
+                                            } else {
+                                                "No spot holdings to sell"
+                                            }
                                         } else {
                                             "Profit on market drawdown"
                                         }),
@@ -2226,11 +2336,33 @@ impl Render for ExecutionPanel {
                         )
                     })
                     .when(is_spot, |this| {
+                        let reserved = (spot_holding_qty - spot_available_qty).max(0.0);
+                        let holdings_label = match mark {
+                            Some(price) if spot_holding_qty > 0.0 => format!(
+                                "Spot holdings: {} {} (≈ ${:.2})",
+                                Self::fmt_size(spot_holding_qty),
+                                base,
+                                spot_holding_qty * price
+                            ),
+                            _ if spot_holding_qty > 0.0 => format!(
+                                "Spot holdings: {} {}",
+                                Self::fmt_size(spot_holding_qty),
+                                base
+                            ),
+                            _ => "Spot holdings: none".to_string(),
+                        };
                         this.child(
                             div()
                                 .text_xs()
                                 .text_color(c.muted_foreground)
-                                .child("Spot settlement · no liquidation price"),
+                                .child(if reserved > 0.0 {
+                                    format!(
+                                        "{holdings_label} · {} reserved",
+                                        Self::fmt_size(reserved)
+                                    )
+                                } else {
+                                    holdings_label
+                                }),
                         )
                     });
 
