@@ -87,10 +87,16 @@ jobs:
         run: |
           binary="target/${{ matrix.target }}/release/finter${{ matrix.extension }}"
           if [ -n "$FINTER_VERSION_URL" ]; then
-            LC_ALL=C grep -aqF -- "$FINTER_VERSION_URL" "$binary" || {
+            if ! LC_ALL=C grep -aqF -- "$FINTER_VERSION_URL" "$binary"; then
               echo "::error::FINTER_VERSION_URL was not embedded in $binary"
+              echo "Generated version_url.rs files:"
+              find "target/${{ matrix.target }}/release/build" -name version_url.rs \
+                -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \; || true
+              echo "URL strings found in binary:"
+              LC_ALL=C grep -aoE 'https://[^"[:space:]]+' "$binary" | sort -u | head -20 || true
+              ls -l "$binary"
               exit 1
-            }
+            fi
             echo "Embedded update endpoint: $FINTER_VERSION_URL"
           else
             echo "Update checks disabled for this build"

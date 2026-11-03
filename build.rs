@@ -8,6 +8,9 @@ fn main() {
     // (instead of relying on option_env!) makes Cargo rebuild the lib and bin
     // when the URL changes, even when a cached target directory is restored.
     let version_url = env::var("FINTER_VERSION_URL").unwrap_or_default();
+    if !version_url.is_empty() {
+        println!("cargo:warning=Embedding update endpoint: {version_url}");
+    }
     let out_dir = std::path::PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     std::fs::write(
         out_dir.join("version_url.rs"),

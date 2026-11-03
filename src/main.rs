@@ -4,6 +4,11 @@
     windows_subsystem = "windows"
 )]
 
+// Tie the binary's fingerprint to the baked update endpoint so a URL change
+// relinks the executable even when the library comes from a restored cache.
+include!(concat!(env!("OUT_DIR"), "/version_url.rs"));
+const _: &str = DEFAULT_VERSION_URL;
+
 mod assets;
 mod combined_assets;
 
