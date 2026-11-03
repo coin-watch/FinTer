@@ -10,6 +10,8 @@ The included GitHub Actions workflow builds and tests platform binaries. On push
 
 Alpha/beta builds stage under `<channel>/<sha>/` and update `<channel>/version.json`, pruning obsolete builds. Tagged releases stage under `releases/v<version>/` and update `latest/version.json`.
 
+CI embeds the matching metadata endpoint in each binary automatically: `alpha` → `https://data.coinwat.ch/alpha/version.json`, `beta` → `https://data.coinwat.ch/beta/version.json`, and `v*` tags → `https://data.coinwat.ch/latest/version.json`. Pull-request builds leave update checks disabled. Local builds can opt in at build or run time with `FINTER_VERSION_URL`.
+
 Required GitHub Actions secrets:
 - `B2_KEY_ID`: Application key ID.
 - `B2_APPLICATION_KEY`: Application key secret.
@@ -22,6 +24,7 @@ Required GitHub Actions secrets:
 
 - Supported targets in CI: macOS arm64/x86_64, Windows x86_64, Linux x86_64.
 - macOS `.app` bundles are not built or notarized.
+- Linux AppImage artifacts are not self-updating; the updater replaces the raw `finter` binary, so use the published Linux binary rather than the AppImage.
 - Updating an executable in a read-only/system install location may fail.
 - SHA-256 is not a digital signature and does not protect against a compromised metadata host.
 

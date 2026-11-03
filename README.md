@@ -102,7 +102,7 @@ FINTER_API_URL="http://localhost:5173" cargo run
 | `FINTER_WS_URL` | WebSocket market stream gateway. |
 | `FINTER_NEWS_API_URL` | News article API. |
 | `FINTER_NEWS_WS_URL` | News WebSocket stream. |
-| `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. |
+| `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel. |
 | `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
 
 <details>

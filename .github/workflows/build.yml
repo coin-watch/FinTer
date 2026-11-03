@@ -67,8 +67,34 @@ jobs:
             libssl-dev pkg-config \
             desktop-file-utils zsync file
 
+      - name: Configure update endpoint
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/heads/alpha) url="https://data.coinwat.ch/alpha/version.json" ;;
+            refs/heads/beta)  url="https://data.coinwat.ch/beta/version.json" ;;
+            refs/tags/v*)     url="https://data.coinwat.ch/latest/version.json" ;;
+            *)                url="" ;;
+          esac
+          echo "FINTER_VERSION_URL=$url" >> "$GITHUB_ENV"
+          echo "Update endpoint: ${url:-<disabled>}"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify update endpoint embedded
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/finter${{ matrix.extension }}"
+          if [ -n "$FINTER_VERSION_URL" ]; then
+            grep -aqF "$FINTER_VERSION_URL" "$binary" || {
+              echo "::error::FINTER_VERSION_URL was not embedded in $binary"
+              exit 1
+            }
+            echo "Embedded update endpoint: $FINTER_VERSION_URL"
+          else
+            echo "Update checks disabled for this build"
+          fi
 
       - name: Package Linux AppImage
         if: runner.os == 'Linux'
