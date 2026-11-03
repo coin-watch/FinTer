@@ -977,6 +977,22 @@ impl MainView {
         cx.notify();
     }
 
+    /// Drop the guest workspace state before a cloud account's dashboards are
+    /// loaded. Without this, a guest HomePage/active module (or a stale view
+    /// from a previous account) can shadow the dashboard that was active when
+    /// the user last logged in.
+    fn reset_workspace_for_account_switch(&mut self) {
+        self.active_module = None;
+        self.home_page = None;
+        self.pending_module_load = None;
+        self.dashboard_views.clear();
+        self.closed_dashboard_tabs.clear();
+        self.layout_cache.clear();
+        // Do not let the guest settings' `current_dashboard` seed the cloud
+        // session; the account's own settings are fetched next.
+        self.user_settings = None;
+    }
+
     /// Handle successful login: switch to home with trading view
     fn on_logged_in(&mut self, cx: &mut Context<Self>) {
         self.is_authenticated = true;
@@ -984,6 +1000,7 @@ impl MainView {
         self.is_restoring = true;
         // Rebuild the settings page with the cloud account's preferences.
         self.settings_page = None;
+        self.reset_workspace_for_account_switch();
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -1003,6 +1020,7 @@ impl MainView {
         self.is_restoring = true;
         // Rebuild the settings page with the new account's preferences.
         self.settings_page = None;
+        self.reset_workspace_for_account_switch();
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -1364,12 +1382,10 @@ impl MainView {
             };
             
             // If the API failed to give us a current dashboard, fallback to our local cache!
-            let _ = this.update(cx, |view, cx| {
+            let _ = this.update(cx, |_view, cx| {
                 if current_dashboard.is_none() {
                     current_dashboard = local_dashboard.clone();
                 }
-                // Done loading everything
-                view.is_restoring = false;
                 cx.notify();
             });
 
@@ -1407,10 +1423,18 @@ impl MainView {
                             current_dashboard,
                             cx,
                         );
+                        // Keep the loading screen up until the restored
+                        // dashboard has actually been applied.
+                        view.is_restoring = false;
+                        cx.notify();
                     });
                 }
                 Err(e) => {
                     tracing::error!("✗ Failed to load modules from API: {:?}", e);
+                    let _ = this.update(cx, |view, cx| {
+                        view.is_restoring = false;
+                        cx.notify();
+                    });
                 }
             }
         })
@@ -1483,24 +1507,12 @@ impl MainView {
         }
 
         // Auto-select the last used module based on current_dashboard name.
-        // Only consider tabs that are actually open for this session.
+        // The last-used dashboard is always restored, even if the local tab
+        // preferences filtered it out (for example because its tab was closed
+        // before logging out).
         tracing::info!("=== AUTO-SELECTING DASHBOARD ===");
-        let target_module = if let Some(dashboard_name) = &current_dashboard {
-            modules.iter().find(|module| {
-                module.module_name == *dashboard_name
-                    && module.id.as_ref().is_some_and(|id| open_ids.contains(id))
-            })
-        } else {
-            None
-        };
-
-        let module_to_load = target_module
-            .or_else(|| {
-                modules
-                    .iter()
-                    .find(|module| module.id.as_ref().is_some_and(|id| open_ids.contains(id)))
-            })
-            .or_else(|| modules.first());
+        let module_to_load =
+            select_startup_module(&modules, current_dashboard.as_deref(), &open_ids);
 
         if let Some(module) = module_to_load {
             if let Some(module_id) = &module.id {
@@ -3112,5 +3124,66 @@ fn collect_exchanges_from_json(
             }
         }
         _ => {}
+    }
+}
+
+/// Choose the dashboard to open after settings and modules have loaded.
+///
+/// The last-used dashboard (`current_dashboard`) always wins, even when the
+/// local tab preferences did not restore its tab. Otherwise fall back to the
+/// first restored/open dashboard, then to the first available dashboard.
+fn select_startup_module<'a>(
+    modules: &'a [Module],
+    current_dashboard: Option<&str>,
+    open_ids: &[String],
+) -> Option<&'a Module> {
+    current_dashboard
+        .and_then(|name| modules.iter().find(|module| module.module_name == name))
+        .or_else(|| {
+            modules
+                .iter()
+                .find(|module| module.id.as_ref().is_some_and(|id| open_ids.contains(id)))
+        })
+        .or_else(|| modules.first())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(id: &str, name: &str) -> Module {
+        Module {
+            id: Some(id.to_string()),
+            user_id: None,
+            module_name: name.to_string(),
+            module: serde_json::json!({}),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn startup_selects_last_dashboard_even_when_its_tab_is_closed() {
+        let modules = vec![module("a", "Alpha"), module("b", "Beta")];
+        let selected = select_startup_module(&modules, Some("Beta"), &ids(&["a"]));
+        assert_eq!(selected.and_then(|module| module.id.as_deref()), Some("b"));
+    }
+
+    #[test]
+    fn startup_falls_back_to_first_open_dashboard() {
+        let modules = vec![module("a", "Alpha"), module("b", "Beta")];
+        let selected = select_startup_module(&modules, Some("Missing"), &ids(&["b"]));
+        assert_eq!(selected.and_then(|module| module.id.as_deref()), Some("b"));
+    }
+
+    #[test]
+    fn startup_falls_back_to_first_dashboard() {
+        let modules = vec![module("a", "Alpha"), module("b", "Beta")];
+        let selected = select_startup_module(&modules, None, &[]);
+        assert_eq!(selected.and_then(|module| module.id.as_deref()), Some("a"));
     }
 }
