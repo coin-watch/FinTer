@@ -4,6 +4,17 @@ fn main() {
     println!("cargo:rerun-if-env-changed=FINTER_API_URL");
     println!("cargo:rerun-if-env-changed=FINTER_VERSION_URL");
 
+    // Bake the update endpoint into the binary. Writing a generated source file
+    // (instead of relying on option_env!) makes Cargo rebuild the lib and bin
+    // when the URL changes, even when a cached target directory is restored.
+    let version_url = env::var("FINTER_VERSION_URL").unwrap_or_default();
+    let out_dir = std::path::PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    std::fs::write(
+        out_dir.join("version_url.rs"),
+        format!("const DEFAULT_VERSION_URL: &str = {version_url:?};\n"),
+    )
+    .expect("failed to write version_url.rs");
+
     // Windows app icon
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" {

@@ -87,7 +87,7 @@ jobs:
         run: |
           binary="target/${{ matrix.target }}/release/finter${{ matrix.extension }}"
           if [ -n "$FINTER_VERSION_URL" ]; then
-            grep -aqF "$FINTER_VERSION_URL" "$binary" || {
+            LC_ALL=C grep -aqF -- "$FINTER_VERSION_URL" "$binary" || {
               echo "::error::FINTER_VERSION_URL was not embedded in $binary"
               exit 1
             }
