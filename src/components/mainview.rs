@@ -6,6 +6,7 @@ use crate::components::pages::{
     profile::ProfilePage,
     settings::SettingsPage,
 };
+use crate::components::ui::alerts_panel::{AlertsPanel, AlertsPanelEvent};
 use crate::components::ui::delete_dashboard_dialog::{
     DeleteDashboardDialogEvent, open_delete_dashboard_dialog,
 };
@@ -36,7 +37,6 @@ pub enum Page {
     Dashboard,
     SimpleDashboard, // New PaneGrid implementation
     Feeds,
-    Superchat,
     Notification,
     Settings,
     Profile,
@@ -47,7 +47,6 @@ pub enum Page {
 pub enum SecondarySidebar {
     Dashboard,
     Feeds,
-    Superchat,
     Notifications,
     Settings,
 }
@@ -133,6 +132,8 @@ pub struct MainView {
     dashboard_views: std::collections::HashMap<String, Entity<HomePage>>,
     settings_page: Option<Entity<SettingsPage>>,
     dashboard_manager: Option<Entity<crate::components::ui::dashboard_manager::DashboardManager>>,
+    /// Live CoinWatch alert desk shown in the secondary sidebar.
+    alerts_panel: Option<Entity<AlertsPanel>>,
     api_client: ApiClient,
     is_authenticated: bool,
     /// Redacted account snapshot for the native Profile page.
@@ -179,6 +180,7 @@ impl MainView {
             dashboard_views: std::collections::HashMap::new(),
             settings_page: None,
             dashboard_manager: None,
+            alerts_panel: None,
             api_client,
             is_authenticated: false,
             account_summary: None,
@@ -514,6 +516,10 @@ impl MainView {
                     // Load settings first, then modules with current_dashboard for auto-selection
                     this.load_settings_then_modules(cx);
                     this.load_account_summary(cx);
+                    this.ensure_alerts_panel(cx);
+                    if let Some(panel) = &this.alerts_panel {
+                        panel.update(cx, |panel, cx| panel.refresh(cx));
+                    }
                 } else {
                     this.is_authenticated = false;
                     this.account_summary = None;
@@ -599,12 +605,42 @@ impl MainView {
         self.current_page = Page::Home;
     }
 
+    /// Create the alerts desk once and keep it alive so its poll task, inputs,
+    /// and scroll state survive closing and reopening the sidebar.
+    fn ensure_alerts_panel(&mut self, cx: &mut Context<Self>) {
+        if self.alerts_panel.is_some() {
+            return;
+        }
+
+        let client = self.api_client.clone();
+        let panel = cx.new(|cx| AlertsPanel::new(client, cx));
+        cx.subscribe(
+            &panel,
+            |this, _panel, event: &AlertsPanelEvent, cx| match event {
+                AlertsPanelEvent::RequestLogin => {
+                    this.active_secondary_sidebar = None;
+                    this.switch_page(Page::Login);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.alerts_panel = Some(panel);
+    }
+
     /// Toggle a secondary sidebar (close if already open)
     pub fn toggle_secondary_sidebar(&mut self, sidebar: SecondarySidebar, cx: &mut Context<Self>) {
         if self.active_secondary_sidebar == Some(sidebar) {
             self.active_secondary_sidebar = None;
         } else {
             self.active_secondary_sidebar = Some(sidebar);
+
+            if sidebar == SecondarySidebar::Notifications {
+                self.ensure_alerts_panel(cx);
+                if let Some(panel) = &self.alerts_panel {
+                    panel.update(cx, |panel, cx| panel.refresh(cx));
+                }
+            }
 
             // If we are opening the dashboard sidebar and authenticated, refresh modules and presets in the background
             if sidebar == SecondarySidebar::Dashboard && self.is_authenticated {
@@ -916,7 +952,8 @@ impl MainView {
                     #[cfg(not(target_os = "linux"))]
                     titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                     window_decorations: Some(gpui::WindowDecorations::Client),
-                    app_id: Some("finter-dashboard".to_string()),
+                        app_id: Some("ch.coinwat.finter".to_string()),
+                        icon: crate::data::app_icon::png().map(|bytes| bytes.to_vec()),
                     ..Default::default()
                 },
                 move |window, cx| {
@@ -1000,7 +1037,7 @@ impl MainView {
     /// loaded. Without this, a guest HomePage/active module (or a stale view
     /// from a previous account) can shadow the dashboard that was active when
     /// the user last logged in.
-    fn reset_workspace_for_account_switch(&mut self) {
+    fn reset_workspace_for_account_switch(&mut self, cx: &mut Context<Self>) {
         self.active_module = None;
         self.home_page = None;
         self.pending_module_load = None;
@@ -1019,6 +1056,9 @@ impl MainView {
             server_url: Some(server_url),
             ..Default::default()
         });
+        if let Some(panel) = &self.alerts_panel {
+            panel.update(cx, |panel, cx| panel.clear(cx));
+        }
     }
 
     /// Handle successful login: switch to home with trading view
@@ -1028,7 +1068,7 @@ impl MainView {
         self.is_restoring = true;
         // Rebuild the settings page with the cloud account's preferences.
         self.settings_page = None;
-        self.reset_workspace_for_account_switch();
+        self.reset_workspace_for_account_switch(cx);
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -1037,6 +1077,10 @@ impl MainView {
         // Load settings first, then modules with current_dashboard for auto-selection
         self.load_settings_then_modules(cx);
         self.load_account_summary(cx);
+        self.ensure_alerts_panel(cx);
+        if let Some(panel) = &self.alerts_panel {
+            panel.update(cx, |panel, cx| panel.refresh(cx));
+        }
 
         cx.notify();
     }
@@ -1048,7 +1092,7 @@ impl MainView {
         self.is_restoring = true;
         // Rebuild the settings page with the new account's preferences.
         self.settings_page = None;
-        self.reset_workspace_for_account_switch();
+        self.reset_workspace_for_account_switch(cx);
 
         let token = self.api_client.access_token();
         crate::data::gateway_registry::GatewayRegistry::global()
@@ -1056,6 +1100,10 @@ impl MainView {
 
         // Create default module for new user, then load modules
         self.create_default_module_then_load(cx);
+        self.ensure_alerts_panel(cx);
+        if let Some(panel) = &self.alerts_panel {
+            panel.update(cx, |panel, cx| panel.refresh(cx));
+        }
 
         cx.notify();
     }
@@ -1883,6 +1931,12 @@ impl MainView {
                 this.user_settings = None;
                 this.active_module = None;
                 this.settings_page = None;
+                if let Some(panel) = &this.alerts_panel {
+                    panel.update(cx, |panel, cx| panel.clear(cx));
+                }
+                if let Ok(mut store) = crate::data::alerts::AlertStore::global().lock() {
+                    store.clear();
+                }
                 this.load_guest_layout(cx);
                 cx.notify();
             });
@@ -2043,7 +2097,6 @@ impl MainView {
                                     .child(match sidebar_type {
                                         SecondarySidebar::Dashboard => "Layouts",
                                         SecondarySidebar::Feeds => "Feeds",
-                                        SecondarySidebar::Superchat => "Superchat",
                                         SecondarySidebar::Notifications => "Alerts",
                                         SecondarySidebar::Settings => "Settings",
                                     }),
@@ -2074,8 +2127,11 @@ impl MainView {
                 }
             }
             SecondarySidebar::Feeds => build_feeds_content(cx).into_any_element(),
-            SecondarySidebar::Superchat => build_superchat_content(cx).into_any_element(),
-            SecondarySidebar::Notifications => build_notifications_content(cx).into_any_element(),
+            SecondarySidebar::Notifications => self
+                .alerts_panel
+                .as_ref()
+                .map(|panel| panel.clone().into_any_element())
+                .unwrap_or_else(|| div().into_any_element()),
             SecondarySidebar::Settings => build_settings_content(cx).into_any_element(),
         }
     }
@@ -2141,71 +2197,6 @@ fn build_feeds_content(cx: &App) -> impl IntoElement {
             "Volume spike detected",
             "12 min ago",
             true,
-            cx,
-        ))
-}
-
-fn build_superchat_content(cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(12.0))
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.colors.muted_foreground)
-                .child("Trading community chat"),
-        )
-        .child(build_chat_message(
-            "@trader_pro",
-            "Just opened a long position on BTC",
-            gpui::rgb(0x6366f1),
-            cx,
-        ))
-        .child(build_chat_message(
-            "@crypto_whale",
-            "Bullish on ETH this week",
-            gpui::rgb(0x22c55e),
-            cx,
-        ))
-        .child(build_chat_message(
-            "@degen_master",
-            "SOL looking strong",
-            gpui::rgb(0xf59e0b),
-            cx,
-        ))
-}
-
-fn build_notifications_content(cx: &App) -> impl IntoElement {
-    let theme = cx.theme();
-    div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(px(12.0))
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .text_color(theme.colors.muted_foreground)
-                .child("Your trading alerts"),
-        )
-        .child(build_notification_item(
-            "Order Filled",
-            "BTC/USDT limit order filled at $65,000",
-            cx,
-        ))
-        .child(build_notification_item(
-            "Price Alert",
-            "ETH/USDT reached target of $3,500",
-            cx,
-        ))
-        .child(build_notification_item(
-            "Stop Loss",
-            "SOL/USDT stop loss triggered at $140",
             cx,
         ))
 }
@@ -2319,66 +2310,6 @@ fn build_feed_item(
         )
 }
 
-/// Helper to build a chat message
-fn build_chat_message(
-    username: &'static str,
-    message: &'static str,
-    name_color: gpui::Rgba,
-    cx: &App,
-) -> impl IntoElement {
-    let theme = cx.theme();
-    div()
-        .p(px(12.0))
-        .bg(theme.colors.sidebar_accent)
-        .child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(name_color)
-                .mb(px(4.0))
-                .child(username),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(theme.colors.sidebar_foreground)
-                .child(message),
-        )
-}
-
-/// Helper to build a notification item
-fn build_notification_item(
-    title: &'static str,
-    message: &'static str,
-    cx: &App,
-) -> impl IntoElement {
-    let theme = cx.theme();
-    div()
-        .w_full()
-        .min_w_0()
-        .p(px(12.0))
-        .rounded(theme.radius)
-        .bg(theme.colors.sidebar_accent)
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.colors.sidebar_foreground)
-                .mb(px(4.0))
-                .child(title),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .text_color(theme.colors.muted_foreground)
-                .child(message),
-        )
-}
-
 /// Helper to build a settings item
 fn build_settings_item(
     title: &'static str,
@@ -2410,6 +2341,14 @@ fn build_settings_item(
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.start_agent_context_refresh(cx);
+        // Keep the alert desk alive for the whole session: chart panes read the
+        // shared alert snapshot even when the sidebar has never been opened.
+        self.ensure_alerts_panel(cx);
+        if let Some(panel) = self.alerts_panel.clone() {
+            panel.update(cx, |panel, cx| {
+                panel.drain_notifications(window, cx);
+            });
+        }
         let theme = cx.theme().clone();
         let current_page = self.current_page;
         let entity = cx.weak_entity();
@@ -3116,18 +3055,6 @@ impl Render for MainView {
                                     .text_xl()
                                     .text_color(sidebar_fg)
                                     .child("Feeds Page"),
-                            )
-                        })
-                        .when(current_page == Page::Superchat, |this| {
-                            this.child(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_xl()
-                                    .text_color(sidebar_fg)
-                                    .child("Superchat Page"),
                             )
                         })
                         .when(current_page == Page::Notification, |this| {

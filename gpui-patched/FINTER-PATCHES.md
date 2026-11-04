@@ -42,6 +42,23 @@ Manual regression checks on Linux:
 - Run the AppImage, restart the app, and confirm it relaunches from the
   AppImage file rather than the transient mount directory.
 
+## X11 window icon (`_NET_WM_ICON`)
+
+`src/platform.rs`, `src/window.rs`, `src/platform/linux/x11/window.rs`:
+
+`WindowOptions` now accepts PNG-encoded `icon` data. The X11 backend decodes it
+and sets `_NET_WM_ICON` before mapping the window, so taskbars and docks show
+the application icon even when the desktop file is not installed or the
+window's app id cannot be matched to a launcher. Other backends ignore the
+field (Wayland uses the app id/desktop file; macOS/Windows use bundle or
+executable resources).
+
+Manual regression checks on Linux/X11:
+
+- Launch the binary directly (without installing a desktop file) and confirm
+  the taskbar/dock shows the FinTer icon.
+- Confirm the icon still renders after maximizing/restoring the window.
+
 ## Windows application manifest
 
 `resources/windows/gpui.manifest.xml`:

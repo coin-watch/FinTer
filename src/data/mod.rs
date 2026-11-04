@@ -1,5 +1,7 @@
 pub mod agent;
+pub mod alerts;
 pub mod api_management;
+pub mod app_icon;
 pub mod auth;
 pub mod bridge;
 pub mod candle_feed;

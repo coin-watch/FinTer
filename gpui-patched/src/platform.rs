@@ -539,6 +539,8 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         Decorations::Server
     }
     fn set_app_id(&mut self, _app_id: &str) {}
+    /// Sets the window icon from PNG-encoded image data.
+    fn set_window_icon(&mut self, _icon: &[u8]) {}
     fn map_window(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1123,6 +1125,12 @@ pub struct WindowOptions {
     /// Application identifier of the window. Can by used by desktop environments to group applications together.
     pub app_id: Option<String>,
 
+    /// PNG-encoded window icon.
+    ///
+    /// Used by platforms that support per-window icons (currently X11). Other
+    /// platforms take the icon from the application bundle or executable.
+    pub icon: Option<Vec<u8>>,
+
     /// Window minimum size
     pub window_min_size: Option<Size<Pixels>>,
 
@@ -1236,6 +1244,7 @@ impl Default for WindowOptions {
             display_id: None,
             window_background: WindowBackgroundAppearance::default(),
             app_id: None,
+            icon: None,
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,

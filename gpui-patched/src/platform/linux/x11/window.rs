@@ -60,6 +60,7 @@ x11rb::atom_manager! {
         WM_TRANSIENT_FOR,
         _NET_WM_PID,
         _NET_WM_NAME,
+        _NET_WM_ICON,
         _NET_WM_STATE,
         _NET_WM_STATE_MAXIMIZED_VERT,
         _NET_WM_STATE_MAXIMIZED_HORZ,
@@ -1372,6 +1373,43 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
+    }
+
+    fn set_window_icon(&mut self, icon: &[u8]) {
+        let Ok(image) = image::load_from_memory(icon) else {
+            log::warn!("failed to decode window icon");
+            return;
+        };
+        let image = image.into_rgba8();
+        let (width, height) = image.dimensions();
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        // _NET_WM_ICON is an array of CARDINAL: width, height, then
+        // width * height ARGB pixels (alpha in the most significant byte).
+        let mut data = Vec::with_capacity(2 + width as usize * height as usize);
+        data.push(width);
+        data.push(height);
+        for pixel in image.pixels() {
+            let [r, g, b, a] = pixel.0;
+            data.push(
+                ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+            );
+        }
+
+        check_reply(
+            || "X11 ChangeProperty32 for _NET_WM_ICON failed.",
+            self.0.xcb.change_property32(
+                xproto::PropMode::REPLACE,
+                self.0.x_window,
+                self.0.state.borrow().atoms._NET_WM_ICON,
+                xproto::AtomEnum::CARDINAL,
+                &data,
+            ),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {

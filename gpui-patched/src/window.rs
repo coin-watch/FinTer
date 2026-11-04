@@ -944,6 +944,7 @@ impl Window {
             display_id,
             window_background,
             app_id,
+            icon,
             window_min_size,
             window_decorations,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -1200,6 +1201,10 @@ impl Window {
 
         if let Some(app_id) = app_id {
             platform_window.set_app_id(&app_id);
+        }
+
+        if let Some(icon) = icon {
+            platform_window.set_window_icon(&icon);
         }
 
         platform_window.map_window().unwrap();
@@ -1783,6 +1788,11 @@ impl Window {
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);
+    }
+
+    /// Sets the window icon from PNG-encoded image data.
+    pub fn set_window_icon(&mut self, icon: &[u8]) {
+        self.platform_window.set_window_icon(icon);
     }
 
     /// Sets the window background appearance.

@@ -65,6 +65,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     install_linux_desktop_entry();
 
+    let window_icon =
+        crate::assets::CustomAssets::get("app-icon-256.png").map(|icon| icon.data.into_owned());
+    if let Some(icon) = window_icon.as_ref() {
+        finter::data::app_icon::set_png(icon.clone());
+    }
+
     let app = Application::new()
         .with_assets(CombinedAssets::new())
         .with_http_client(ReqwestHttpClient::new());
@@ -82,7 +88,8 @@ fn main() {
                     #[cfg(not(target_os = "linux"))]
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
-                    app_id: Some("finter".to_string()),
+                    app_id: Some("ch.coinwat.finter".to_string()),
+                    icon: window_icon,
                     ..Default::default()
                 },
                 |window, cx| {
@@ -215,7 +222,7 @@ fn install_linux_desktop_entry() {
         Icon=finter\n\
         Terminal=false\n\
         Categories=Office;Finance;\n\
-        StartupWMClass=finter\n\
+        StartupWMClass=ch.coinwat.finter\n\
         StartupNotify=true\n\
         Keywords=crypto;trading;finance;terminal;bitcoin;\n"
     );

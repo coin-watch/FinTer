@@ -20,6 +20,8 @@
 /// - **Drawing Tools** – full suite of charting tools (Trendline, Ray, Horizontal,
 ///   Vertical, Fibonacci, Channel, Long/Short Position, Text) with interactive
 ///   placement, selection, moving, deletion, and persistence.
+/// - **Price Alert Levels** – saved alerts for the pane's exchange/symbol render
+///   as dashed horizontal lines with Y-axis pills and off-screen edge badges.
 /// - **Indicator Library Modal** – draggable, resizable, searchable modal with
 ///   active indicator management and live parameter validation.
 ///
@@ -38,8 +40,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::Selectable;
 use gpui_component::chart::{
-    CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle, OrderOverlaySpec,
-    PaneTarget, PositionOverlaySpec,
+    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle,
+    OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
@@ -55,6 +57,7 @@ use crate::chart::drawings::{
     DrawingInstance, DrawingPoint, DrawingTool, DrawingInteractionState, hit_test_drawings,
 };
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
+use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
 use crate::data::price_format::format_price;
@@ -216,6 +219,7 @@ impl ChartPanel {
             let mut last_ms = 0;
             let mut last_countdown_second = u64::MAX;
             let mut last_trade_ver = u64::MAX;
+            let mut last_alert_ver = u64::MAX;
             let mut last_credit_rev = u64::MAX;
             loop {
                 let ms = f.last_update_ms();
@@ -230,16 +234,27 @@ impl ChartPanel {
                     .lock()
                     .map(|s| s.version)
                     .unwrap_or(0);
+                let alert_ver = AlertStore::global()
+                    .lock()
+                    .map(|s| s.version())
+                    .unwrap_or(0);
                 let credit_rev = crate::data::credits::CreditStore::revision();
                 let feed_changed = ms != last_ms;
                 let countdown_changed = countdown_second != last_countdown_second;
                 let trade_changed = trade_ver != last_trade_ver;
+                let alert_changed = alert_ver != last_alert_ver;
                 let credit_changed = credit_rev != last_credit_rev;
 
-                if feed_changed || countdown_changed || trade_changed || credit_changed {
+                if feed_changed
+                    || countdown_changed
+                    || trade_changed
+                    || alert_changed
+                    || credit_changed
+                {
                     last_ms = ms;
                     last_countdown_second = countdown_second;
                     last_trade_ver = trade_ver;
+                    last_alert_ver = alert_ver;
                     last_credit_rev = credit_rev;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
@@ -1728,6 +1743,44 @@ impl Render for ChartPanel {
         };
 
         chart = chart.position_overlays(pos_overlays).order_overlays(ord_overlays);
+
+        // Saved price alerts for this pane's exchange/symbol. The store is
+        // populated by the alerts sidebar and survives panes created before it.
+        let alert_overlays: Vec<AlertOverlaySpec> = {
+            let colors = cx.theme().colors;
+            AlertStore::global()
+                .lock()
+                .map(|store| {
+                    store
+                        .alerts_for(&self.exchange, &self.symbol)
+                        .into_iter()
+                        .filter(|alert| !alert.is_expired())
+                        .map(|alert| {
+                            let color = if alert.is_bullish() {
+                                colors.bullish
+                            } else if alert.is_bearish() {
+                                colors.bearish
+                            } else {
+                                colors.info
+                            };
+                            AlertOverlaySpec {
+                                id: alert.id.clone(),
+                                price: alert.price,
+                                color,
+                                label: format!(
+                                    "{} {}",
+                                    alert.glyph(),
+                                    format_price(alert.price, self.precision.as_ref())
+                                )
+                                .into(),
+                                is_active: alert.is_active(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        chart = chart.alert_overlays(alert_overlays);
 
         // Render drawing overlay
         let drawing_overlay = {

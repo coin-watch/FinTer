@@ -59,7 +59,7 @@ const MAIN_NAV_ITEMS: &[SidebarItem] = &[
     ),
     SidebarItem::new(
         "alerts",
-        "icons/bell.svg",
+        "icons/alarm-clock.svg",
         "Alerts",
         Some(SecondarySidebar::Notifications),
     ),
@@ -68,12 +68,6 @@ const MAIN_NAV_ITEMS: &[SidebarItem] = &[
         "icons/megaphone.svg",
         "Feeds",
         Some(SecondarySidebar::Feeds),
-    ),
-    SidebarItem::new(
-        "superchat",
-        "icons/message-square.svg",
-        "Superchat",
-        Some(SecondarySidebar::Superchat),
     ),
 ];
 

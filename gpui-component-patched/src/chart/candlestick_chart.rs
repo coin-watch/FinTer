@@ -44,6 +44,19 @@ pub struct OrderOverlaySpec {
     pub is_live: bool,
 }
 
+/// A saved price-alert level painted on the chart.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlertOverlaySpec {
+    pub id: String,
+    pub price: f64,
+    /// Accent colour derived from the alert condition.
+    pub color: Hsla,
+    /// Price text shown in the Y-axis pill / off-screen badge.
+    pub label: SharedString,
+    /// Paused alerts are painted dimmed so active levels stay dominant.
+    pub is_active: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------
@@ -140,6 +153,8 @@ where
     position_overlays: Vec<PositionOverlaySpec>,
     /// Open order overlays (price line, type/side badge, cancel action).
     order_overlays: Vec<OrderOverlaySpec>,
+    /// Saved price-alert levels (dashed line + Y-axis pill).
+    alert_overlays: Vec<AlertOverlaySpec>,
 }
 
 impl<T, Y> CandlestickChart<T, Y>
@@ -171,6 +186,7 @@ where
             indicator_lines: Vec::new(),
             position_overlays: Vec::new(),
             order_overlays: Vec::new(),
+            alert_overlays: Vec::new(),
         }
     }
 
@@ -294,6 +310,12 @@ where
     /// Attach open order overlay specs (order price lines, side/type badges, cancel action).
     pub fn order_overlays(mut self, overlays: Vec<OrderOverlaySpec>) -> Self {
         self.order_overlays = overlays;
+        self
+    }
+
+    /// Attach saved price-alert levels (dashed lines + Y-axis pills).
+    pub fn alert_overlays(mut self, overlays: Vec<AlertOverlaySpec>) -> Self {
+        self.alert_overlays = overlays;
         self
     }
 }
@@ -1365,6 +1387,131 @@ where
                 window,
                 cx,
             );
+        }
+
+        // ------------------------------------------------------------------ //
+        // 10b. Saved price-alert levels
+        // ------------------------------------------------------------------ //
+        if self.show_candles {
+            let mut offscreen_up = 0usize;
+            let mut offscreen_down = 0usize;
+
+            for alert in &self.alert_overlays {
+                if !alert.price.is_finite() || alert.price <= 0.0 {
+                    continue;
+                }
+
+                let alert_px_y = y_scale.scale(alert.price);
+                let alert_abs_y = origin.y.as_f32() + alert_px_y;
+                let mut line_color = alert.color;
+                line_color.a = if alert.is_active { 0.8 } else { 0.32 };
+                let accent_color = if alert.is_active {
+                    alert.color
+                } else {
+                    alert.color.opacity(0.55)
+                };
+
+                if alert_px_y >= 0.0 && alert_px_y <= candle_h {
+                    // Dashed level line.
+                    let seg = 3.0_f32;
+                    let gap = 3.0_f32;
+                    let mut x_cur = origin.x.as_f32();
+                    let end_x = origin.x.as_f32() + chart_w;
+                    while x_cur < end_x {
+                        let x_end = (x_cur + seg).min(end_x);
+                        let mut pb = PathBuilder::stroke(px(1.0));
+                        pb.move_to(gpui::point(px(x_cur), px(alert_abs_y)));
+                        pb.line_to(gpui::point(px(x_end), px(alert_abs_y)));
+                        if let Ok(p) = pb.build() {
+                            window.paint_path(p, line_color);
+                        }
+                        x_cur += seg + gap;
+                    }
+
+                    // Small diamond marker at the left edge.
+                    let marker_x = origin.x.as_f32() + 4.0;
+                    let mut marker = PathBuilder::fill();
+                    marker.move_to(gpui::point(px(marker_x), px(alert_abs_y - 3.0)));
+                    marker.line_to(gpui::point(px(marker_x + 3.0), px(alert_abs_y)));
+                    marker.line_to(gpui::point(px(marker_x), px(alert_abs_y + 3.0)));
+                    marker.line_to(gpui::point(px(marker_x - 3.0), px(alert_abs_y)));
+                    marker.close();
+                    if let Ok(path) = marker.build() {
+                        window.paint_path(path, accent_color);
+                    }
+
+                    // Y-axis pill with a coloured accent strip.
+                    let pill_h = 14.0_f32;
+                    let pill_x = origin.x.as_f32() + chart_w;
+                    let pill_min_y = origin.y.as_f32() + 1.0;
+                    let pill_max_y =
+                        (origin.y.as_f32() + candle_h - pill_h - 1.0).max(pill_min_y);
+                    let pill_y = (alert_abs_y - pill_h / 2.0).clamp(pill_min_y, pill_max_y);
+                    let pill_bounds = Bounds::from_corners(
+                        gpui::point(px(pill_x), px(pill_y)),
+                        gpui::point(px(pill_x + y_axis_w), px(pill_y + pill_h)),
+                    );
+                    let pill_bg = if alert.is_active {
+                        rgba(0x131722f0)
+                    } else {
+                        rgba(0x131722a0)
+                    };
+                    window.paint_quad(fill(pill_bounds, pill_bg));
+                    let strip_bounds = Bounds::from_corners(
+                        gpui::point(px(pill_x), px(pill_y)),
+                        gpui::point(px(pill_x + 2.0), px(pill_y + pill_h)),
+                    );
+                    window.paint_quad(fill(strip_bounds, accent_color));
+                    let text_color = if alert.is_active {
+                        alert.color
+                    } else {
+                        alert.color.opacity(0.6)
+                    };
+                    paint_text_line_centered(
+                        alert.label.clone(),
+                        text_color,
+                        pill_bounds,
+                        window,
+                        cx,
+                    );
+                } else {
+                    // Off-screen level: pin a compact badge to the top/bottom edge.
+                    let (off_y, arrow) = if alert_px_y < 0.0 {
+                        let y = origin.y.as_f32() + 4.0 + offscreen_up as f32 * 18.0;
+                        offscreen_up += 1;
+                        (y, "▲")
+                    } else {
+                        let y = origin.y.as_f32() + candle_h - 18.0 - offscreen_down as f32 * 18.0;
+                        offscreen_down += 1;
+                        (y, "▼")
+                    };
+                    let off_min_y = origin.y.as_f32() + 2.0;
+                    let off_max_y =
+                        (origin.y.as_f32() + candle_h - 18.0).max(off_min_y);
+                    let off_y = off_y.clamp(off_min_y, off_max_y);
+                    let off_text: SharedString = format!("{} ALERT {}", arrow, alert.label).into();
+                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(90.0, 160.0);
+                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0)
+                        .max(origin.x.as_f32() + 4.0);
+                    let off_bounds = Bounds::from_corners(
+                        gpui::point(px(off_x), px(off_y)),
+                        gpui::point(px(off_x + off_w), px(off_y + 18.0)),
+                    );
+                    window.paint_quad(fill(off_bounds, rgba(0x131722e0)));
+                    let text_b = Bounds::from_corners(
+                        gpui::point(px(off_x + 4.0), px(off_y)),
+                        gpui::point(px(off_x + off_w - 4.0), px(off_y + 18.0)),
+                    );
+                    paint_text_line(
+                        off_text,
+                        gpui::point(px(off_x + 4.0), px(off_y + 3.0)),
+                        accent_color,
+                        text_b,
+                        window,
+                        cx,
+                    );
+                }
+            }
         }
 
         // ------------------------------------------------------------------ //

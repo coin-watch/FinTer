@@ -8,6 +8,6 @@ Exec=finter %u
 Icon=finter
 Terminal=false
 Categories=Office;Finance;
-StartupWMClass=finter
+StartupWMClass=ch.coinwat.finter
 StartupNotify=true
 Keywords=crypto;trading;finance;terminal;bitcoin;
