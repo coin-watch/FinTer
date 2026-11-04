@@ -32,7 +32,7 @@ Required GitHub Actions secrets:
 
 - `FINTER_VERSION_URL`: HTTPS URL to compatible `version.json` metadata; unset disables update checking.
 - `FINTER_BUILD_ID`: optional build identifier used to detect same-version channel updates.
-- `FINTER_API_URL`: backend API origin for account/API features; empty by default (unconfigured).
+- `FINTER_API_URL`: backend API origin for account/API features. Guest mode stays unconfigured; authenticated sessions default to the hosted staging origin.
 - `FINTER_REST_URL`: optional REST market gateway; defaults to `FINTER_API_URL`.
 - `FINTER_WS_URL`: optional WebSocket market gateway; otherwise derived from `FINTER_REST_URL`.
 - `FINTER_NEWS_API_URL`: optional news API base URL.

@@ -137,7 +137,7 @@ impl Default for AppSettings {
             .unwrap_or_default();
 
         Self {
-            server_url: crate::data::client::DEFAULT_FINTER_API_URL.into(),
+            server_url: crate::data::client::default_api_url().into(),
             dark_mode: false,
             theme: "gruvbox".into(),
             enable_animations: true,
@@ -176,7 +176,8 @@ impl AppSettings {
             server_url: data
                 .server_url
                 .clone()
-                .unwrap_or_else(|| crate::data::client::DEFAULT_FINTER_API_URL.to_string())
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(crate::data::client::default_api_url)
                 .into(),
             dark_mode: data.dark_mode.as_deref() == Some("dark"),
             theme: data
@@ -526,7 +527,7 @@ impl SettingsPage {
                                     }
                                 },
                             )
-                            .default_value(SharedString::from(crate::data::client::DEFAULT_FINTER_API_URL)),
+                            .default_value(SharedString::from(crate::data::client::default_api_url())),
                         )
                         .description("URL of your API backend. Configure an endpoint for market data streaming and account synchronization."),
                     ),

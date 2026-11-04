@@ -168,12 +168,29 @@ __EMAIL_ROW__
 }
 
 impl ApiClient {
+    /// Ensure API requests have an absolute origin.
+    ///
+    /// A session can only exist if the user signed in against a real backend,
+    /// so fall back to the hosted cloud origin when no endpoint was configured.
+    /// Without this, reqwest rejects `/api/...` paths with
+    /// `RelativeUrlWithoutBase` and every account/dashboard request fails.
+    fn ensure_base_url(&self) {
+        if self.base_url().trim().is_empty() {
+            tracing::info!(
+                "No API endpoint configured for authenticated session; using {}",
+                crate::data::client::DEFAULT_CLOUD_API_URL
+            );
+            self.set_base_url(crate::data::client::DEFAULT_CLOUD_API_URL);
+        }
+    }
+
     /// Log in with email and password.
     /// On success, stores the session internally and returns it.
     ///
     /// This is a blocking call — run it from a background thread
     /// (e.g. inside GPUI's `cx.spawn`).
     pub fn login(&self, email: &str, password: &str) -> Result<AuthSession> {
+        self.ensure_base_url();
         let rt = tokio_runtime();
         let http = self.http().clone();
         let url = self.url("/api/auth/login");
@@ -235,6 +252,7 @@ impl ApiClient {
     ///
     /// Blocking — run from a background thread.
     pub fn signup(&self, email: &str, password: &str) -> Result<AuthSession> {
+        self.ensure_base_url();
         let rt = tokio_runtime();
         let http = self.http().clone();
         let url = self.url("/api/auth/signup");
@@ -310,6 +328,7 @@ impl ApiClient {
     ///
     /// Blocking — run from a background thread.
     pub fn refresh_token(&self) -> Result<AuthSession> {
+        self.ensure_base_url();
         let current = self
             .get_session()
             .ok_or_else(|| CoinWatchError::Auth("No session to refresh".into()))?;
@@ -426,6 +445,11 @@ impl ApiClient {
         // Step 2 — pre-load it into memory immediately (so client can make calls)
         self.set_session_raw(stored.clone());
 
+        // A stored session implies a real backend. If no endpoint is configured
+        // (for example after upgrading from a build with an empty default), use
+        // the hosted cloud origin instead of issuing relative URLs.
+        self.ensure_base_url();
+
         // Check if token is still valid (give 5 mins buffer)
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -488,6 +512,10 @@ impl ApiClient {
         use std::net::TcpListener;
         use std::sync::Mutex;
         use url::Url;
+
+        // A Google sign-in is a cloud flow; make sure the handoff and the
+        // subsequent API calls use an absolute backend origin.
+        self.ensure_base_url();
 
         // Find an available port
         let listener = TcpListener::bind("127.0.0.1:0")

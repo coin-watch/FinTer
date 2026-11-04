@@ -87,13 +87,15 @@ cargo clippy -- -D warnings
 
 ## Connect a backend (optional)
 
-FinTer ships with **no pre-configured API endpoint**. Without one it runs in Guest Mode, persists your layout and settings locally, and shows clear empty states when market data is unavailable.
+FinTer runs in **Guest Mode** without a backend: it persists your layout and settings locally and shows clear empty states when market data is unavailable. Once you sign in, the native client defaults to the hosted CoinWatch staging backend (`https://staging.coinwat.ch`) so account, dashboard, preset, and profile data load without extra setup.
 
-Point it at a backend in **Settings → Network & Server**, or set the environment variable before launch:
+Point it at a different backend in **Settings → Network & Server**, or set the environment variable before launch:
 
 ```sh
 FINTER_API_URL="http://localhost:5173" cargo run
 ```
+
+A locally configured endpoint is preserved across restarts and is not cleared by a null `serverUrl` in the shared server-side settings record.
 
 | Variable | Purpose |
 | --- | --- |

@@ -68,18 +68,21 @@ fn fallback_path() -> std::result::Result<std::path::PathBuf, String> {
 }
 
 fn file_save(session: &AuthSession) -> std::result::Result<(), String> {
-    let path = fallback_path()?;
+    file_save_at(&fallback_path()?, session)
+}
+
+fn file_save_at(path: &std::path::Path, session: &AuthSession) -> std::result::Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
     let json = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &json).map_err(|e| format!("write session file: {e}"))?;
+    std::fs::write(path, &json).map_err(|e| format!("write session file: {e}"))?;
 
     // Restrict permissions to owner-only on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
@@ -87,20 +90,26 @@ fn file_save(session: &AuthSession) -> std::result::Result<(), String> {
 }
 
 fn file_load() -> std::result::Result<Option<AuthSession>, String> {
-    let path = fallback_path()?;
+    file_load_at(&fallback_path()?)
+}
+
+fn file_load_at(path: &std::path::Path) -> std::result::Result<Option<AuthSession>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let json = std::fs::read_to_string(&path).map_err(|e| format!("read session file: {e}"))?;
+    let json = std::fs::read_to_string(path).map_err(|e| format!("read session file: {e}"))?;
     let session: AuthSession =
         serde_json::from_str(&json).map_err(|e| format!("deserialize session file: {e}"))?;
     Ok(Some(session))
 }
 
 fn file_delete() -> std::result::Result<(), String> {
-    let path = fallback_path()?;
+    file_delete_at(&fallback_path()?)
+}
+
+fn file_delete_at(path: &std::path::Path) -> std::result::Result<(), String> {
     if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("delete session file: {e}"))?;
+        std::fs::remove_file(path).map_err(|e| format!("delete session file: {e}"))?;
     }
     Ok(())
 }
@@ -193,8 +202,19 @@ mod tests {
             avatar_url: Some("https://example.com/avatar.png".into()),
         };
 
-        file_save(&session).expect("file_save");
-        let loaded = file_load().expect("file_load").expect("should be Some");
+        // Use an isolated path so the test never touches the developer's real
+        // session file (or deletes it during cleanup).
+        let path = std::env::temp_dir().join(format!(
+            "finter-session-test-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        file_save_at(&path, &session).expect("file_save");
+        let loaded = file_load_at(&path).expect("file_load").expect("should be Some");
         assert_eq!(loaded.user_id, "u-test");
         assert_eq!(loaded.email, "test@example.com");
         assert_eq!(loaded.name, Some("Test User".into()));
@@ -203,8 +223,8 @@ mod tests {
             Some("https://example.com/avatar.png".into())
         );
 
-        file_delete().expect("file_delete");
-        let after_delete = file_load().expect("file_load after delete");
+        file_delete_at(&path).expect("file_delete");
+        let after_delete = file_load_at(&path).expect("file_load after delete");
         assert!(after_delete.is_none());
     }
 }

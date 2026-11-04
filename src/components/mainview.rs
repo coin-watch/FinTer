@@ -447,7 +447,12 @@ impl MainView {
                 if let Ok(settings) =
                     serde_json::from_str::<crate::data::models::SettingsData>(&json)
                 {
-                    if let Some(server_url) = &settings.server_url {
+                    if let Some(server_url) = settings
+                        .server_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                    {
                         self.api_client.set_base_url(server_url);
                     }
                     let theme_name = settings
@@ -989,8 +994,17 @@ impl MainView {
         self.closed_dashboard_tabs.clear();
         self.layout_cache.clear();
         // Do not let the guest settings' `current_dashboard` seed the cloud
-        // session; the account's own settings are fetched next.
-        self.user_settings = None;
+        // session; the account's own settings are fetched next. The API origin
+        // is a client-local network setting, so keep it across account switches.
+        let local_server_url = self
+            .user_settings
+            .as_ref()
+            .and_then(|settings| settings.server_url.clone())
+            .filter(|url| !url.trim().is_empty());
+        self.user_settings = local_server_url.map(|server_url| SettingsData {
+            server_url: Some(server_url),
+            ..Default::default()
+        });
     }
 
     /// Handle successful login: switch to home with trading view
@@ -1298,6 +1312,15 @@ impl MainView {
             .user_settings
             .as_ref()
             .and_then(|settings| settings.current_dashboard.clone());
+        // The backend origin is configured per machine and must survive a
+        // settings round-trip. The shared server record commonly has
+        // `serverUrl: null`, which previously wiped the local endpoint and left
+        // the next launch with no API base URL at all.
+        let local_server_url = self
+            .user_settings
+            .as_ref()
+            .and_then(|settings| settings.server_url.clone())
+            .filter(|url| !url.trim().is_empty());
 
         cx.spawn(async move |this, cx| {
             let (settings_res, presets_res, modules_res) = rt
@@ -1318,7 +1341,21 @@ impl MainView {
             // Step 1: Fetch settings from API to get current_dashboard
             tracing::info!("=== LOADING SETTINGS FROM API ===");
             let mut current_dashboard = match settings_res {
-                Ok(Some(user_settings)) => {
+                Ok(Some(mut user_settings)) => {
+                    // Preserve the locally configured backend when the shared
+                    // server record has no `serverUrl` (the common case for
+                    // settings created by the web client).
+                    if user_settings
+                        .settings
+                        .server_url
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        user_settings.settings.server_url = local_server_url.clone();
+                    }
+
                     let dashboard = user_settings.settings.current_dashboard.clone();
                     tracing::info!(
                         "✓ Settings loaded successfully. currentDashboard = {:?}",
@@ -1338,7 +1375,12 @@ impl MainView {
                     // Store settings in MainView and apply theme
                     let settings_clone = user_settings.settings.clone();
                     let _ = this.update(cx, |view, cx| {
-                        if let Some(server_url) = &settings_clone.server_url {
+                        if let Some(server_url) = settings_clone
+                            .server_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|url| !url.is_empty())
+                        {
                             view.api_client.set_base_url(server_url);
                         }
                         // Apply theme from loaded settings
@@ -1669,9 +1711,19 @@ impl MainView {
                 .unwrap_or(false);
             crate::data::theme::apply_theme(&theme_name, dark_mode, cx);
 
-            // Update ApiClient with configured server_url
-            if let Some(server_url) = &settings_data.server_url {
+            // Update ApiClient with configured server_url. An empty value means
+            // "use the hosted default" for signed-in users, not "clear the
+            // backend" (which would make every API call fail).
+            let configured_server_url = settings_data
+                .server_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty());
+            if let Some(server_url) = configured_server_url {
                 self.api_client.set_base_url(server_url);
+            } else if self.is_authenticated {
+                self.api_client
+                    .set_base_url(crate::data::client::DEFAULT_CLOUD_API_URL);
             }
 
             // Preserve settings the native settings page does not expose while

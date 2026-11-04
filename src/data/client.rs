@@ -5,8 +5,15 @@ use crate::data::models::AuthSession;
 use crate::data::session_store;
 use webbrowser;
 
-/// Default API endpoint — unconfigured by default so user specifies their API endpoint.
+/// Default API endpoint for guest mode — unconfigured so the user can point the
+/// app at their own backend. Authenticated sessions use [`DEFAULT_CLOUD_API_URL`]
+/// instead, because a session can only have been issued by a real backend.
 pub const DEFAULT_FINTER_API_URL: &str = "";
+
+/// Hosted CoinWatch backend used by authenticated sessions when no explicit
+/// endpoint has been configured. This is the development/staging origin used by
+/// the native client; override it with `FINTER_API_URL` or Settings → Network.
+pub const DEFAULT_CLOUD_API_URL: &str = "https://staging.coinwat.ch";
 
 /// Base URL for the FinTer backend API.
 ///
@@ -14,8 +21,21 @@ pub const DEFAULT_FINTER_API_URL: &str = "";
 /// 1. Runtime active base URL (if set via `set_base_url`).
 /// 2. `FINTER_API_URL` environment variable.
 /// 3. `server_url` field stored in `cloud_settings.json` or `guest_settings.json`.
-/// 4. Default endpoint (empty string if unconfigured).
+/// 4. Default endpoint (empty for guests, the hosted cloud origin for sessions).
 static ACTIVE_BASE_URL: RwLock<Option<String>> = RwLock::new(None);
+
+/// Default API origin for the current session.
+///
+/// Guests stay unconfigured so the app remains local-first. A persisted session
+/// means the user signed in against a real backend, so fall back to the hosted
+/// cloud origin instead of sending requests to a relative URL.
+pub fn default_api_url() -> String {
+    if session_store::load_session().ok().flatten().is_some() {
+        DEFAULT_CLOUD_API_URL.to_string()
+    } else {
+        DEFAULT_FINTER_API_URL.to_string()
+    }
+}
 
 fn get_base_url() -> String {
     if let Ok(guard) = ACTIVE_BASE_URL.read() {
@@ -72,8 +92,14 @@ mod endpoint_tests {
     use super::*;
 
     #[test]
-    fn unconfigured_default_endpoint_is_empty() {
+    fn unconfigured_guest_endpoint_is_empty() {
         assert_eq!(DEFAULT_FINTER_API_URL, "");
+    }
+
+    #[test]
+    fn cloud_default_is_an_absolute_https_origin() {
+        assert!(DEFAULT_CLOUD_API_URL.starts_with("https://"));
+        assert!(!DEFAULT_CLOUD_API_URL.ends_with('/'));
     }
 }
 
@@ -115,19 +141,36 @@ impl Default for ApiClient {
 
 impl ApiClient {
     /// Create a new API client using the optional `FINTER_API_URL`.
-    /// The URL is empty when no compatible backend has been configured.
+    /// Guests are unconfigured; a restored session falls back to the hosted
+    /// cloud origin so account and dashboard requests have a valid base URL.
     pub fn new() -> Self {
-        Self::with_base_url(&get_base_url())
+        let mut base = get_base_url();
+        if base.trim().is_empty() {
+            base = default_api_url();
+        }
+
+        let client = Self::with_base_url(&base);
+        if !base.trim().is_empty() {
+            // Publish the resolved origin so `service_base_url()` (market data,
+            // gateway registry, bridge) uses the same backend as the API client.
+            client.set_base_url(&base);
+        }
+        client
     }
 
     /// Create a new API client with a custom base URL (useful for tests).
     pub fn with_base_url(base_url: &str) -> Self {
+        let initial_session = session_store::load_session().ok().flatten();
+        Self::with_base_url_and_session(base_url, initial_session)
+    }
+
+    /// Create a client with an explicit session state. Tests use this to avoid
+    /// depending on whatever session happens to be in the developer's keyring.
+    fn with_base_url_and_session(base_url: &str, initial_session: Option<AuthSession>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
-
-        let initial_session = session_store::load_session().ok().flatten();
 
         Self {
             http,
@@ -202,12 +245,18 @@ impl ApiClient {
     /// Clear the current auth session (called on logout).
     /// Also removes the persisted session from storage.
     pub fn clear_session(&self) {
-        let mut guard = self.session.write().expect("session lock poisoned");
-        *guard = None;
-        drop(guard); // release lock before I/O
+        self.clear_session_in_memory();
         if let Err(e) = session_store::delete_session() {
             tracing::warn!("failed to delete persisted session: {}", e);
         }
+    }
+
+    /// Drop the in-memory session without touching the OS keyring or the
+    /// fallback session file. Used by lifecycle tests so they never delete a
+    /// developer's real saved credentials.
+    fn clear_session_in_memory(&self) {
+        let mut guard = self.session.write().expect("session lock poisoned");
+        *guard = None;
     }
 
     /// Get a clone of the current session, if any.
@@ -495,13 +544,14 @@ mod tests {
 
     #[test]
     fn test_session_lifecycle() {
-        let client = ApiClient::with_base_url("https://example.com");
+        let client = ApiClient::with_base_url_and_session("https://example.com", None);
 
         // Initially no session
         assert!(client.get_session().is_none());
         assert!(client.access_token().is_none());
 
-        // Set session
+        // Set session in memory only; never persist test credentials over a
+        // developer's real saved session.
         let session = AuthSession {
             user_id: "user-123".into(),
             email: "test@example.com".into(),
@@ -511,15 +561,13 @@ mod tests {
             name: None,
             avatar_url: None,
         };
-        client
-            .set_session(session.clone())
-            .expect("set_session should succeed in test");
+        client.set_session_raw(session);
 
         assert_eq!(client.access_token(), Some("tok-abc".into()));
         assert_eq!(client.user_id(), Some("user-123".into()));
 
         // Clear session
-        client.clear_session();
+        client.clear_session_in_memory();
         assert!(client.get_session().is_none());
     }
 
