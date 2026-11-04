@@ -28,7 +28,8 @@ The build workflow uses the following policy:
 ### What the build produces
 
 - `finter` — the standalone updater artifact. Signed with a Developer ID and
-  hardened runtime. It is notarized as part of the app bundle submission.
+  hardened runtime. The `.app`/`.dmg` are the notarized distribution
+  artifacts; the raw binary is intended for the in-app updater.
 - `FinTer.app.zip` — the signed, notarized, and stapled app bundle.
 - `FinTer-<target>.dmg` — a signed, notarized, and stapled disk image.
 
@@ -59,10 +60,10 @@ Store the contents of `certificate.b64` in `MACOS_CERTIFICATE`.
 2. Creates a `FinTer.app` bundle with `Contents/Info.plist` and the `.icns`
    icon.
 3. Imports the Developer ID certificate into a temporary keychain.
-4. Signs the app bundle with
-   `--options runtime --timestamp --entitlements assets/platform/macos/FinTer.entitlements`,
-   then copies the signed main executable back to the standalone updater
-   artifact so both share the same signature.
+4. Signs the standalone updater binary and the app bundle separately with
+   `--options runtime --timestamp --entitlements assets/platform/macos/FinTer.entitlements`.
+   They are signed in place because a bundle's main executable is bound to the
+   bundle's `Info.plist` and cannot be copied out as a valid standalone binary.
 5. Verifies the signatures with `codesign --verify --deep --strict`.
 6. Submits the app to `notarytool`, staples the ticket, and validates it with
    `stapler` and `spctl`.

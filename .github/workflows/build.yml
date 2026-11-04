@@ -244,13 +244,12 @@ jobs:
             SIGN=(--force --options runtime --entitlements "$ENT" --sign "$ID")
           fi
 
-          # Sign the app bundle. This also signs the bundled main executable.
+          # Sign the standalone updater binary and the app bundle separately.
+          # A bundle's main executable is bound to the bundle's Info.plist, so
+          # copying it out of the bundle produces an invalid standalone
+          # signature ("invalid Info.plist"). Sign each artifact in place.
+          codesign "${SIGN[@]}" "$BIN"
           codesign "${SIGN[@]}" "$APP"
-
-          # Keep the standalone updater artifact byte-identical to the
-          # notarized app's main executable so both share the same signature
-          # and notarization record.
-          install -m 0755 "$APP/Contents/MacOS/finter" "$BIN"
 
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --verify --strict --verbose=2 "$BIN"
