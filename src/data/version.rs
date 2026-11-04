@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::{OnceLock, RwLock};
 
 /// Current app version, embedded at compile time from Cargo.toml.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -11,9 +12,191 @@ include!(concat!(env!("OUT_DIR"), "/version_url.rs"));
 /// Build identity embedded by GitHub Actions for alpha/beta update checks.
 pub const BUILD_ID: Option<&str> = option_env!("FINTER_BUILD_ID");
 
-/// Get the version check URL, allowing override via environment variable.
+/// Release channel an installation follows.
+///
+/// The channel is user-selectable at runtime and is persisted both in the
+/// synced settings record (`updateChannel`) and in a small local file so it is
+/// available before sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateChannel {
+    /// Tagged releases published under `latest/`.
+    Stable,
+    /// Pre-release builds published under `beta/`.
+    Beta,
+    /// Bleeding-edge builds published under `alpha/`.
+    Alpha,
+}
+
+impl Default for UpdateChannel {
+    fn default() -> Self {
+        Self::Stable
+    }
+}
+
+impl UpdateChannel {
+    /// Value stored in settings and on disk.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Alpha => "alpha",
+        }
+    }
+
+    /// Human-readable label for the settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Beta => "Beta",
+            Self::Alpha => "Alpha",
+        }
+    }
+
+    /// Directory segment used by the update service.
+    fn url_segment(self) -> &'static str {
+        match self {
+            Self::Stable => "latest",
+            Self::Beta => "beta",
+            Self::Alpha => "alpha",
+        }
+    }
+
+    /// Parse a stored channel value. Unknown values fall back to `None` so the
+    /// caller can decide whether to use the baked-in default.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" | "latest" | "release" => Some(Self::Stable),
+            "beta" => Some(Self::Beta),
+            "alpha" => Some(Self::Alpha),
+            _ => None,
+        }
+    }
+
+    /// Pre-release channels can receive a new build for the same semantic
+    /// version, so build ids participate in update detection.
+    pub fn is_prerelease(self) -> bool {
+        matches!(self, Self::Beta | Self::Alpha)
+    }
+}
+
+/// Infer the channel from a version.json URL.
+fn channel_from_url(url: &str) -> UpdateChannel {
+    if url.contains("/alpha/") {
+        UpdateChannel::Alpha
+    } else if url.contains("/beta/") {
+        UpdateChannel::Beta
+    } else {
+        UpdateChannel::Stable
+    }
+}
+
+/// Channel of the default update endpoint (environment override or baked URL).
+pub fn default_channel() -> UpdateChannel {
+    channel_from_url(&default_version_url())
+}
+
+/// Rewrite the channel segment of an official update URL.
+///
+/// Custom endpoints without a recognised `alpha`/`beta`/`latest` segment are
+/// returned unchanged; channel switching only applies to the official layout.
+fn url_for_channel(url: &str, channel: UpdateChannel) -> String {
+    for existing in ["alpha", "beta", "latest"] {
+        let needle = format!("/{existing}/");
+        if url.contains(&needle) {
+            return url.replacen(&needle, &format!("/{}/", channel.url_segment()), 1);
+        }
+    }
+    url.to_string()
+}
+
+fn selected_channel_cell() -> &'static RwLock<Option<UpdateChannel>> {
+    static CELL: OnceLock<RwLock<Option<UpdateChannel>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(None))
+}
+
+/// Path to the locally persisted update channel.
+pub fn channel_file() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("finter")
+        .join("update_channel")
+}
+
+fn load_saved_channel() -> Option<UpdateChannel> {
+    std::fs::read_to_string(channel_file())
+        .ok()
+        .and_then(|value| UpdateChannel::parse(&value))
+}
+
+fn save_channel(channel: UpdateChannel) {
+    let path = channel_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Err(error) = std::fs::write(&path, channel.as_str()) {
+        tracing::warn!("version: failed to persist update channel: {error}");
+    }
+}
+
+/// Channel used for update checks.
+///
+/// Resolution order: runtime override set by the settings UI, then the locally
+/// persisted choice, then the channel baked into the binary at build time.
+pub fn selected_channel() -> UpdateChannel {
+    let cell = selected_channel_cell();
+    let cached = { *cell.read().unwrap() };
+    if let Some(channel) = cached {
+        return channel;
+    }
+
+    let channel = load_saved_channel().unwrap_or_else(default_channel);
+    *cell.write().unwrap() = Some(channel);
+    channel
+}
+
+/// Persist and apply the user's channel choice.
+pub fn set_selected_channel(channel: UpdateChannel) {
+    let cell = selected_channel_cell();
+    {
+        let mut guard = cell.write().unwrap();
+        if *guard == Some(channel) {
+            return;
+        }
+        *guard = Some(channel);
+    }
+    save_channel(channel);
+}
+
+/// Version endpoint baked into the binary, ignoring the saved channel.
+///
+/// `FINTER_VERSION_URL` still wins so local builds and CI can override the
+/// endpoint explicitly.
+pub fn default_version_url() -> String {
+    std::env::var("FINTER_VERSION_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_VERSION_URL.to_string())
+}
+
+/// Build the version check URL for a specific channel.
+pub fn version_check_url_for_channel(channel: UpdateChannel) -> String {
+    if DEFAULT_VERSION_URL.trim().is_empty() {
+        return String::new();
+    }
+    url_for_channel(DEFAULT_VERSION_URL, channel)
+}
+
+/// Get the version check URL for the selected channel.
+///
+/// An explicit `FINTER_VERSION_URL` environment variable always wins so
+/// operators can pin a custom endpoint.
 pub fn version_check_url() -> String {
-    std::env::var("FINTER_VERSION_URL").unwrap_or_else(|_| DEFAULT_VERSION_URL.to_string())
+    if let Ok(url) = std::env::var("FINTER_VERSION_URL") {
+        if !url.trim().is_empty() {
+            return url;
+        }
+    }
+    version_check_url_for_channel(selected_channel())
 }
 
 /// Remote version metadata returned from version.json in GitHub Releases.
@@ -304,6 +487,64 @@ mod tests {
         assert_eq!(info.version, "0.1.0");
         assert!(info.downloads.darwin_arm64.is_none());
         assert!(info.checksums.windows.is_none());
+    }
+
+    #[test]
+    fn test_update_channel_parse() {
+        assert_eq!(UpdateChannel::parse("stable"), Some(UpdateChannel::Stable));
+        assert_eq!(UpdateChannel::parse("latest"), Some(UpdateChannel::Stable));
+        assert_eq!(UpdateChannel::parse("BETA"), Some(UpdateChannel::Beta));
+        assert_eq!(UpdateChannel::parse("alpha"), Some(UpdateChannel::Alpha));
+        assert_eq!(UpdateChannel::parse("nightly"), None);
+    }
+
+    #[test]
+    fn test_channel_from_url() {
+        assert_eq!(
+            channel_from_url("https://data.example/alpha/version.json"),
+            UpdateChannel::Alpha
+        );
+        assert_eq!(
+            channel_from_url("https://data.example/beta/version.json"),
+            UpdateChannel::Beta
+        );
+        assert_eq!(
+            channel_from_url("https://data.example/latest/version.json"),
+            UpdateChannel::Stable
+        );
+        assert_eq!(
+            channel_from_url("https://example.com/version.json"),
+            UpdateChannel::Stable
+        );
+    }
+
+    #[test]
+    fn test_url_for_channel_rewrites_official_segment() {
+        let stable = "https://data.example/latest/version.json";
+        let beta = "https://data.example/beta/version.json";
+        let alpha = "https://data.example/alpha/version.json";
+
+        assert_eq!(
+            url_for_channel(stable, UpdateChannel::Beta),
+            "https://data.example/beta/version.json"
+        );
+        assert_eq!(
+            url_for_channel(beta, UpdateChannel::Alpha),
+            "https://data.example/alpha/version.json"
+        );
+        assert_eq!(
+            url_for_channel(alpha, UpdateChannel::Stable),
+            "https://data.example/latest/version.json"
+        );
+    }
+
+    #[test]
+    fn test_url_for_channel_leaves_custom_endpoint_unchanged() {
+        let custom = "https://example.com/updates/version.json";
+        assert_eq!(
+            url_for_channel(custom, UpdateChannel::Alpha),
+            custom
+        );
     }
 
     #[test]

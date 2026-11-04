@@ -1,5 +1,5 @@
 use crate::data::error::{CoinWatchError, Result};
-use crate::data::version::{VersionInfo, last_check_file};
+use crate::data::version::{UpdateChannel, VersionInfo, last_check_file};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Interval between automatic version checks (1 hour).
@@ -46,24 +46,34 @@ fn fetch_version_metadata(url: &str) -> Result<VersionInfo> {
 fn is_update_available(
     current: &crate::data::version::SemVer,
     current_build: Option<&str>,
-    version_url: &str,
+    channel: UpdateChannel,
+    allow_same_version: bool,
     remote: &crate::data::version::SemVer,
     remote_build: Option<&str>,
 ) -> bool {
-    remote.is_newer_than(current) || (
-        remote == current
-            && ["/alpha/", "/beta/"].iter().any(|channel| version_url.contains(channel))
+    remote.is_newer_than(current)
+        || (remote == current
+            && (channel.is_prerelease() || allow_same_version)
             && remote_build.is_some()
-            && remote_build != current_build
-    )
+            && remote_build != current_build)
 }
 
 /// Check if the remote version is newer than the current app version.
 pub fn check_for_update() -> Result<Option<VersionInfo>> {
+    check_for_update_with(false)
+}
+
+/// Check for an update, optionally accepting a same-version rebuild.
+///
+/// `allow_same_version` is used right after the user switches release
+/// channels, so moving from a pre-release back to stable can install the
+/// stable build even when both report the same semantic version.
+pub fn check_for_update_with(allow_same_version: bool) -> Result<Option<VersionInfo>> {
     let check_url = crate::data::version::version_check_url();
     if check_url.trim().is_empty() {
         return Ok(None);
     }
+    let channel = crate::data::version::selected_channel();
     let info = fetch_latest_version()?;
     let current = crate::data::version::SemVer::parse(crate::data::version::APP_VERSION)
         .ok_or_else(|| CoinWatchError::UpdateCheck("Invalid current app version".into()))?;
@@ -72,7 +82,8 @@ pub fn check_for_update() -> Result<Option<VersionInfo>> {
     if !is_update_available(
         &current,
         crate::data::version::BUILD_ID,
-        &check_url,
+        channel,
+        allow_same_version,
         &remote,
         info.build_id.as_deref(),
     ) { return Ok(None); }
@@ -127,6 +138,12 @@ pub fn record_check_time() {
     if let Err(e) = std::fs::write(&path, now.to_string()) {
         tracing::warn!("update_checker: failed to write check timestamp: {}", e);
     }
+}
+
+/// Forget the last check timestamp so the next automatic check runs
+/// immediately. Used when the user switches release channels.
+pub fn reset_check_time() {
+    std::fs::remove_file(last_check_file()).ok();
 }
 
 /// Get the platform identifier string used in version.json keys.
@@ -190,19 +207,22 @@ mod tests {
         let current = SemVer::parse("0.1.0").unwrap();
         let remote = SemVer::parse("0.1.0").unwrap();
         assert!(is_update_available(
-            &current, Some("old-sha"), "https://example.com/alpha/version.json", &remote, Some("new-sha")
+            &current, Some("old-sha"), UpdateChannel::Alpha, false, &remote, Some("new-sha")
         ));
         assert!(is_update_available(
-            &current, Some("old-sha"), "https://example.com/beta/version.json", &remote, Some("new-sha")
+            &current, Some("old-sha"), UpdateChannel::Beta, false, &remote, Some("new-sha")
         ));
         assert!(!is_update_available(
-            &current, Some("new-sha"), "https://example.com/alpha/version.json", &remote, Some("new-sha")
+            &current, Some("new-sha"), UpdateChannel::Alpha, false, &remote, Some("new-sha")
         ));
         assert!(!is_update_available(
-            &current, Some("old-sha"), "https://example.com/latest/version.json", &remote, Some("new-sha")
+            &current, Some("old-sha"), UpdateChannel::Stable, false, &remote, Some("new-sha")
+        ));
+        assert!(is_update_available(
+            &current, Some("old-sha"), UpdateChannel::Stable, true, &remote, Some("new-sha")
         ));
         assert!(!is_update_available(
-            &current, Some("old-sha"), "https://example.com/alpha/version.json", &remote, None
+            &current, Some("old-sha"), UpdateChannel::Alpha, false, &remote, None
         ));
     }
 

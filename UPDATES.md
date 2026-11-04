@@ -32,13 +32,19 @@ Required GitHub Actions secrets:
 
 ## Configuration
 
-- `FINTER_VERSION_URL`: HTTPS URL to compatible `version.json` metadata; unset disables update checking.
+- `FINTER_VERSION_URL`: HTTPS URL to compatible `version.json` metadata; unset disables update checking. An explicit value always wins over the user-selected channel.
 - `FINTER_BUILD_ID`: optional build identifier used to detect same-version channel updates.
 - `FINTER_API_URL`: backend API origin for account/API features. Guest mode stays unconfigured; authenticated sessions default to the hosted staging origin.
 - `FINTER_REST_URL`: optional REST market gateway; defaults to `FINTER_API_URL`.
 - `FINTER_WS_URL`: optional WebSocket market gateway; otherwise derived from `FINTER_REST_URL`.
 - `FINTER_NEWS_API_URL`: optional news API base URL.
 - `FINTER_NEWS_WS_URL`: optional news WebSocket URL.
+
+### Update channels
+
+Users choose their release channel under **Settings → Updates**. The selection is stored as `updateChannel` in the synced settings record and mirrored to `~/.finter/update_channel` so it applies before sign-in. Supported values are `stable` (tagged releases under `latest/`), `beta`, and `alpha`.
+
+When the baked endpoint uses the official `<channel>/version.json` layout, FinTer rewrites the channel segment at runtime. Custom endpoints without an `alpha`, `beta`, or `latest` segment keep their configured URL. Switching channels clears the last-check timestamp and triggers an immediate update check.
 
 Never commit credentials, tokens, or private deployment keys. Configure secrets through the hosting provider's secret store.
 

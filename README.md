@@ -104,7 +104,7 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | `FINTER_WS_URL` | WebSocket market stream gateway. |
 | `FINTER_NEWS_API_URL` | News article API. |
 | `FINTER_NEWS_WS_URL` | News WebSocket stream. |
-| `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel. |
+| `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel, and users can switch channels in Settings → Updates. |
 | `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
 
 <details>

@@ -105,6 +105,7 @@ pub struct AppSettings {
     pub enable_chart_grid: bool,
     pub enable_magnet_snap: bool,
     pub auto_check_updates: bool,
+    pub update_channel: SharedString,
     pub sync_dashboard_tabs: bool,
     pub default_timezone: gpui::SharedString,
     /// Local-only startup tab behavior; never included in SettingsData.
@@ -152,6 +153,7 @@ impl Default for AppSettings {
             enable_chart_grid: true,
             enable_magnet_snap: true,
             auto_check_updates: true,
+            update_channel: crate::data::version::selected_channel().as_str().into(),
             sync_dashboard_tabs: true,
             default_timezone: "UTC".into(),
             startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
@@ -211,6 +213,13 @@ impl AppSettings {
                 .unwrap_or_else(|| "UTC".into())
                 .into(),
             auto_check_updates: data.auto_check_updates.unwrap_or(true),
+            update_channel: data
+                .update_channel
+                .as_deref()
+                .and_then(crate::data::version::UpdateChannel::parse)
+                .unwrap_or_else(crate::data::version::selected_channel)
+                .as_str()
+                .into(),
             startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
             startup_tab_ids: tab_preferences.selected_tab_ids,
             agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
@@ -246,6 +255,7 @@ impl AppSettings {
             link_dashboard_tabs: Some(self.sync_dashboard_tabs),
             timezone: Some(self.default_timezone.to_string()),
             auto_check_updates: Some(self.auto_check_updates),
+            update_channel: Some(self.update_channel.to_string()),
             ..Default::default()
         }
     }
@@ -490,7 +500,7 @@ impl SettingsPage {
                             "performance" => { saved.max_fps = values.max_fps.clone(); saved.data_update_frequency = values.data_update_frequency.clone(); },
                             "layout" => { saved.sync_dashboard_tabs = values.sync_dashboard_tabs.clone(); saved.default_timezone = values.default_timezone.clone(); saved.auto_save_dashboard = values.auto_save_dashboard.clone(); },
                             "tabs" => { saved.startup_tabs_mode = values.startup_tabs_mode.clone(); saved.startup_tab_ids = values.startup_tab_ids.clone(); },
-                            "updates" => { saved.auto_check_updates = values.auto_check_updates.clone(); },
+                            "updates" => { saved.auto_check_updates = values.auto_check_updates.clone(); saved.update_channel = values.update_channel.clone(); },
                             _ => {}
                         }
                     });
@@ -1032,6 +1042,32 @@ impl SettingsPage {
                         "Current Version: v{}",
                         crate::data::version::APP_VERSION
                     ))
+                    .item(
+                        SettingItem::new(
+                            "Update Channel",
+                            SettingField::dropdown(
+                                vec![
+                                    (SharedString::from("stable"), SharedString::from("Stable")),
+                                    (SharedString::from("beta"), SharedString::from("Beta")),
+                                    (SharedString::from("alpha"), SharedString::from("Alpha")),
+                                ],
+                                {
+                                    let settings = settings.clone();
+                                    move |cx| settings.read(cx).update_channel.clone()
+                                },
+                                {
+                                    let settings = settings.clone();
+                                    move |value: SharedString, cx| {
+                                        settings.update(cx, |s, _| s.update_channel = value);
+                                    }
+                                },
+                            )
+                            .default_value(SharedString::from(
+                                crate::data::version::selected_channel().as_str(),
+                            )),
+                        )
+                        .description("Choose which release channel this installation follows. Stable receives tagged releases; Beta and Alpha receive pre-release builds."),
+                    )
                     .item(
                         SettingItem::new(
                             "Auto-Check for Updates",

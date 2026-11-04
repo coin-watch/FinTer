@@ -82,6 +82,7 @@ mod tests {
                 locale: Some("en_US".into()),
                 timezone: Some("UTC".into()),
                 auto_check_updates: Some(false),
+                update_channel: Some("beta".into()),
                 default_ticker_exchange: Some("binance".into()),
                 link_dashboard_tabs: Some(true),
                 survey_status: Some("".into()),
@@ -94,5 +95,6 @@ mod tests {
         assert_eq!(json["settings"]["theme"], "gruvbox");
         assert_eq!(json["settings"]["defaultTickerExchange"], "binance");
         assert_eq!(json["settings"]["linkDashboardTabs"], true);
+        assert_eq!(json["settings"]["updateChannel"], "beta");
     }
 }

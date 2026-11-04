@@ -18,7 +18,7 @@ use crate::data::models::{LayoutPreset, Module, SettingsData};
 use crate::data::pane_tree::PaneNode;
 use crate::data::theme::apply_theme;
 use crate::data::update_manager::UpdateManager;
-use crate::data::version::UpdateState;
+use crate::data::version::{UpdateChannel, UpdateState};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -364,6 +364,7 @@ impl MainView {
                         .server_url
                         .as_deref()
                         .and_then(crate::data::client::normalize_api_origin);
+                    let update_channel = settings.update_channel.clone();
                     let theme_name = settings
                         .theme
                         .clone()
@@ -375,6 +376,7 @@ impl MainView {
                         .unwrap_or(false);
                     apply_theme(&theme_name, dark_mode, cx);
                     self.user_settings = Some(settings);
+                    self.apply_update_channel(update_channel.as_deref(), cx);
                     if let Some(home) = &self.home_page {
                         if let Some(s) = &self.user_settings {
                             let s = s.clone();
@@ -468,6 +470,13 @@ impl MainView {
                         .server_url
                         .as_deref()
                         .and_then(crate::data::client::normalize_api_origin);
+                    if let Some(channel) = settings
+                        .update_channel
+                        .as_deref()
+                        .and_then(UpdateChannel::parse)
+                    {
+                        crate::data::version::set_selected_channel(channel);
+                    }
                     if let Some(server_url) = settings.server_url.as_deref() {
                         self.api_client.set_base_url(server_url);
                     }
@@ -1460,6 +1469,8 @@ impl MainView {
 
                         view.user_settings = Some(settings_clone.clone());
 
+                        view.apply_update_channel(settings_clone.update_channel.as_deref(), cx);
+
                         if let Some(home) = &view.home_page {
                             let settings = settings_clone.clone();
                             home.update(cx, |page, cx| {
@@ -1803,6 +1814,8 @@ impl MainView {
             }
             self.user_settings = Some(settings_data.clone());
 
+            self.apply_update_channel(settings_data.update_channel.as_deref(), cx);
+
             if let Some(home) = &self.home_page {
                 let settings = settings_data.clone();
                 home.update(cx, |page, cx| {
@@ -1851,6 +1864,32 @@ impl MainView {
 
             cx.notify();
         }
+    }
+
+    /// Apply the release channel stored in settings. When it changes, forget
+    /// the previous check timestamp and immediately look for updates on the
+    /// newly selected channel.
+    fn apply_update_channel(&mut self, channel: Option<&str>, cx: &mut Context<Self>) {
+        let Some(channel) = channel.and_then(UpdateChannel::parse) else {
+            return;
+        };
+        if !self.update_manager.set_channel(channel) {
+            return;
+        }
+
+        // The render-time check is one-shot; run a fresh check now instead.
+        self.update_check_started = true;
+        let mgr = self.update_manager.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::data::client::tokio_runtime()
+                .spawn_blocking(move || mgr.force_check())
+                .await;
+            if let Err(error) = result {
+                tracing::warn!("Update check after channel switch failed: {error}");
+            }
+            let _ = this.update(cx, |_this, cx| cx.notify());
+        })
+        .detach();
     }
 
     /// Save the current layout immediately (called on LayoutModified events)

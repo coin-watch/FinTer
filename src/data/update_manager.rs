@@ -3,6 +3,7 @@ use crate::data::update_checker;
 use crate::data::update_downloader::{self, DownloadProgress};
 use crate::data::version::{APP_VERSION, UpdateState, VersionInfo, backup_dir};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// On-disk path of the executable that was replaced by the most recent
@@ -21,6 +22,10 @@ static INSTALLED_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
 pub struct UpdateManager {
     state: Arc<Mutex<UpdateState>>,
     download_progress: Arc<Mutex<DownloadProgress>>,
+    /// Bumped whenever the release channel changes. In-flight checks and
+    /// downloads compare against it so results from the old channel cannot
+    /// overwrite the new channel's state.
+    generation: Arc<AtomicU64>,
 }
 
 impl Default for UpdateManager {
@@ -34,6 +39,7 @@ impl UpdateManager {
         Self {
             state: Arc::new(Mutex::new(UpdateState::Idle)),
             download_progress: Arc::new(Mutex::new(DownloadProgress::default())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -52,6 +58,32 @@ impl UpdateManager {
         self.download_progress.lock().unwrap().clone()
     }
 
+    /// Switch the release channel used for future update checks.
+    ///
+    /// Returns `true` when the channel actually changed. The caller can then
+    /// trigger an immediate check, since the previous metadata is no longer
+    /// relevant.
+    pub fn set_channel(&self, channel: crate::data::version::UpdateChannel) -> bool {
+        if crate::data::version::selected_channel() == channel {
+            return false;
+        }
+
+        crate::data::version::set_selected_channel(channel);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        update_checker::reset_check_time();
+        *self.state.lock().unwrap() = UpdateState::Idle;
+        *self.download_progress.lock().unwrap() = DownloadProgress::default();
+        tracing::info!(
+            "update_manager: switched update channel to {}",
+            channel.as_str()
+        );
+        true
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+
     /// Perform a version check if enough time has elapsed.
     /// Returns `Some(VersionInfo)` if an update is available.
     ///
@@ -62,13 +94,21 @@ impl UpdateManager {
             return None;
         }
 
+        let generation = self.generation.load(Ordering::SeqCst);
+        let allow_same_version = crate::data::version::selected_channel()
+            != crate::data::version::default_channel();
         {
             let mut s = self.state.lock().unwrap();
             *s = UpdateState::Checking;
         }
 
-        match update_checker::check_for_update() {
+        let result = update_checker::check_for_update_with(allow_same_version);
+
+        match result {
             Ok(Some(info)) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 update_checker::record_check_time();
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Available(Box::new(info.clone()));
@@ -80,12 +120,18 @@ impl UpdateManager {
                 Some(info)
             }
             Ok(None) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 update_checker::record_check_time();
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Idle;
                 None
             }
             Err(e) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 tracing::warn!("update_manager: check failed: {}", e);
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Failed(e.to_string());
@@ -98,25 +144,39 @@ impl UpdateManager {
     ///
     /// Blocking — call from a background thread.
     pub fn force_check(&self) -> Option<VersionInfo> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        let allow_same_version = crate::data::version::selected_channel()
+            != crate::data::version::default_channel();
         {
             let mut s = self.state.lock().unwrap();
             *s = UpdateState::Checking;
         }
 
-        match update_checker::check_for_update() {
+        let result = update_checker::check_for_update_with(allow_same_version);
+
+        match result {
             Ok(Some(info)) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 update_checker::record_check_time();
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Available(Box::new(info.clone()));
                 Some(info)
             }
             Ok(None) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 update_checker::record_check_time();
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Idle;
                 None
             }
             Err(e) => {
+                if !self.is_current(generation) {
+                    return None;
+                }
                 tracing::warn!("update_manager: force check failed: {}", e);
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Failed(e.to_string());
@@ -129,6 +189,7 @@ impl UpdateManager {
     ///
     /// Blocking — call from a background thread.
     pub fn download_update(&self, version_info: &VersionInfo) -> Result<PathBuf, CoinWatchError> {
+        let generation = self.generation.load(Ordering::SeqCst);
         {
             let mut s = self.state.lock().unwrap();
             *s = UpdateState::Downloading {
@@ -149,6 +210,14 @@ impl UpdateManager {
 
         match update_downloader::download_update(version_info, progress) {
             Ok(path) => {
+                if !self.is_current(generation) {
+                    tracing::info!(
+                        "update_manager: discarding download from a previous update channel"
+                    );
+                    return Err(CoinWatchError::UpdateDownload(
+                        "Update channel changed during download".into(),
+                    ));
+                }
                 let mut s = state.lock().unwrap();
                 *s = UpdateState::ReadyToInstall {
                     version: version.clone(),
@@ -165,6 +234,9 @@ impl UpdateManager {
                 Ok(path)
             }
             Err(e) => {
+                if !self.is_current(generation) {
+                    return Err(e);
+                }
                 let mut s = state.lock().unwrap();
                 *s = UpdateState::Failed(e.to_string());
                 Err(e)

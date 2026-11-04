@@ -333,6 +333,8 @@ pub struct SettingsData {
     pub timezone: Option<String>,
     #[serde(rename = "autoCheckUpdates", default)]
     pub auto_check_updates: Option<bool>,
+    #[serde(rename = "updateChannel", default)]
+    pub update_channel: Option<String>,
 
     // Dashboard settings shared with the CoinWatch web client.
     #[serde(rename = "defaultTickerExchange", default)]
