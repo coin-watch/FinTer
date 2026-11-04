@@ -199,17 +199,15 @@ impl<P: LinuxClient + 'static> Platform for P {
         log::info!("Restarting process, using app path: {:?}", app_path);
 
         // Script to wait for the current process to exit and then restart the app.
-        let script = format!(
-            r#"
-            while kill -0 {pid} 2>/dev/null; do
+        // The pid and path are passed as positional arguments so paths containing
+        // spaces or shell metacharacters are handled safely.
+        let script = r#"
+            while kill -0 "$0" 2>/dev/null; do
                 sleep 0.1
             done
 
-            {app_path}
-            "#,
-            pid = app_pid,
-            app_path = app_path.display()
-        );
+            exec "$1"
+            "#;
 
         #[allow(
             clippy::disallowed_methods,
@@ -219,6 +217,8 @@ impl<P: LinuxClient + 'static> Platform for P {
             .arg("bash")
             .arg("-c")
             .arg(script)
+            .arg(app_pid)
+            .arg(app_path)
             .process_group(0)
             .spawn();
 
@@ -466,6 +466,13 @@ impl<P: LinuxClient + 'static> Platform for P {
     }
 
     fn app_path(&self) -> Result<PathBuf> {
+        // When running from an AppImage, `current_exe()` points inside the
+        // temporary mount (`/tmp/.mount_*`), which is gone after the process
+        // exits. Restart/relaunch must target the AppImage file itself.
+        if let Some(appimage) = env::var_os("APPIMAGE") {
+            return Ok(PathBuf::from(appimage));
+        }
+
         // get the path of the executable of the current process
         let app_path = env::current_exe()?;
         Ok(app_path)

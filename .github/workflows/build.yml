@@ -7,15 +7,31 @@ on:
   pull_request:
     branches: [alpha, beta, release]
 
+# Least privilege: the build only needs to read the repository. Publishing
+# credentials are injected per-step from repository secrets.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   FINTER_BUILD_ID: ${{ github.sha }}
 
+  # Pin the AppImage packaging tool. The upstream "continuous" tag is mutable,
+  # so a pinned release plus a checksum prevents a compromised or swapped
+  # download from injecting code into every Linux build.
+  APPIMAGETOOL_VERSION: "1.9.1"
+  APPIMAGETOOL_SHA256: "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+  # appimagetool otherwise downloads the type-2 runtime from a mutable
+  # "continuous" URL. Pin a versioned runtime and verify it before use.
+  APPIMAGE_RUNTIME_VERSION: "20251108"
+  APPIMAGE_RUNTIME_SHA256: "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -37,16 +53,54 @@ jobs:
             artifact: finter-linux
             extension: ""
 
+    env:
+      # Secrets cannot be referenced directly in `if:` expressions. Expose
+      # only their availability as booleans, then branch on those in steps.
+      MACOS_SIGNING_AVAILABLE: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_KEYCHAIN_PASSWORD != '' && secrets.MACOS_SIGNING_IDENTITY != '' }}
+      MACOS_NOTARY_AVAILABLE: ${{ secrets.MACOS_NOTARY_APPLE_ID != '' && secrets.MACOS_NOTARY_PASSWORD != '' && secrets.MACOS_TEAM_ID != '' }}
+      WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+      LINUX_SIGNING_AVAILABLE: ${{ secrets.APPIMAGE_GPG_PRIVATE_KEY != '' && secrets.APPIMAGE_GPG_KEY_ID != '' }}
+      REQUIRE_SIGNING: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/alpha' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Enforce release signing policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$REQUIRE_SIGNING" != "true" ]; then
+            echo "Pull-request build: signing is optional."
+            exit 0
+          fi
+          if [ "${ALLOW_UNSIGNED_RELEASE:-false}" = "true" ]; then
+            echo "::warning::ALLOW_UNSIGNED_RELEASE is set; unsigned release artifacts will be published."
+            exit 0
+          fi
+          missing=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            [ "$MACOS_SIGNING_AVAILABLE" = "true" ] || missing="$missing macOS-certificate"
+            [ "$MACOS_NOTARY_AVAILABLE" = "true" ] || missing="$missing macOS-notary-credentials"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            [ "$WINDOWS_SIGNING_AVAILABLE" = "true" ] || missing="$missing windows-certificate"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Release builds require signing credentials. Missing:$missing"
+            echo "Configure the repository secrets documented in docs/PLATFORM-SECURITY.md,"
+            echo "or set the ALLOW_UNSIGNED_RELEASE repository variable to true to publish unsigned artifacts."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -65,7 +119,9 @@ jobs:
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev \
             libssl-dev pkg-config \
-            desktop-file-utils zsync file
+            desktop-file-utils zsync file \
+            appstream \
+            imagemagick
 
       - name: Configure update endpoint
         shell: bash
@@ -112,7 +168,165 @@ jobs:
             echo "Update checks disabled for this build"
           fi
 
-      - name: Package Linux AppImage
+      - name: Package macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          OUT="target/$TARGET/release"
+          APP="$OUT/FinTer.app"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test -n "$VERSION" || { echo "::error::Could not read version from Cargo.toml"; exit 1; }
+
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          install -m 0755 "$OUT/finter" "$APP/Contents/MacOS/finter"
+          install -m 0644 assets/app-icon.icns "$APP/Contents/Resources/AppIcon.icns"
+
+          sed -e "s/__FINTER_VERSION__/${VERSION}/g" \
+              -e "s/__FINTER_BUILD__/${GITHUB_RUN_NUMBER}/g" \
+              assets/platform/macos/Info.plist > "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "BIN=$OUT/finter" >> "$GITHUB_ENV"
+
+      - name: Sign and notarize macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          ENT="assets/platform/macos/FinTer.entitlements"
+          KEYCHAIN=""
+
+          cleanup() {
+            if [ -n "$KEYCHAIN" ]; then
+              security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if [ "$MACOS_SIGNING_AVAILABLE" = "true" ]; then
+            CERT="$RUNNER_TEMP/finter-cert.p12"
+            echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT"
+            KEYCHAIN="$RUNNER_TEMP/finter-signing.keychain-db"
+            security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN"
+            security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+            security import "$CERT" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+            security list-keychain -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+            rm -f "$CERT"
+
+            ID="$MACOS_SIGNING_IDENTITY"
+            SIGN=(--force --options runtime --timestamp --entitlements "$ENT" --sign "$ID" --keychain "$KEYCHAIN")
+          else
+            echo "::warning::macOS Developer ID certificate is not configured; using ad-hoc signing. Gatekeeper will block this build on other Macs."
+            ID="-"
+            SIGN=(--force --options runtime --entitlements "$ENT" --sign "$ID")
+          fi
+
+          # Sign the app bundle. This also signs the bundled main executable.
+          codesign "${SIGN[@]}" "$APP"
+
+          # Keep the standalone updater artifact byte-identical to the
+          # notarized app's main executable so both share the same signature
+          # and notarization record.
+          install -m 0755 "$APP/Contents/MacOS/finter" "$BIN"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+          if [ "$MACOS_SIGNING_AVAILABLE" != "true" ]; then
+            echo "Skipping notarization: no Developer ID certificate."
+            exit 0
+          fi
+          if [ "$MACOS_NOTARY_AVAILABLE" != "true" ]; then
+            echo "::warning::Notarization credentials are not configured; Gatekeeper will require an online check and may warn."
+            exit 0
+          fi
+
+          # Submit the app bundle, staple the ticket, then verify Gatekeeper.
+          SUBMIT_ZIP="$RUNNER_TEMP/FinTer-submit.zip"
+          ditto -c -k --keepParent "$APP" "$SUBMIT_ZIP"
+          xcrun notarytool submit "$SUBMIT_ZIP" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          if spctl --status 2>/dev/null | grep -q "assessments enabled"; then
+            if ! spctl --assess --type execute --verbose=4 "$APP"; then
+              echo "::warning::spctl assessment failed even though codesign and stapler checks passed."
+            fi
+          else
+            echo "Gatekeeper assessments are disabled on this runner; skipping spctl."
+          fi
+
+          # Distribution zip contains the stapled app.
+          DIST_ZIP="target/${{ matrix.target }}/release/FinTer.app.zip"
+          rm -f "$DIST_ZIP"
+          ditto -c -k --keepParent "$APP" "$DIST_ZIP"
+
+          # A signed, notarized, stapled DMG is the normal macOS download.
+          DMG="target/${{ matrix.target }}/release/FinTer-${{ matrix.target }}.dmg"
+          rm -f "$DMG"
+          hdiutil create -volname "FinTer" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          codesign --force --timestamp --sign "$ID" --keychain "$KEYCHAIN" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --team-id "$MACOS_TEAM_ID" \
+            --wait
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+
+      - name: Sign Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+        run: |
+          $binary = "target/${{ matrix.target }}/release/finter.exe"
+          if ($env:WINDOWS_SIGNING_AVAILABLE -ne 'true') {
+            Write-Host "::warning::Windows code-signing certificate is not configured; SmartScreen will block this binary."
+            exit 0
+          }
+
+          $pfx = Join-Path $env:RUNNER_TEMP "finter-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+
+          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+          if (-not $signtool) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $signtool) { throw "signtool.exe not found" }
+          $signtoolPath = if ($signtool.Source) { $signtool.Source } else { $signtool.FullName }
+
+          & $signtoolPath sign /fd SHA256 /td SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD $binary
+          if ($LASTEXITCODE -ne 0) { throw "signtool sign failed" }
+
+          & $signtoolPath verify /pa /v $binary
+          if ($LASTEXITCODE -ne 0) { throw "signtool verify failed" }
+
+          Remove-Item $pfx -Force
+
+      - name: Package Linux AppImage and tarball
         if: runner.os == 'Linux'
         shell: bash
         env:
@@ -123,31 +337,56 @@ jobs:
           APPDIR="$RUNNER_TEMP/FinTer.AppDir"
           OUT="target/$TARGET/release"
           APPIMAGE="$OUT/finter-$TARGET.AppImage"
+          TARBALL="$OUT/finter-$TARGET.tar.gz"
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          test -n "$VERSION" || { echo "::error::Could not read version from Cargo.toml"; exit 1; }
+          RELEASE_DATE="$(date -u +%Y-%m-%d)"
 
           # appimagetool requires a very specific AppDir layout:
           #   <AppDir>/AppRun                     executable launcher (mandatory)
           #   <AppDir>/<name>.desktop             desktop file in the TOP LEVEL (mandatory)
           #   <AppDir>/<Icon=value>.png           top-level icon used to create .DirIcon (mandatory)
           #   <AppDir>/usr/bin/<binary>           the payload
-          # A desktop file only in usr/share/applications is NOT found by appimagetool,
-          # which is what produced "Desktop file not found, aborting".
+          #   <AppDir>/usr/share/metainfo/        AppStream metadata for software centers
           rm -rf "$APPDIR"
           mkdir -p \
             "$APPDIR/usr/bin" \
             "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/metainfo" \
             "$APPDIR/usr/share/icons/hicolor/1024x1024/apps" \
+            "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
             "$APPDIR/usr/share/pixmaps"
 
           install -m 0755 "$OUT/finter" "$APPDIR/usr/bin/finter"
 
-          # Icon must be a PNG named after Icon= in the desktop file, in the top level.
-          install -m 0644 assets/app-icon.png "$APPDIR/finter.png"
+          # Ship every icon size that desktop environments look up. The
+          # directory name must match the PNG's real pixel size, otherwise
+          # some icon themes ignore the icon.
+          for size in 16 24 32 48 64 128 256 512; do
+            dir="$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dir"
+            convert assets/app-icon.png -resize "${size}x${size}" "$dir/finter.png"
+          done
           install -m 0644 assets/app-icon.png "$APPDIR/usr/share/icons/hicolor/1024x1024/apps/finter.png"
-          install -m 0644 assets/app-icon.png "$APPDIR/usr/share/pixmaps/finter.png"
+          install -m 0644 assets/icons/app-icon.svg "$APPDIR/usr/share/icons/hicolor/scalable/apps/finter.svg"
+
+          # appimagetool derives .DirIcon from the top-level icon. Use a
+          # conventional 512x512 PNG rather than the 1024px source.
+          install -m 0644 "$APPDIR/usr/share/icons/hicolor/512x512/apps/finter.png" "$APPDIR/finter.png"
+          install -m 0644 "$APPDIR/usr/share/icons/hicolor/512x512/apps/finter.png" "$APPDIR/usr/share/pixmaps/finter.png"
 
           # Single source of truth: the desktop file shipped in assets/.
           install -m 0644 assets/finter.desktop "$APPDIR/finter.desktop"
           install -m 0644 assets/finter.desktop "$APPDIR/usr/share/applications/finter.desktop"
+
+          # AppStream metadata lets software centers show a verified identity,
+          # screenshots, and release notes instead of an anonymous binary.
+          # Use the .appdata.xml suffix for compatibility with appimagetool and
+          # older software centers; AppStream accepts both suffixes.
+          sed -e "s/__FINTER_VERSION__/${VERSION}/g" \
+              -e "s/__FINTER_DATE__/${RELEASE_DATE}/g" \
+              assets/platform/linux/finter.appdata.xml \
+            > "$APPDIR/usr/share/metainfo/finter.appdata.xml"
 
           cat > "$APPDIR/AppRun" <<'APPRUN'
           #!/bin/sh
@@ -163,33 +402,82 @@ jobs:
           if command -v desktop-file-validate >/dev/null; then
             desktop-file-validate "$APPDIR/finter.desktop"
           fi
+          if command -v appstreamcli >/dev/null; then
+            appstreamcli validate --no-net "$APPDIR/usr/share/metainfo/finter.appdata.xml"
+          fi
 
+          TOOL="$RUNNER_TEMP/appimagetool.AppImage"
           curl -fsSL --retry 3 --retry-delay 2 \
-            -o "$RUNNER_TEMP/appimagetool.AppImage" \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod 0755 "$RUNNER_TEMP/appimagetool.AppImage"
+            -o "$TOOL" \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  $TOOL" | sha256sum -c -
+          chmod 0755 "$TOOL"
+
+          RUNTIME="$RUNNER_TEMP/runtime-x86_64"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o "$RUNTIME" \
+            "https://github.com/AppImage/type2-runtime/releases/download/${APPIMAGE_RUNTIME_VERSION}/runtime-x86_64"
+          echo "${APPIMAGE_RUNTIME_SHA256}  $RUNTIME" | sha256sum -c -
+          chmod 0755 "$RUNTIME"
 
           rm -f "$APPIMAGE"
-          ARCH=x86_64 "$RUNNER_TEMP/appimagetool.AppImage" \
-            --appimage-extract-and-run --no-appstream \
+          ARCH=x86_64 "$TOOL" --appimage-extract-and-run \
+            --runtime-file "$RUNTIME" \
             "$APPDIR" "$APPIMAGE"
 
           # Smoke test: unpack the result and make sure the AppImage really contains
-          # the launcher, the desktop file and the binary.
+          # the launcher, the desktop file, the metadata, and the binary.
           "$APPIMAGE" --appimage-extract >/dev/null
           test -x squashfs-root/AppRun
           test -x squashfs-root/usr/bin/finter
           test -f squashfs-root/finter.desktop
           test -f squashfs-root/.DirIcon
+          test -f squashfs-root/usr/share/metainfo/finter.appdata.xml
+          test -f squashfs-root/usr/share/icons/hicolor/512x512/apps/finter.png
+          test -f squashfs-root/usr/share/icons/hicolor/scalable/apps/finter.svg
+          test "$(identify -format '%wx%h' squashfs-root/.DirIcon)" = "512x512"
           rm -rf squashfs-root
 
+          # Fallback for distributions that restrict FUSE or unprivileged user
+          # namespaces (which can prevent AppImages from mounting).
+          STAGE="$RUNNER_TEMP/finter-$TARGET"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          install -m 0755 "$OUT/finter" "$STAGE/finter"
+          install -m 0644 assets/finter.desktop "$STAGE/finter.desktop"
+          install -m 0644 "$APPDIR/usr/share/metainfo/finter.appdata.xml" "$STAGE/finter.appdata.xml"
+          install -m 0644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/finter.png" "$STAGE/finter.png"
+          tar -C "$STAGE" -czf "$TARBALL" .
+
           sha256sum "$APPIMAGE" | cut -d ' ' -f 1 > "$APPIMAGE.sha256"
+          sha256sum "$TARBALL" | cut -d ' ' -f 1 > "$TARBALL.sha256"
 
-      - name: Self-sign macOS binary
-        if: runner.os == 'macOS'
-        run: codesign -s - target/${{ matrix.target }}/release/finter
+      - name: Sign Linux artifacts with GPG
+        if: runner.os == 'Linux' && env.LINUX_SIGNING_AVAILABLE == 'true'
+        shell: bash
+        env:
+          APPIMAGE_GPG_PRIVATE_KEY: ${{ secrets.APPIMAGE_GPG_PRIVATE_KEY }}
+          APPIMAGE_GPG_KEY_ID: ${{ secrets.APPIMAGE_GPG_KEY_ID }}
+          APPIMAGE_GPG_PASSPHRASE: ${{ secrets.APPIMAGE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          echo "$APPIMAGE_GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import
 
-      - name: Generate SHA256 checksum (Windows)
+          GPG_ARGS=(--batch --yes --armor --detach-sign --local-user "$APPIMAGE_GPG_KEY_ID")
+          if [ -n "${APPIMAGE_GPG_PASSPHRASE:-}" ]; then
+            GPG_ARGS+=(--pinentry-mode loopback --passphrase "$APPIMAGE_GPG_PASSPHRASE")
+          fi
+
+          OUT="target/${{ matrix.target }}/release"
+          for f in "$OUT/finter" "$OUT/finter-${{ matrix.target }}.AppImage" "$OUT/finter-${{ matrix.target }}.tar.gz"; do
+            gpg "${GPG_ARGS[@]}" "$f"
+            gpg --verify "$f.asc" "$f"
+          done
+
+      - name: Generate SHA256 checksums (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -198,32 +486,52 @@ jobs:
           [System.IO.File]::WriteAllText("$binary.sha256", "$hash`n")
           Write-Host "SHA256: $hash"
 
-      - name: Generate SHA256 checksum (macOS and Linux)
+      - name: Generate SHA256 checksums (macOS and Linux)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          BINARY="target/${{ matrix.target }}/release/finter${{ matrix.extension }}"
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            shasum -a 256 "$BINARY" | cut -d ' ' -f 1 > "$BINARY.sha256"
-          else
-            sha256sum "$BINARY" | cut -d ' ' -f 1 > "$BINARY.sha256"
-          fi
-          echo "SHA256: $(cat "$BINARY.sha256")"
+          set -euo pipefail
+          OUT="target/${{ matrix.target }}/release"
+          files=("$OUT/finter")
+          for f in "$OUT"/*.AppImage "$OUT"/*.tar.gz "$OUT"/*.dmg "$OUT"/FinTer.app.zip; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          for f in "${files[@]}"; do
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              shasum -a 256 "$f" | cut -d ' ' -f 1 > "$f.sha256"
+            else
+              sha256sum "$f" | cut -d ' ' -f 1 > "$f.sha256"
+            fi
+            echo "$(basename "$f") SHA256: $(cat "$f.sha256")"
+          done
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
+          if-no-files-found: error
           path: |
-            target/${{ matrix.target }}/release/finter${{ matrix.extension }}
-            target/${{ matrix.target }}/release/finter${{ matrix.extension }}.sha256
-            target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage
-            target/${{ matrix.target }}/release/finter-${{ matrix.target }}.AppImage.sha256
+            target/${{ matrix.target }}/release/finter
+            target/${{ matrix.target }}/release/finter.exe
+            target/${{ matrix.target }}/release/finter.sha256
+            target/${{ matrix.target }}/release/finter.exe.sha256
+            target/${{ matrix.target }}/release/finter-*.AppImage
+            target/${{ matrix.target }}/release/finter-*.AppImage.sha256
+            target/${{ matrix.target }}/release/finter-*.AppImage.asc
+            target/${{ matrix.target }}/release/finter-*.tar.gz
+            target/${{ matrix.target }}/release/finter-*.tar.gz.sha256
+            target/${{ matrix.target }}/release/finter-*.tar.gz.asc
+            target/${{ matrix.target }}/release/finter.asc
+            target/${{ matrix.target }}/release/FinTer-*.dmg
+            target/${{ matrix.target }}/release/FinTer-*.dmg.sha256
+            target/${{ matrix.target }}/release/FinTer.app.zip
+            target/${{ matrix.target }}/release/FinTer.app.zip.sha256
 
   release:
     name: Publish B2 updates
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.ref == 'refs/heads/alpha' || github.ref == 'refs/heads/beta' || startsWith(github.ref, 'refs/tags/v')
     concurrency:
       group: b2-${{ github.ref }}
@@ -238,10 +546,11 @@ jobs:
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts/
       - name: Publish verified binaries then metadata
         run: python3 scripts/publish_updates.py
-

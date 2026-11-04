@@ -8,7 +8,7 @@ Updates require explicit user action to download and install. Downloads are boun
 
 The included GitHub Actions workflow builds and tests platform binaries. On pushes to `alpha`, `beta`, or matching version tags (`v*`), it runs the `release` job to publish verified binaries to public Backblaze B2 using `scripts/publish_updates.py`.
 
-Alpha/beta builds stage under `<channel>/<sha>/` and update `<channel>/version.json`, pruning obsolete builds. Tagged releases stage under `releases/v<version>/` and update `latest/version.json`.
+Alpha/beta builds stage under `<channel>/<sha>/` and update `<channel>/version.json`, pruning obsolete builds. Tagged releases stage under `releases/v<version>/` and update `latest/version.json`. When the optional Linux GPG signing secrets are configured, detached `.asc` signatures are published next to the raw binaries and listed in the `signatures` map of `version.json`.
 
 CI embeds the matching metadata endpoint in each binary automatically: `alpha` → `https://data.coinwat.ch/alpha/version.json`, `beta` → `https://data.coinwat.ch/beta/version.json`, and `v*` tags → `https://data.coinwat.ch/latest/version.json`. Pull-request builds leave update checks disabled. Local builds can opt in at build or run time with `FINTER_VERSION_URL`.
 
@@ -23,10 +23,12 @@ Required GitHub Actions secrets:
 ## Limits
 
 - Supported targets in CI: macOS arm64/x86_64, Windows x86_64, Linux x86_64.
-- macOS `.app` bundles are not built or notarized.
-- Linux AppImage artifacts are not self-updating; the updater replaces the raw `finter` binary, so use the published Linux binary rather than the AppImage.
+- macOS releases are signed with a Developer ID, hardened at runtime, notarized, and stapled. The `.app`/`.dmg` are distribution artifacts; the standalone `finter` binary remains the updater artifact. Replacing the binary inside a signed `.app` would invalidate its signature, so `.app` users should update by downloading the new signed `.dmg`.
+- Windows releases are Authenticode-signed and timestamped. An EV certificate is recommended for immediate SmartScreen reputation.
+- Linux AppImage artifacts are not self-updating; the updater replaces the raw `finter` binary, so use the published Linux binary rather than the AppImage. A `.tar.gz` fallback is produced for systems that restrict AppImage/FUSE.
 - Updating an executable in a read-only/system install location may fail.
-- SHA-256 is not a digital signature and does not protect against a compromised metadata host.
+- SHA-256 is not a digital signature and does not protect against a compromised metadata host. Add signed update metadata before enabling public updates at scale.
+- Release signing requires the repository secrets documented in [`docs/PLATFORM-SECURITY.md`](docs/PLATFORM-SECURITY.md). Release builds fail when required signing credentials are missing unless `ALLOW_UNSIGNED_RELEASE` is set.
 
 ## Configuration
 

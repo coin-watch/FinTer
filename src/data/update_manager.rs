@@ -2,8 +2,17 @@ use crate::data::error::CoinWatchError;
 use crate::data::update_checker;
 use crate::data::update_downloader::{self, DownloadProgress};
 use crate::data::version::{APP_VERSION, UpdateState, VersionInfo, backup_dir};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// On-disk path of the executable that was replaced by the most recent
+/// successful update.
+///
+/// `std::env::current_exe()` cannot be used after `self_replace` on Linux: the
+/// running process keeps the old inode, so `/proc/self/exe` resolves to
+/// `"<path> (deleted)"` and spawning it fails. Remember the real path while the
+/// replacement happens so the restart button can launch the new binary.
+static INSTALLED_EXE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Manages the full update lifecycle: check → download → verify → prompt → install.
 ///
@@ -190,7 +199,7 @@ impl UpdateManager {
     }
 
     /// Replace running executable with the updated binary.
-    pub fn install_update(update_path: &std::path::Path) -> Result<(), CoinWatchError> {
+    pub fn install_update(update_path: &Path) -> Result<(), CoinWatchError> {
         let current_exe = std::env::current_exe()
             .map_err(|e| CoinWatchError::Io(format!("Cannot find current executable: {e}")))?;
         let expected = update_downloader::checksum_path(update_path);
@@ -213,17 +222,48 @@ impl UpdateManager {
             let _ = std::fs::copy(&backup, &current_exe);
             return Err(CoinWatchError::Io(format!("Executable replacement failed; backup restored: {error}")));
         }
+
+        // Record the path *before* the process image becomes stale. This is what
+        // the restart action must launch.
+        if let Ok(mut installed) = INSTALLED_EXE.lock() {
+            *installed = Some(current_exe);
+        }
+
         Ok(())
+    }
+
+    /// Path of the executable installed by the most recent update, if any.
+    pub fn installed_exe_path() -> Option<PathBuf> {
+        INSTALLED_EXE.lock().ok().and_then(|path| path.clone())
     }
 
     /// Restart the application with the current command line arguments.
     pub fn restart_app() -> Result<(), CoinWatchError> {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| CoinWatchError::Io(format!("Cannot find current executable: {e}")))?;
-        let mut cmd = std::process::Command::new(&current_exe);
+        let exe = Self::installed_exe_path()
+            .or_else(|| std::env::current_exe().ok())
+            .ok_or_else(|| CoinWatchError::Io("Cannot find executable to restart".into()))?;
+
+        // Defensive: if we ever fall back to `current_exe()` after a Linux
+        // self-replace, strip the kernel's " (deleted)" marker.
+        let exe = strip_deleted_suffix(&exe);
+        if !exe.exists() {
+            return Err(CoinWatchError::Io(format!(
+                "Cannot restart: executable not found at {}",
+                exe.display()
+            )));
+        }
+
+        let mut cmd = std::process::Command::new(&exe);
         cmd.args(std::env::args().skip(1));
-        cmd.spawn()
-            .map_err(|e| CoinWatchError::Io(format!("Failed to restart application: {e}")))?;
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.spawn().map_err(|e| {
+            CoinWatchError::Io(format!(
+                "Failed to restart application from {}: {e}",
+                exe.display()
+            ))
+        })?;
         Ok(())
     }
 
@@ -311,6 +351,23 @@ impl UpdateManager {
     }
 }
 
+/// Linux appends " (deleted)" to `/proc/self/exe` once the running executable
+/// has been replaced or unlinked. Strip it so the path can be spawned again.
+fn strip_deleted_suffix(path: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        const SUFFIX: &[u8] = b" (deleted)";
+        let bytes = path.as_os_str().as_bytes();
+        if let Some(stripped) = bytes.strip_suffix(SUFFIX) {
+            return PathBuf::from(std::ffi::OsStr::from_bytes(stripped));
+        }
+    }
+
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +420,17 @@ mod tests {
         let p = mgr.download_progress();
         assert_eq!(p.downloaded, 0);
         assert!(!p.complete);
+    }
+
+    #[test]
+    fn test_strip_deleted_suffix() {
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/tmp/finter (deleted)")),
+            PathBuf::from("/tmp/finter")
+        );
+        assert_eq!(
+            strip_deleted_suffix(Path::new("/tmp/finter")),
+            PathBuf::from("/tmp/finter")
+        );
     }
 }

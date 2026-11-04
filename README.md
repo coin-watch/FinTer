@@ -132,6 +132,8 @@ Tab preferences (which dashboard tabs open on startup) are local-only and stored
 
 FinTer does not ship API keys, application credentials, user data, session tokens, database dumps, compiled artifacts, or vendored dependency build directories. Authentication tokens are obtained at runtime and stored through the OS keyring where available. When a keyring is unavailable, the fallback session file lives in the per-user configuration directory and is restricted to the current user on Unix systems.
 
+Release builds are signed for each platform so operating-system security gates do not block them: macOS builds are signed with a Developer ID, hardened at runtime, notarized, and stapled; Windows builds are Authenticode-signed and timestamped; Linux AppImages ship AppStream metadata and an optional GPG signature. See [Platform security and release signing](docs/PLATFORM-SECURITY.md) for the required secrets, verification commands, and the release signing policy.
+
 Do not commit `.env` files, credentials, private keys, local session files, or generated build output. See [`.gitignore`](.gitignore).
 
 ## Project layout
@@ -147,7 +149,9 @@ Do not commit `.env` files, credentials, private keys, local session files, or g
 
 ## Release builds
 
-Release automation lives in [`.github/workflows`](.github/workflows). It runs tests before building platform binaries and produces SHA-256 checksums. Publishing update artifacts requires repository-hosted deployment secrets; those values belong in GitHub Actions secrets and must never be committed.
+Release automation lives in [`.github/workflows`](.github/workflows). It builds platform binaries, signs them for the target platform, and produces SHA-256 checksums. Publishing update artifacts requires repository-hosted deployment secrets; those values belong in GitHub Actions secrets and must never be committed.
+
+Pushes to `alpha`, `beta`, and `v*` tags fail unless the macOS and Windows signing secrets are configured. Pull-request builds may be unsigned. The `ALLOW_UNSIGNED_RELEASE` repository variable is an explicit escape hatch for forks and staging, and the workflow warns when it is used. See [Platform security and release signing](docs/PLATFORM-SECURITY.md) for the full secret list and verification commands.
 
 Before publishing, review the workflow endpoints, artifact names, update metadata URL, and repository permissions for your deployment environment. Update downloads require explicit user action, are size-bounded, and are re-verified against SHA-256 metadata before installation. SHA-256 detects corruption but does not authenticate publishers — treat the configured HTTPS update host as trusted code distribution infrastructure.
 

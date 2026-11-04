@@ -2916,7 +2916,15 @@ impl Render for MainView {
                         }).detach();
                     }
                     UpdateBannerEvent::RestartRequested => {
-                        if let Err(error) = UpdateManager::restart_app() {
+                        // Prefer the platform restart helper: it waits for this
+                        // process to exit before launching the replacement. On
+                        // Linux `current_exe()` points at a deleted inode after
+                        // `self_replace`, so pass the path captured at install
+                        // time instead.
+                        if let Some(exe) = UpdateManager::installed_exe_path() {
+                            cx.set_restart_path(exe);
+                            cx.restart();
+                        } else if let Err(error) = UpdateManager::restart_app() {
                             tracing::error!("Failed to restart application: {error}");
                             this.update_manager.fail(format!("Restart failed: {error}"));
                             cx.notify();

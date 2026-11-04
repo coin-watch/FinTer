@@ -117,37 +117,92 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn install_linux_desktop_entry() {
+    use std::path::Path;
+
     let Some(data_dir) = dirs::data_local_dir() else { return; };
 
-    // 1. Install icons
-    let icon_data = crate::assets::CustomAssets::get("app-icon.png")
-        .or_else(|| crate::assets::CustomAssets::get("icons/app-icon.png"));
-
-    if let Some(icon) = icon_data {
-        // ~/.local/share/icons/hicolor/512x512/apps/finter.png
-        let icon_hicolor = data_dir.join("icons/hicolor/512x512/apps/finter.png");
-        if !icon_hicolor.exists() {
-            if let Some(parent) = icon_hicolor.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&icon_hicolor, &icon.data);
+    // Write only when the content actually changed so we don't churn the
+    // desktop caches on every launch.
+    fn write_if_changed(path: &Path, data: &[u8]) -> bool {
+        if std::fs::read(path).ok().as_deref() == Some(data) {
+            return false;
         }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, data).is_ok()
+    }
 
-        // ~/.local/share/pixmaps/finter.png
-        let pixmap = data_dir.join("pixmaps/finter.png");
-        if !pixmap.exists() {
-            if let Some(parent) = pixmap.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&pixmap, &icon.data);
+    let mut changed = false;
+
+    // 1. Install icons.
+    //
+    // The source asset is 1024x1024. Older builds copied it into the
+    // hicolor/512x512 directory, which makes some icon themes reject it
+    // because the directory size does not match the actual image size.
+    let icon_png = crate::assets::CustomAssets::get("app-icon.png")
+        .or_else(|| crate::assets::CustomAssets::get("icons/app-icon.png"));
+    if let Some(icon) = icon_png.as_ref() {
+        changed |= write_if_changed(
+            &data_dir.join("icons/hicolor/1024x1024/apps/finter.png"),
+            &icon.data,
+        );
+        changed |= write_if_changed(&data_dir.join("pixmaps/finter.png"), &icon.data);
+
+        let stale = data_dir.join("icons/hicolor/512x512/apps/finter.png");
+        if stale.exists() {
+            changed |= std::fs::remove_file(&stale).is_ok();
         }
     }
 
-    // 2. Install desktop entry ~/.local/share/applications/finter.desktop
-    let desktop_path = data_dir.join("applications/finter.desktop");
-    let current_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "finter".to_string());
+    // Some icon themes do not read scalable SVGs and cap their lookup at
+    // 256px, so install a correctly-sized 256px PNG as well.
+    if let Some(icon) = crate::assets::CustomAssets::get("app-icon-256.png") {
+        changed |= write_if_changed(
+            &data_dir.join("icons/hicolor/256x256/apps/finter.png"),
+            &icon.data,
+        );
+    }
+
+    // A scalable icon lets the desktop render the correct size for docks,
+    // application menus, and file managers that support SVG.
+    if let Some(icon) = crate::assets::CustomAssets::get("icons/app-icon.svg") {
+        changed |= write_if_changed(
+            &data_dir.join("icons/hicolor/scalable/apps/finter.svg"),
+            &icon.data,
+        );
+    }
+
+    // 2. Install the desktop entry.
+    //
+    // When running from an AppImage, `current_exe()` points inside the
+    // temporary mount (`/tmp/.mount_*`), which disappears when the app exits.
+    // Point the launcher at the AppImage file instead.
+    let launch_path = std::env::var_os("APPIMAGE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    let exec_path = launch_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "finter".to_string());
+
+    // Quote/escape the path for the desktop entry Exec key.
+    let exec = {
+        let mut escaped = String::with_capacity(exec_path.len() + 2);
+        escaped.push('"');
+        for ch in exec_path.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '`' => escaped.push_str("\\`"),
+                '$' => escaped.push_str("\\$"),
+                '%' => escaped.push_str("%%"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped.push('"');
+        escaped
+    };
 
     let desktop_content = format!(
         "[Desktop Entry]\n\
@@ -156,17 +211,52 @@ fn install_linux_desktop_entry() {
         Name=FinTer\n\
         GenericName=Financial Terminal\n\
         Comment=Real-time crypto and financial market data terminal\n\
-        Exec=\"{}\"\n\
+        Exec={exec} %u\n\
         Icon=finter\n\
         Terminal=false\n\
         Categories=Finance;Office;Network;\n\
         StartupWMClass=finter\n\
-        Keywords=crypto;trading;finance;terminal;bitcoin;\n",
-        current_exe
+        StartupNotify=true\n\
+        Keywords=crypto;trading;finance;terminal;bitcoin;\n"
     );
 
-    if let Some(parent) = desktop_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    changed |= write_if_changed(
+        &data_dir.join("applications/finter.desktop"),
+        desktop_content.as_bytes(),
+    );
+
+    // 3. Give the downloaded AppImage/binary itself an icon in file managers
+    // that honour GVFS metadata (e.g. GNOME Files). Best-effort: `gio` may not
+    // be installed on non-GNOME desktops.
+    if let Some(artifact) = launch_path.as_ref() {
+        let icon_path = data_dir.join("icons/hicolor/256x256/apps/finter.png");
+        if icon_path.exists() {
+            if let Ok(icon_uri) = url::Url::from_file_path(&icon_path) {
+                let _ = std::process::Command::new("gio")
+                    .arg("set")
+                    .arg(artifact)
+                    .arg("metadata::custom-icon")
+                    .arg(icon_uri.as_str())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
     }
-    let _ = std::fs::write(&desktop_path, desktop_content);
+
+    // 4. Refresh the caches so the new icon/launcher is visible immediately.
+    if changed {
+        let _ = std::process::Command::new("gtk-update-icon-cache")
+            .arg("-f")
+            .arg("-t")
+            .arg(data_dir.join("icons/hicolor"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(data_dir.join("applications"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }

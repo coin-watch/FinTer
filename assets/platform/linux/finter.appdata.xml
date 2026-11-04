@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>finter</id>
+  <name>FinTer</name>
+  <summary>Native market terminal for live crypto and financial charts</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="ch.coinwat">
+    <name>CoinWatch</name>
+  </developer>
+  <description>
+    <p>
+      FinTer is a native desktop market terminal for people who read charts for
+      a living. It combines live crypto market data, a real charting engine, and
+      a persistent workspace in a single fast application.
+    </p>
+    <ul>
+      <li>Live OHLCV candlestick and Heikin Ashi charts with indicators.</li>
+      <li>Order books, trade tape, tickers, watchlists, and market news.</li>
+      <li>Resizable pane layouts that persist between sessions.</li>
+      <li>Local-first guest mode with optional cloud sync.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">finter.desktop</launchable>
+  <url type="homepage">https://github.com/coin-watch/FinTer</url>
+  <url type="bugtracker">https://github.com/coin-watch/FinTer/issues</url>
+  <provides>
+    <binary>finter</binary>
+  </provides>
+  <categories>
+    <category>Finance</category>
+    <category>Office</category>
+    <category>Network</category>
+  </categories>
+  <icon type="stock">finter</icon>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Live charting, market panels, and watchlists</caption>
+      <image>https://raw.githubusercontent.com/coin-watch/FinTer/main/assets/Screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="__FINTER_VERSION__" date="__FINTER_DATE__"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

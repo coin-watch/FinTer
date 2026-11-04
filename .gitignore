@@ -40,6 +40,10 @@ desktop.ini
 *.p8
 session.json
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # Scratch & temporary development scripts
 patch_*.py
 rewrite_*.py

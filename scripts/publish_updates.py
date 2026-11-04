@@ -58,6 +58,7 @@ def prepare(root: Path, base_url: str, git_ref: str, git_sha: str):
         "changelog": f"Build {git_sha}",
         "downloads": {},
         "checksums": {},
+        "signatures": {},
     }
     files = []
     for platform, filename in PLATFORMS.items():
@@ -73,6 +74,13 @@ def prepare(root: Path, base_url: str, git_ref: str, git_sha: str):
         metadata["downloads"][platform] = f"{base_url.rstrip('/')}/{key}"
         metadata["checksums"][platform] = digest
         files.append((path, key))
+
+        # Optional detached GPG signature produced by the Linux signing step.
+        signature = Path(f"{path}.asc")
+        if signature.is_file() and signature.stat().st_size > 0:
+            signature_key = f"{key}.asc"
+            metadata["signatures"][platform] = f"{base_url.rstrip('/')}/{signature_key}"
+            files.append((signature, signature_key))
     return metadata, files, prefix, channel
 
 

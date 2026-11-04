@@ -9,4 +9,5 @@ Icon=finter
 Terminal=false
 Categories=Finance;Office;Network;
 StartupWMClass=finter
+StartupNotify=true
 Keywords=crypto;trading;finance;terminal;bitcoin;

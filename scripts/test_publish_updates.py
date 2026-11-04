@@ -29,6 +29,12 @@ with tempfile.TemporaryDirectory() as directory:
         assert actual == channel and len(files) == len(metadata["downloads"]) == 4
         assert metadata["build_id"] == sha
         assert all(url.startswith(f"https://example.com/{prefix}/") for url in metadata["downloads"].values())
+    signature = Path(f"{path}.asc")
+    signature.write_text("-----BEGIN PGP SIGNATURE-----\n")
+    metadata, files, prefix, _ = prepare(root, "https://example.com", "refs/heads/alpha", sha)
+    assert metadata["signatures"]["linux"].endswith("/finter-linux.asc")
+    assert any(key.endswith("/finter-linux.asc") for _, key in files)
+    signature.unlink()
     for base, ref in [("http://example.com", "refs/heads/alpha"), ("https://example.com", "refs/tags/v9.0.0")]:
         try:
             prepare(root, base, ref, sha)
@@ -53,4 +59,4 @@ versions = [
 ]
 assert [item["VersionId"] for item in obsolete_versions(versions, "alpha", "alpha/bbb")] == ["old-meta", "old-build", "old-file"]
 assert obsolete_versions(versions, "beta", "beta/ccc") == []
-print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, pruning")
+print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, signatures, pruning")

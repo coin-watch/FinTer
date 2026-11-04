@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		FinTer runs with the hardened runtime but is not sandboxed.
+
+		Keep this file empty unless a feature genuinely needs an entitlement.
+		In particular, FinTer does not need JIT, unsigned executable memory,
+		library-validation bypasses, or Apple Events. Network access and
+		Keychain access are available to non-sandboxed Developer ID apps
+		without additional entitlements.
+
+		Every entitlement added here weakens the hardened runtime and must be
+		justified in review.
+	-->
+</dict>
+</plist>
