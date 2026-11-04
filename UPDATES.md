@@ -42,9 +42,9 @@ Required GitHub Actions secrets:
 
 ### Update channels
 
-Users choose their release channel under **Settings → Updates**. The selection is stored as `updateChannel` in the synced settings record and mirrored to `~/.finter/update_channel` so it applies before sign-in. Supported values are `stable` (tagged releases under `latest/`), `beta`, and `alpha`.
+Users choose their release channel under **Settings → Updates** using the Stable, Beta, and Alpha buttons. Selecting a channel applies it immediately, checks that channel, and downloads and installs its current build. Switching channels may upgrade or downgrade the application; restart remains user-controlled. The selection is stored as `updateChannel` in the synced settings record and mirrored to `~/.finter/update_channel` so it applies before sign-in.
 
-When the baked endpoint uses the official `<channel>/version.json` layout, FinTer rewrites the channel segment at runtime. Custom endpoints without an `alpha`, `beta`, or `latest` segment keep their configured URL. Switching channels clears the last-check timestamp and triggers an immediate update check.
+When the baked endpoint uses the official `<channel>/version.json` layout, FinTer rewrites the channel segment at runtime. Custom endpoints without an `alpha`, `beta`, or `latest` segment keep their configured URL. Explicit channel selection accepts the channel's current version even when it is older than the running build, while automatic checks continue to install only newer builds unless the selected channel differs from the binary's build channel.
 
 Never commit credentials, tokens, or private deployment keys. Configure secrets through the hosting provider's secret store.
 

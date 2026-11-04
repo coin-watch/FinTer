@@ -47,13 +47,20 @@ fn is_update_available(
     current: &crate::data::version::SemVer,
     current_build: Option<&str>,
     channel: UpdateChannel,
-    allow_same_version: bool,
+    allow_any_version: bool,
     remote: &crate::data::version::SemVer,
     remote_build: Option<&str>,
 ) -> bool {
+    if allow_any_version {
+        // Explicit channel switches may upgrade or downgrade. A same-version
+        // rebuild is only useful when the build id actually differs.
+        return remote != current
+            || (remote_build.is_some() && remote_build != current_build);
+    }
+
     remote.is_newer_than(current)
         || (remote == current
-            && (channel.is_prerelease() || allow_same_version)
+            && channel.is_prerelease()
             && remote_build.is_some()
             && remote_build != current_build)
 }
@@ -63,12 +70,13 @@ pub fn check_for_update() -> Result<Option<VersionInfo>> {
     check_for_update_with(false)
 }
 
-/// Check for an update, optionally accepting a same-version rebuild.
+/// Check for an update, optionally accepting any version on the channel.
 ///
-/// `allow_same_version` is used right after the user switches release
-/// channels, so moving from a pre-release back to stable can install the
-/// stable build even when both report the same semantic version.
-pub fn check_for_update_with(allow_same_version: bool) -> Result<Option<VersionInfo>> {
+/// `allow_any_version` is used when the user explicitly selects a release
+/// channel. It permits installing the channel's current build even when that
+/// version is older than the running binary, so switching channels can upgrade
+/// or downgrade as needed.
+pub fn check_for_update_with(allow_any_version: bool) -> Result<Option<VersionInfo>> {
     let check_url = crate::data::version::version_check_url();
     if check_url.trim().is_empty() {
         return Ok(None);
@@ -83,7 +91,7 @@ pub fn check_for_update_with(allow_same_version: bool) -> Result<Option<VersionI
         &current,
         crate::data::version::BUILD_ID,
         channel,
-        allow_same_version,
+        allow_any_version,
         &remote,
         info.build_id.as_deref(),
     ) { return Ok(None); }
@@ -223,6 +231,26 @@ mod tests {
         ));
         assert!(!is_update_available(
             &current, Some("old-sha"), UpdateChannel::Alpha, false, &remote, None
+        ));
+    }
+
+    #[test]
+    fn test_channel_switch_allows_downgrade() {
+        let current = SemVer::parse("0.2.0").unwrap();
+        let older = SemVer::parse("0.1.8").unwrap();
+        let newer = SemVer::parse("0.3.0").unwrap();
+
+        assert!(is_update_available(
+            &current, Some("sha"), UpdateChannel::Stable, true, &older, Some("old-sha")
+        ));
+        assert!(is_update_available(
+            &current, Some("sha"), UpdateChannel::Stable, true, &newer, Some("new-sha")
+        ));
+        assert!(!is_update_available(
+            &current, Some("sha"), UpdateChannel::Stable, false, &older, Some("old-sha")
+        ));
+        assert!(!is_update_available(
+            &current, Some("sha"), UpdateChannel::Stable, true, &current, Some("sha")
         ));
     }
 

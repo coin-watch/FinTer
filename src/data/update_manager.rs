@@ -84,6 +84,17 @@ impl UpdateManager {
         self.generation.load(Ordering::SeqCst) == generation
     }
 
+    /// Invalidate any in-flight check or download and reset the update state.
+    ///
+    /// Used when the user explicitly re-selects the current channel, so the
+    /// program still re-scans that channel instead of trusting stale state.
+    pub fn prepare_channel_check(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        update_checker::reset_check_time();
+        *self.state.lock().unwrap() = UpdateState::Idle;
+        *self.download_progress.lock().unwrap() = DownloadProgress::default();
+    }
+
     /// Perform a version check if enough time has elapsed.
     /// Returns `Some(VersionInfo)` if an update is available.
     ///
@@ -94,17 +105,36 @@ impl UpdateManager {
             return None;
         }
 
-        let generation = self.generation.load(Ordering::SeqCst);
-        let allow_same_version = crate::data::version::selected_channel()
+        let allow_any_version = crate::data::version::selected_channel()
             != crate::data::version::default_channel();
+        self.run_check(allow_any_version)
+    }
+
+    /// Force a version check regardless of timing.
+    ///
+    /// Blocking — call from a background thread.
+    pub fn force_check(&self) -> Option<VersionInfo> {
+        let allow_any_version = crate::data::version::selected_channel()
+            != crate::data::version::default_channel();
+        self.run_check(allow_any_version)
+    }
+
+    /// Force a check for the currently selected channel and accept any version
+    /// it publishes, including an older version than the running binary.
+    ///
+    /// Blocking — call from a background thread.
+    pub fn force_channel_check(&self) -> Option<VersionInfo> {
+        self.run_check(true)
+    }
+
+    fn run_check(&self, allow_any_version: bool) -> Option<VersionInfo> {
+        let generation = self.generation.load(Ordering::SeqCst);
         {
             let mut s = self.state.lock().unwrap();
             *s = UpdateState::Checking;
         }
 
-        let result = update_checker::check_for_update_with(allow_same_version);
-
-        match result {
+        match update_checker::check_for_update_with(allow_any_version) {
             Ok(Some(info)) => {
                 if !self.is_current(generation) {
                     return None;
@@ -133,51 +163,6 @@ impl UpdateManager {
                     return None;
                 }
                 tracing::warn!("update_manager: check failed: {}", e);
-                let mut s = self.state.lock().unwrap();
-                *s = UpdateState::Failed(e.to_string());
-                None
-            }
-        }
-    }
-
-    /// Force a version check regardless of timing.
-    ///
-    /// Blocking — call from a background thread.
-    pub fn force_check(&self) -> Option<VersionInfo> {
-        let generation = self.generation.load(Ordering::SeqCst);
-        let allow_same_version = crate::data::version::selected_channel()
-            != crate::data::version::default_channel();
-        {
-            let mut s = self.state.lock().unwrap();
-            *s = UpdateState::Checking;
-        }
-
-        let result = update_checker::check_for_update_with(allow_same_version);
-
-        match result {
-            Ok(Some(info)) => {
-                if !self.is_current(generation) {
-                    return None;
-                }
-                update_checker::record_check_time();
-                let mut s = self.state.lock().unwrap();
-                *s = UpdateState::Available(Box::new(info.clone()));
-                Some(info)
-            }
-            Ok(None) => {
-                if !self.is_current(generation) {
-                    return None;
-                }
-                update_checker::record_check_time();
-                let mut s = self.state.lock().unwrap();
-                *s = UpdateState::Idle;
-                None
-            }
-            Err(e) => {
-                if !self.is_current(generation) {
-                    return None;
-                }
-                tracing::warn!("update_manager: force check failed: {}", e);
                 let mut s = self.state.lock().unwrap();
                 *s = UpdateState::Failed(e.to_string());
                 None

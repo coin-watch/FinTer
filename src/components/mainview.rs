@@ -18,7 +18,7 @@ use crate::data::models::{LayoutPreset, Module, SettingsData};
 use crate::data::pane_tree::PaneNode;
 use crate::data::theme::apply_theme;
 use crate::data::update_manager::UpdateManager;
-use crate::data::version::{UpdateChannel, UpdateState};
+use crate::data::version::{UpdateChannel, UpdateState, VersionInfo};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -1892,6 +1892,185 @@ impl MainView {
         .detach();
     }
 
+    /// Create the update banner and subscribe to its actions once per session.
+    fn ensure_update_banner(&mut self, cx: &mut Context<Self>) {
+        if self.update_banner.is_some() {
+            return;
+        }
+
+        let mgr = self.update_manager.clone();
+        let banner = cx.new(|_cx| UpdateBanner::new(mgr));
+
+        cx.subscribe(
+            &banner,
+            |this: &mut MainView, _banner, event: &UpdateBannerEvent, cx| match event {
+                UpdateBannerEvent::DownloadRequested => {
+                    if let UpdateState::Available(info) = this.update_manager.state() {
+                        this.start_update_download(*info, false, cx);
+                    }
+                }
+                UpdateBannerEvent::InstallRequested(path) => {
+                    let path = std::path::PathBuf::from(path);
+                    let mgr = this.update_manager.clone();
+                    let version = match mgr.state() {
+                        UpdateState::ReadyToInstall { ref version, .. } => version.clone(),
+                        _ => crate::data::version::APP_VERSION.to_string(),
+                    };
+                    cx.spawn(async move |this, cx| {
+                        let result = crate::data::client::tokio_runtime()
+                            .spawn_blocking(move || UpdateManager::install_update(&path))
+                            .await;
+                        match result {
+                            Ok(Ok(())) => mgr.mark_installed(&version),
+                            Ok(Err(error)) => mgr.fail(error.to_string()),
+                            Err(error) => mgr.fail(format!("Update install task failed: {error}")),
+                        }
+                        let _ = this.update(cx, |_this, cx| cx.notify());
+                    }).detach();
+                }
+                UpdateBannerEvent::RestartRequested => {
+                    // Prefer the platform restart helper: it waits for this
+                    // process to exit before launching the replacement. On
+                    // Linux `current_exe()` points at a deleted inode after
+                    // `self_replace`, so pass the path captured at install
+                    // time instead.
+                    if let Some(exe) = UpdateManager::installed_exe_path() {
+                        cx.set_restart_path(exe);
+                        cx.restart();
+                    } else if let Err(error) = UpdateManager::restart_app() {
+                        tracing::error!("Failed to restart application: {error}");
+                        this.update_manager.fail(format!("Restart failed: {error}"));
+                        cx.notify();
+                    } else {
+                        cx.quit();
+                    }
+                }
+                UpdateBannerEvent::Dismissed => {
+                    this.update_manager.dismiss();
+                    cx.notify();
+                }
+                UpdateBannerEvent::CheckRequested => {
+                    let mgr = this.update_manager.clone();
+                    cx.spawn(async move |this, cx| {
+                        let result = crate::data::client::tokio_runtime()
+                            .spawn_blocking(move || mgr.force_check())
+                            .await;
+                        if let Err(error) = result { tracing::warn!("Update check task failed: {error}"); }
+                        let _ = this.update(cx, |_this, cx| cx.notify());
+                    })
+                    .detach();
+                }
+            },
+        )
+        .detach();
+
+        self.update_banner = Some(banner);
+    }
+
+    /// Apply a channel selected from the Settings UI and immediately install
+    /// that channel's current build, even if it is older than the running one.
+    fn select_update_channel(&mut self, cx: &mut Context<Self>) {
+        let channel = self
+            .settings_page
+            .as_ref()
+            .and_then(|page| page.read(cx).get_settings_data(cx).update_channel)
+            .and_then(|value| UpdateChannel::parse(&value));
+        let Some(channel) = channel else {
+            return;
+        };
+
+        if !self.update_manager.set_channel(channel) {
+            self.update_manager.prepare_channel_check();
+        }
+        self.save_settings_from_page(cx);
+        self.force_update_channel_check(cx);
+    }
+
+    fn force_update_channel_check(&mut self, cx: &mut Context<Self>) {
+        self.update_check_started = true;
+        let mgr = self.update_manager.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::data::client::tokio_runtime()
+                .spawn_blocking(move || mgr.force_channel_check())
+                .await;
+            if let Err(error) = result {
+                tracing::warn!("Channel update check failed: {error}");
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.auto_install_selected_channel_update(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn auto_install_selected_channel_update(&mut self, cx: &mut Context<Self>) {
+        if let UpdateState::Available(info) = self.update_manager.state() {
+            self.start_update_download(*info, true, cx);
+        }
+    }
+
+    /// Download an available update. When `auto_install` is set, install it as
+    /// soon as the download finishes and leave the app in `RestartRequired`.
+    fn start_update_download(
+        &mut self,
+        info: VersionInfo,
+        auto_install: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mgr = self.update_manager.clone();
+        cx.spawn(async move |this, cx| {
+            let mgr_worker = mgr.clone();
+            let info_worker = info.clone();
+            let download_task = crate::data::client::tokio_runtime().spawn(async move {
+                tokio::task::spawn_blocking(move || mgr_worker.download_update(&info_worker)).await
+            });
+
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let is_downloading = matches!(mgr.state(), UpdateState::Downloading { .. });
+                if this.update(cx, |_this, cx| cx.notify()).is_err() || !is_downloading {
+                    break;
+                }
+            }
+
+            let downloaded = match download_task.await {
+                Ok(Ok(Ok(_))) => true,
+                Ok(Ok(Err(error))) => {
+                    tracing::error!("Update download failed: {error}");
+                    false
+                }
+                Ok(Err(error)) => {
+                    tracing::error!("Update download task failed: {error}");
+                    false
+                }
+                Err(error) => {
+                    tracing::error!("Update download task failed: {error}");
+                    false
+                }
+            };
+
+            if downloaded && auto_install {
+                if let UpdateState::ReadyToInstall { version, path } = mgr.state() {
+                    let path = std::path::PathBuf::from(path);
+                    let result = crate::data::client::tokio_runtime()
+                        .spawn_blocking(move || UpdateManager::install_update(&path))
+                        .await;
+                    match result {
+                        Ok(Ok(())) => mgr.mark_installed(&version),
+                        Ok(Err(error)) => mgr.fail(error.to_string()),
+                        Err(error) => mgr.fail(format!("Update install task failed: {error}")),
+                    }
+                }
+            }
+
+            let _ = this.update(cx, |_this, cx| cx.notify());
+        })
+        .detach();
+    }
+
     /// Save the current layout immediately (called on LayoutModified events)
     fn save_current_layout_immediately(&mut self, cx: &mut Context<Self>) {
         if let Some(home) = &self.home_page {
@@ -2383,6 +2562,7 @@ impl Render for MainView {
         // Keep the alert desk alive for the whole session: chart panes read the
         // shared alert snapshot even when the sidebar has never been opened.
         self.ensure_alerts_panel(cx);
+        self.ensure_update_banner(cx);
         if let Some(panel) = self.alerts_panel.clone() {
             panel.update(cx, |panel, cx| {
                 panel.drain_notifications(window, cx);
@@ -2647,10 +2827,20 @@ impl Render for MainView {
                     }
                 });
 
+                let channel_entity = entity.clone();
+                let on_channel_selected = Arc::new(move |cx: &mut App| {
+                    if let Some(e) = channel_entity.upgrade() {
+                        cx.update_entity(&e, |view: &mut MainView, cx: &mut Context<MainView>| {
+                            view.select_update_channel(cx);
+                        });
+                    }
+                });
+
                 self.settings_page = Some(cx.new(move |cx| {
                     SettingsPage::new_with_data(&settings_data, tab_profile, cx)
                         .with_dashboards(dashboards.clone())
                         .with_on_change(on_setting_changed.clone())
+                        .with_channel_selected(on_channel_selected.clone())
                 }));
             }
 
@@ -2683,23 +2873,43 @@ impl Render for MainView {
             let settings_content = div()
                 .flex_1()
                 .overflow_hidden()
-                .when(current_page == Page::Settings, |this| {
-                    if let Some(settings_page) = self.settings_page.as_ref() {
-                        this.child(settings_page.clone())
-                    } else {
-                        this
-                    }
-                })
-                .when(current_page == Page::Profile, |this| {
-                    this.child(ProfilePage::build_element(
-                        self.api_client.get_session(),
-                        self.user_settings.clone(),
-                        self.account_summary.clone(),
-                        self.account_summary_loading,
-                        self.is_authenticated,
-                        cx,
-                    ))
-                });
+                .flex()
+                .flex_col()
+                .when(
+                    !matches!(
+                        self.update_manager.state(),
+                        UpdateState::Idle | UpdateState::Checking
+                    ),
+                    |this| {
+                        if let Some(banner) = self.update_banner.as_ref() {
+                            this.child(banner.clone())
+                        } else {
+                            this
+                        }
+                    },
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .when(current_page == Page::Settings, |this| {
+                            if let Some(settings_page) = self.settings_page.as_ref() {
+                                this.child(settings_page.clone())
+                            } else {
+                                this
+                            }
+                        })
+                        .when(current_page == Page::Profile, |this| {
+                            this.child(ProfilePage::build_element(
+                                self.api_client.get_session(),
+                                self.user_settings.clone(),
+                                self.account_summary.clone(),
+                                self.account_summary_loading,
+                                self.is_authenticated,
+                                cx,
+                            ))
+                        }),
+                );
 
             if is_macos {
                 return div()
@@ -2835,101 +3045,6 @@ impl Render for MainView {
                 if let Err(error) = result { tracing::warn!("Update check task failed: {error}"); }
                 let _ = this.update(cx, |_this, cx| cx.notify());
             }).detach();
-        }
-
-        // Lazily create update banner entity
-        if self.update_banner.is_none() {
-            let mgr = self.update_manager.clone();
-            let banner = cx.new(|_cx| UpdateBanner::new(mgr));
-
-            cx.subscribe(
-                &banner,
-                |this: &mut MainView, _banner, event: &UpdateBannerEvent, cx| match event {
-                    UpdateBannerEvent::DownloadRequested => {
-                        let state = this.update_manager.state();
-                        if let UpdateState::Available(info) = state {
-                            let mgr = this.update_manager.clone();
-                            cx.spawn(async move |this, cx| {
-                                let mgr_worker = mgr.clone();
-                                let info_worker = info.clone();
-                                let download_task = crate::data::client::tokio_runtime().spawn(async move {
-                                    tokio::task::spawn_blocking(move || mgr_worker.download_update(&info_worker)).await
-                                });
-
-                                loop {
-                                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
-                                    let is_downloading = matches!(mgr.state(), UpdateState::Downloading { .. });
-                                    if this.update(cx, |_this, cx| cx.notify()).is_err() || !is_downloading {
-                                        break;
-                                    }
-                                }
-
-                                if let Ok(res) = download_task.await {
-                                    if let Err(error) = res {
-                                        tracing::error!("Update download task failed: {error:?}");
-                                    }
-                                }
-                                let _ = this.update(cx, |_this, cx| cx.notify());
-                            })
-                            .detach();
-                        }
-                    }
-                    UpdateBannerEvent::InstallRequested(path) => {
-                        let path = std::path::PathBuf::from(path);
-                        let mgr = this.update_manager.clone();
-                        let version = match mgr.state() {
-                            UpdateState::ReadyToInstall { ref version, .. } => version.clone(),
-                            _ => crate::data::version::APP_VERSION.to_string(),
-                        };
-                        cx.spawn(async move |this, cx| {
-                            let result = crate::data::client::tokio_runtime()
-                                .spawn_blocking(move || UpdateManager::install_update(&path))
-                                .await;
-                            match result {
-                                Ok(Ok(())) => mgr.mark_installed(&version),
-                                Ok(Err(error)) => mgr.fail(error.to_string()),
-                                Err(error) => mgr.fail(format!("Update install task failed: {error}")),
-                            }
-                            let _ = this.update(cx, |_this, cx| cx.notify());
-                        }).detach();
-                    }
-                    UpdateBannerEvent::RestartRequested => {
-                        // Prefer the platform restart helper: it waits for this
-                        // process to exit before launching the replacement. On
-                        // Linux `current_exe()` points at a deleted inode after
-                        // `self_replace`, so pass the path captured at install
-                        // time instead.
-                        if let Some(exe) = UpdateManager::installed_exe_path() {
-                            cx.set_restart_path(exe);
-                            cx.restart();
-                        } else if let Err(error) = UpdateManager::restart_app() {
-                            tracing::error!("Failed to restart application: {error}");
-                            this.update_manager.fail(format!("Restart failed: {error}"));
-                            cx.notify();
-                        } else {
-                            cx.quit();
-                        }
-                    }
-                    UpdateBannerEvent::Dismissed => {
-                        this.update_manager.dismiss();
-                        cx.notify();
-                    }
-                    UpdateBannerEvent::CheckRequested => {
-                        let mgr = this.update_manager.clone();
-                        cx.spawn(async move |this, cx| {
-                            let result = crate::data::client::tokio_runtime()
-                                .spawn_blocking(move || mgr.force_check())
-                                .await;
-                            if let Err(error) = result { tracing::warn!("Update check task failed: {error}"); }
-                            let _ = this.update(cx, |_this, cx| cx.notify());
-                        })
-                        .detach();
-                    }
-                },
-            )
-            .detach();
-
-            self.update_banner = Some(banner);
         }
 
         // Determine if update banner should be visible

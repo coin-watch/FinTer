@@ -3,7 +3,7 @@ use crate::data::models::SettingsData;
 use crate::data::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement;
@@ -388,10 +388,59 @@ fn dashboard_multi_select(
         .into_any_element()
 }
 
+/// Interactive release-channel selector.
+///
+/// Clicking a channel applies it immediately and asks MainView to check that
+/// channel and install its current version. Switching channels may upgrade or
+/// downgrade the application.
+fn update_channel_selector(
+    settings: Entity<AppSettings>,
+    committed: Entity<AppSettings>,
+    on_channel_selected: OnChangeFn,
+    cx: &mut App,
+) -> AnyElement {
+    let selected = settings.read(cx).update_channel.clone();
+    let mut row = div().flex().flex_row().gap(px(8.0));
+
+    for channel in [
+        crate::data::version::UpdateChannel::Stable,
+        crate::data::version::UpdateChannel::Beta,
+        crate::data::version::UpdateChannel::Alpha,
+    ] {
+        let is_selected = selected.as_ref() == channel.as_str();
+        let settings = settings.clone();
+        let committed = committed.clone();
+        let on_channel_selected = on_channel_selected.clone();
+
+        row = row.child(
+            Button::new(SharedString::from(format!(
+                "update-channel-{}",
+                channel.as_str()
+            )))
+            .label(channel.label())
+            .small()
+            .when(is_selected, |button| button.primary())
+            .when(!is_selected, |button| button.outline())
+            .on_click(move |_, _, cx| {
+                let value: SharedString = channel.as_str().into();
+                settings.update(cx, |s, _| s.update_channel = value.clone());
+                committed.update(cx, |s, _| s.update_channel = value.clone());
+                if let Some(callback) = &on_channel_selected {
+                    callback(cx);
+                }
+                cx.refresh_windows();
+            }),
+        );
+    }
+
+    row.into_any_element()
+}
+
 pub struct SettingsPage {
     settings: Entity<AppSettings>,
     committed: Entity<AppSettings>,
     on_change: OnChangeFn,
+    on_channel_selected: OnChangeFn,
     api_management: Entity<ApiManagementView>,
     /// Live dashboard list used by the Tabs settings page.
     dashboards: Vec<(String, String)>,
@@ -403,6 +452,7 @@ impl SettingsPage {
             settings: cx.new(|_| AppSettings::default()),
             committed: cx.new(|_| AppSettings::default()),
             on_change: None,
+            on_channel_selected: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
             dashboards: Vec::new(),
         }
@@ -417,6 +467,7 @@ impl SettingsPage {
             settings: cx.new(|_| AppSettings::from_settings_data(data, profile)),
             committed: cx.new(|_| AppSettings::from_settings_data(data, profile)),
             on_change: None,
+            on_channel_selected: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
             dashboards: Vec::new(),
         }
@@ -447,6 +498,14 @@ impl SettingsPage {
 
     pub fn with_on_change(mut self, callback: Arc<dyn Fn(&mut App) + Send + Sync>) -> Self {
         self.on_change = Some(callback);
+        self
+    }
+
+    pub fn with_channel_selected(
+        mut self,
+        callback: Arc<dyn Fn(&mut App) + Send + Sync>,
+    ) -> Self {
+        self.on_channel_selected = Some(callback);
         self
     }
 
@@ -1045,28 +1104,21 @@ impl SettingsPage {
                     .item(
                         SettingItem::new(
                             "Update Channel",
-                            SettingField::dropdown(
-                                vec![
-                                    (SharedString::from("stable"), SharedString::from("Stable")),
-                                    (SharedString::from("beta"), SharedString::from("Beta")),
-                                    (SharedString::from("alpha"), SharedString::from("Alpha")),
-                                ],
-                                {
-                                    let settings = settings.clone();
-                                    move |cx| settings.read(cx).update_channel.clone()
-                                },
-                                {
-                                    let settings = settings.clone();
-                                    move |value: SharedString, cx| {
-                                        settings.update(cx, |s, _| s.update_channel = value);
-                                    }
-                                },
-                            )
-                            .default_value(SharedString::from(
-                                crate::data::version::selected_channel().as_str(),
-                            )),
+                            SettingField::render({
+                                let settings = settings.clone();
+                                let committed = self.committed.clone();
+                                let on_channel_selected = self.on_channel_selected.clone();
+                                move |_options, _, cx| {
+                                    update_channel_selector(
+                                        settings.clone(),
+                                        committed.clone(),
+                                        on_channel_selected.clone(),
+                                        cx,
+                                    )
+                                }
+                            }),
                         )
-                        .description("Choose which release channel this installation follows. Stable receives tagged releases; Beta and Alpha receive pre-release builds."),
+                        .description("Selecting a channel immediately checks that channel and installs its current version. Switching channels can upgrade or downgrade the app."),
                     )
                     .item(
                         SettingItem::new(
