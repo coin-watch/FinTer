@@ -400,7 +400,7 @@ fn update_channel_selector(
     cx: &mut App,
 ) -> AnyElement {
     let selected = settings.read(cx).update_channel.clone();
-    let mut row = div().flex().flex_row().gap(px(8.0));
+    let mut row = div().flex().flex_row();
 
     for channel in [
         crate::data::version::UpdateChannel::Stable,
