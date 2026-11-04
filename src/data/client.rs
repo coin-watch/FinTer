@@ -15,6 +15,39 @@ pub const DEFAULT_FINTER_API_URL: &str = "";
 /// the native client; override it with `FINTER_API_URL` or Settings → Network.
 pub const DEFAULT_CLOUD_API_URL: &str = "https://staging.coinwat.ch";
 
+/// Origins that older builds used as the API base but that do not serve the
+/// native API today. `https://coinwat.ch` is the public marketing site; API
+/// paths there return an HTML page (often a Cloudflare challenge/403), which
+/// surfaced as `expected value at line 1 column 1` when signing in. Treat them
+/// as unconfigured so every platform resolves the same hosted API origin.
+const LEGACY_API_HOSTS: &[&str] = &["coinwat.ch", "www.coinwat.ch"];
+
+/// Normalize a configured API origin.
+///
+/// Returns `None` for empty, whitespace-only, relative, non-HTTP(S), or legacy
+/// marketing origins so callers can fall back to the platform-independent
+/// default. Trailing slashes are removed.
+pub fn normalize_api_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let Ok(url) = url::Url::parse(trimmed) else {
+        return None;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let host = url.host_str()?.to_ascii_lowercase();
+    if LEGACY_API_HOSTS.contains(&host.as_str()) {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
 /// Base URL for the FinTer backend API.
 ///
 /// Discovered in priority order:
@@ -39,17 +72,14 @@ pub fn default_api_url() -> String {
 
 fn get_base_url() -> String {
     if let Ok(guard) = ACTIVE_BASE_URL.read() {
-        if let Some(ref url) = *guard {
-            if !url.trim().is_empty() {
-                return url.clone();
-            }
+        if let Some(origin) = guard.as_deref().and_then(normalize_api_origin) {
+            return origin;
         }
     }
 
     if let Ok(url) = std::env::var("FINTER_API_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return trimmed.trim_end_matches('/').to_string();
+        if let Some(origin) = normalize_api_origin(&url) {
+            return origin;
         }
     }
 
@@ -58,11 +88,12 @@ fn get_base_url() -> String {
             let path = base_dir.join("finter").join(filename);
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(settings) = serde_json::from_str::<crate::data::models::SettingsData>(&content) {
-                    if let Some(url) = settings.server_url {
-                        let trimmed = url.trim();
-                        if !trimmed.is_empty() {
-                            return trimmed.trim_end_matches('/').to_string();
-                        }
+                    if let Some(origin) = settings
+                        .server_url
+                        .as_deref()
+                        .and_then(normalize_api_origin)
+                    {
+                        return origin;
                     }
                 }
             }
@@ -75,10 +106,12 @@ fn get_base_url() -> String {
 /// Use a separately configured REST gateway when `FINTER_REST_URL` is set;
 /// otherwise use the configured API origin.
 pub(crate) fn service_base_url() -> String {
-    std::env::var("FINTER_REST_URL")
-        .unwrap_or_else(|_| get_base_url())
-        .trim_end_matches('/')
-        .to_string()
+    if let Ok(url) = std::env::var("FINTER_REST_URL") {
+        if let Some(origin) = normalize_api_origin(&url) {
+            return origin;
+        }
+    }
+    get_base_url()
 }
 
 /// Check if an API service URL has been configured either via environment variable,
@@ -100,6 +133,30 @@ mod endpoint_tests {
     fn cloud_default_is_an_absolute_https_origin() {
         assert!(DEFAULT_CLOUD_API_URL.starts_with("https://"));
         assert!(!DEFAULT_CLOUD_API_URL.ends_with('/'));
+    }
+
+    #[test]
+    fn legacy_marketing_origin_is_not_an_api_base() {
+        // Older builds persisted this as `serverUrl`; it returns HTML for API
+        // paths, which used to surface as a JSON deserialization error.
+        assert_eq!(normalize_api_origin("https://coinwat.ch"), None);
+        assert_eq!(normalize_api_origin("https://coinwat.ch/"), None);
+        assert_eq!(normalize_api_origin("http://www.coinwat.ch"), None);
+        assert_eq!(normalize_api_origin("  "), None);
+        assert_eq!(normalize_api_origin("staging.coinwat.ch"), None);
+        assert_eq!(normalize_api_origin("ftp://staging.coinwat.ch"), None);
+    }
+
+    #[test]
+    fn valid_api_origins_are_normalized() {
+        assert_eq!(
+            normalize_api_origin("https://staging.coinwat.ch/"),
+            Some("https://staging.coinwat.ch".into())
+        );
+        assert_eq!(
+            normalize_api_origin("  http://localhost:5173/  "),
+            Some("http://localhost:5173".into())
+        );
     }
 }
 
@@ -185,8 +242,18 @@ impl ApiClient {
     }
 
     /// Set a new base URL at runtime.
+    ///
+    /// Empty, relative, and legacy marketing origins are ignored so a stale
+    /// `serverUrl` from an older build can never replace a working endpoint.
     pub fn set_base_url(&self, base_url: &str) {
-        let clean = base_url.trim_end_matches('/').to_string();
+        let Some(clean) = normalize_api_origin(base_url) else {
+            tracing::warn!(
+                "Ignoring invalid or legacy API origin {:?}; keeping {}",
+                base_url,
+                self.base_url()
+            );
+            return;
+        };
         if let Ok(mut guard) = self.base_url.write() {
             *guard = clean.clone();
         }
@@ -586,5 +653,9 @@ mod tests {
             "https://staging.coinwat.ch/api/account-summary"
         );
         assert_eq!(service_base_url(), "https://staging.coinwat.ch");
+
+        // A stale legacy origin must not replace the working endpoint.
+        client1.set_base_url("https://coinwat.ch");
+        assert_eq!(client2.base_url(), "https://staging.coinwat.ch");
     }
 }

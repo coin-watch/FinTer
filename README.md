@@ -95,7 +95,7 @@ Point it at a different backend in **Settings → Network & Server**, or set the
 FINTER_API_URL="http://localhost:5173" cargo run
 ```
 
-A locally configured endpoint is preserved across restarts and is not cleared by a null `serverUrl` in the shared server-side settings record.
+A locally configured endpoint is preserved across restarts and is not cleared by a null `serverUrl` in the shared server-side settings record. Legacy builds that saved `https://coinwat.ch` (the marketing site) as the API origin are migrated automatically to the hosted API origin, so sign-in behaves the same on Linux, macOS, and Windows.
 
 | Variable | Purpose |
 | --- | --- |

@@ -167,17 +167,54 @@ __EMAIL_ROW__
         .replace("__EMAIL_ROW__", &email_row)
 }
 
+/// Decode an auth response body.
+///
+/// Some endpoints (notably the legacy `https://coinwat.ch` origin persisted by
+/// older builds) return an HTML page instead of the JSON envelope. Reporting
+/// that as `expected value at line 1 column 1` hides the real problem, so turn
+/// non-JSON responses into a descriptive API error that names the URL.
+fn parse_auth_response(
+    bytes: &[u8],
+    status: reqwest::StatusCode,
+    url: &str,
+) -> Result<AuthResponse> {
+    match serde_json::from_slice::<AuthResponse>(bytes) {
+        Ok(auth) => Ok(auth),
+        Err(error) => {
+            let body = String::from_utf8_lossy(bytes);
+            let trimmed = body.trim();
+            if !status.is_success() || trimmed.is_empty() || trimmed.starts_with('<') {
+                let detail: String = trimmed.chars().take(160).collect();
+                Err(CoinWatchError::Api {
+                    status: status.as_u16(),
+                    message: format!(
+                        "{url} returned a non-JSON response (HTTP {status}). Check the API server URL in Settings → Network.{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Response: {detail}")
+                        }
+                    ),
+                })
+            } else {
+                Err(CoinWatchError::Deserialization(error.to_string()))
+            }
+        }
+    }
+}
+
 impl ApiClient {
-    /// Ensure API requests have an absolute origin.
+    /// Ensure API requests have an absolute, usable origin.
     ///
     /// A session can only exist if the user signed in against a real backend,
-    /// so fall back to the hosted cloud origin when no endpoint was configured.
+    /// so fall back to the hosted cloud origin when no endpoint was configured
+    /// (or when a legacy marketing origin was persisted by an older build).
     /// Without this, reqwest rejects `/api/...` paths with
     /// `RelativeUrlWithoutBase` and every account/dashboard request fails.
     fn ensure_base_url(&self) {
-        if self.base_url().trim().is_empty() {
+        if crate::data::client::normalize_api_origin(&self.base_url()).is_none() {
             tracing::info!(
-                "No API endpoint configured for authenticated session; using {}",
+                "No usable API endpoint configured for authentication; using {}",
                 crate::data::client::DEFAULT_CLOUD_API_URL
             );
             self.set_base_url(crate::data::client::DEFAULT_CLOUD_API_URL);
@@ -214,8 +251,7 @@ impl ApiClient {
                     message: "proxy unavailable".into(),
                 });
             }
-            serde_json::from_slice::<AuthResponse>(&bytes)
-                .map_err(|e| CoinWatchError::Deserialization(e.to_string()))
+            parse_auth_response(&bytes, status, &url)
         });
 
         let auth = proxy_result?;
@@ -266,9 +302,9 @@ impl ApiClient {
                 .header("Origin", self.base_url())
                 .json(&body)
                 .send().await?;
-            resp.json::<AuthResponse>()
-                .await
-                .map_err(|e| CoinWatchError::Deserialization(e.to_string()))
+            let status = resp.status();
+            let bytes = resp.bytes().await?;
+            parse_auth_response(&bytes, status, &url)
         })?;
 
         if auth.success {
@@ -370,8 +406,7 @@ impl ApiClient {
                     message: String::from_utf8_lossy(&body_bytes).into_owned(),
                 });
             }
-            serde_json::from_slice::<AuthResponse>(&body_bytes)
-                .map_err(|e| CoinWatchError::Deserialization(e.to_string()))
+            parse_auth_response(&body_bytes, status, &url)
         });
 
         let auth = proxy_result?;
@@ -722,5 +757,38 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["refresh_token"], "tok-123");
+    }
+
+    #[test]
+    fn html_auth_response_is_reported_as_api_error() {
+        let body = b"<!DOCTYPE html><html><head><title>Attention Required!</title></head></html>";
+        let error = parse_auth_response(
+            body,
+            reqwest::StatusCode::FORBIDDEN,
+            "https://coinwat.ch/api/auth/login",
+        )
+        .expect_err("HTML must not deserialize as an auth response");
+
+        match error {
+            CoinWatchError::Api { status, message } => {
+                assert_eq!(status, 403);
+                assert!(message.contains("non-JSON response"));
+                assert!(message.contains("https://coinwat.ch/api/auth/login"));
+            }
+            other => panic!("expected API error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_auth_response_still_parses() {
+        let body = br#"{"success":false,"error":"Invalid login credentials"}"#;
+        let auth = parse_auth_response(
+            body,
+            reqwest::StatusCode::BAD_REQUEST,
+            "https://staging.coinwat.ch/api/auth/login",
+        )
+        .expect("JSON auth response should parse");
+        assert!(!auth.success);
+        assert_eq!(auth.error.as_deref(), Some("Invalid login credentials"));
     }
 }

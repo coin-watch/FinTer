@@ -175,8 +175,8 @@ impl AppSettings {
         Self {
             server_url: data
                 .server_url
-                .clone()
-                .filter(|url| !url.trim().is_empty())
+                .as_deref()
+                .and_then(crate::data::client::normalize_api_origin)
                 .unwrap_or_else(crate::data::client::default_api_url)
                 .into(),
             dark_mode: data.dark_mode.as_deref() == Some("dark"),
@@ -224,7 +224,7 @@ impl AppSettings {
 
     pub fn to_settings_data(&self) -> SettingsData {
         SettingsData {
-            server_url: Some(self.server_url.to_string()),
+            server_url: crate::data::client::normalize_api_origin(&self.server_url),
             dark_mode: Some(if self.dark_mode {
                 "dark".into()
             } else {

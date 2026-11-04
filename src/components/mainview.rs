@@ -355,9 +355,22 @@ impl MainView {
         // Load guest settings to apply theme/timezone independently of cloud user
         if let Some(path) = Self::guest_settings_path() {
             if let Ok(json) = std::fs::read_to_string(&path) {
-                if let Ok(settings) = serde_json::from_str::<crate::data::models::SettingsData>(&json) {
-                    let theme_name = settings.theme.clone().unwrap_or_else(|| "gruvbox".to_string());
-                    let dark_mode = settings.dark_mode.as_ref().map(|s| s == "dark").unwrap_or(false);
+                if let Ok(mut settings) =
+                    serde_json::from_str::<crate::data::models::SettingsData>(&json)
+                {
+                    settings.server_url = settings
+                        .server_url
+                        .as_deref()
+                        .and_then(crate::data::client::normalize_api_origin);
+                    let theme_name = settings
+                        .theme
+                        .clone()
+                        .unwrap_or_else(|| "gruvbox".to_string());
+                    let dark_mode = settings
+                        .dark_mode
+                        .as_ref()
+                        .map(|s| s == "dark")
+                        .unwrap_or(false);
                     apply_theme(&theme_name, dark_mode, cx);
                     self.user_settings = Some(settings);
                     if let Some(home) = &self.home_page {
@@ -444,15 +457,16 @@ impl MainView {
         };
         if let Some(path) = startup_settings_path {
             if let Ok(json) = std::fs::read_to_string(&path) {
-                if let Ok(settings) =
+                if let Ok(mut settings) =
                     serde_json::from_str::<crate::data::models::SettingsData>(&json)
                 {
-                    if let Some(server_url) = settings
+                    // Drop legacy/invalid origins so they cannot be re-applied
+                    // or written back to the server settings record.
+                    settings.server_url = settings
                         .server_url
                         .as_deref()
-                        .map(str::trim)
-                        .filter(|url| !url.is_empty())
-                    {
+                        .and_then(crate::data::client::normalize_api_origin);
+                    if let Some(server_url) = settings.server_url.as_deref() {
                         self.api_client.set_base_url(server_url);
                     }
                     let theme_name = settings
@@ -999,8 +1013,8 @@ impl MainView {
         let local_server_url = self
             .user_settings
             .as_ref()
-            .and_then(|settings| settings.server_url.clone())
-            .filter(|url| !url.trim().is_empty());
+            .and_then(|settings| settings.server_url.as_deref())
+            .and_then(crate::data::client::normalize_api_origin);
         self.user_settings = local_server_url.map(|server_url| SettingsData {
             server_url: Some(server_url),
             ..Default::default()
@@ -1319,8 +1333,8 @@ impl MainView {
         let local_server_url = self
             .user_settings
             .as_ref()
-            .and_then(|settings| settings.server_url.clone())
-            .filter(|url| !url.trim().is_empty());
+            .and_then(|settings| settings.server_url.as_deref())
+            .and_then(crate::data::client::normalize_api_origin);
 
         cx.spawn(async move |this, cx| {
             let (settings_res, presets_res, modules_res) = rt
@@ -1343,18 +1357,15 @@ impl MainView {
             let mut current_dashboard = match settings_res {
                 Ok(Some(mut user_settings)) => {
                     // Preserve the locally configured backend when the shared
-                    // server record has no `serverUrl` (the common case for
-                    // settings created by the web client).
-                    if user_settings
+                    // server record has no usable `serverUrl` (the common case
+                    // for settings created by the web client, or a legacy
+                    // marketing origin persisted by an older build).
+                    user_settings.settings.server_url = user_settings
                         .settings
                         .server_url
                         .as_deref()
-                        .map(str::trim)
-                        .unwrap_or("")
-                        .is_empty()
-                    {
-                        user_settings.settings.server_url = local_server_url.clone();
-                    }
+                        .and_then(crate::data::client::normalize_api_origin)
+                        .or_else(|| local_server_url.clone());
 
                     let dashboard = user_settings.settings.current_dashboard.clone();
                     tracing::info!(
@@ -1378,10 +1389,9 @@ impl MainView {
                         if let Some(server_url) = settings_clone
                             .server_url
                             .as_deref()
-                            .map(str::trim)
-                            .filter(|url| !url.is_empty())
+                            .and_then(crate::data::client::normalize_api_origin)
                         {
-                            view.api_client.set_base_url(server_url);
+                            view.api_client.set_base_url(&server_url);
                         }
                         // Apply theme from loaded settings
                         let theme_name = settings_clone
@@ -1717,14 +1727,16 @@ impl MainView {
             let configured_server_url = settings_data
                 .server_url
                 .as_deref()
-                .map(str::trim)
-                .filter(|url| !url.is_empty());
-            if let Some(server_url) = configured_server_url {
+                .and_then(crate::data::client::normalize_api_origin);
+            let resolved_server_url = configured_server_url.or_else(|| {
+                self.is_authenticated
+                    .then(|| crate::data::client::DEFAULT_CLOUD_API_URL.to_string())
+            });
+            if let Some(server_url) = &resolved_server_url {
                 self.api_client.set_base_url(server_url);
-            } else if self.is_authenticated {
-                self.api_client
-                    .set_base_url(crate::data::client::DEFAULT_CLOUD_API_URL);
             }
+            // Never persist a legacy/invalid origin back to the settings record.
+            settings_data.server_url = resolved_server_url;
 
             // Preserve settings the native settings page does not expose while
             // replacing every field that it manages.
