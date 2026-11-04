@@ -40,6 +40,12 @@ fn install_ccxt_panic_filter() {
 }
 
 fn main() {
+    // CI uses this to verify the endpoint baked into the release binary.
+    if std::env::args().any(|arg| arg == "--print-update-url") {
+        println!("{}", finter::data::version::version_check_url());
+        return;
+    }
+
     install_ccxt_panic_filter();
 
     // Initialise tracing so bridge logs (info!, warn!, debug!) are visible.

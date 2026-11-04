@@ -87,17 +87,27 @@ jobs:
         run: |
           binary="target/${{ matrix.target }}/release/finter${{ matrix.extension }}"
           if [ -n "$FINTER_VERSION_URL" ]; then
-            if ! LC_ALL=C grep -aqF -- "$FINTER_VERSION_URL" "$binary"; then
-              echo "::error::FINTER_VERSION_URL was not embedded in $binary"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              # GUI-subsystem binaries do not reliably inherit stdout, so inspect the file.
+              if ! LC_ALL=C grep -aqF -- "$FINTER_VERSION_URL" "$binary"; then
+                echo "::error::FINTER_VERSION_URL was not embedded in $binary"
+                exit 1
+              fi
+              actual="$FINTER_VERSION_URL"
+            else
+              actual=$(env -u FINTER_VERSION_URL "$binary" --print-update-url)
+            fi
+            if [ "$actual" != "$FINTER_VERSION_URL" ]; then
+              echo "::error::Update endpoint mismatch: expected '$FINTER_VERSION_URL', got '$actual'"
               echo "Generated version_url.rs files:"
               find "target/${{ matrix.target }}/release/build" -name version_url.rs \
                 -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \; || true
               echo "URL strings found in binary:"
-              LC_ALL=C grep -aoE 'https://[^"[:space:]]+' "$binary" | sort -u | head -20 || true
+              strings "$binary" | grep -oE 'https://[^"[:space:]]+' | sort -u | head -20 || true
               ls -l "$binary"
               exit 1
             fi
-            echo "Embedded update endpoint: $FINTER_VERSION_URL"
+            echo "Embedded update endpoint: $actual"
           else
             echo "Update checks disabled for this build"
           fi
