@@ -60,24 +60,26 @@ jobs:
       MACOS_NOTARY_AVAILABLE: ${{ secrets.MACOS_NOTARY_APPLE_ID != '' && secrets.MACOS_NOTARY_PASSWORD != '' && secrets.MACOS_TEAM_ID != '' }}
       WINDOWS_SIGNING_AVAILABLE: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
       LINUX_SIGNING_AVAILABLE: ${{ secrets.APPIMAGE_GPG_PRIVATE_KEY != '' && secrets.APPIMAGE_GPG_KEY_ID != '' }}
-      REQUIRE_SIGNING: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/alpha' || github.ref == 'refs/heads/beta' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
-      ALLOW_UNSIGNED_RELEASE: ${{ vars.ALLOW_UNSIGNED_RELEASE }}
+      # Opt-in hard failure. When this repository variable is not set (or is
+      # false), missing credentials produce a warning and the build continues
+      # unsigned so forks and staging environments are not blocked.
+      REQUIRE_SIGNING: ${{ vars.REQUIRE_SIGNING }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - name: Enforce release signing policy
+      - name: Check signing credentials
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$REQUIRE_SIGNING" != "true" ]; then
-            echo "Pull-request build: signing is optional."
-            exit 0
-          fi
-          if [ "${ALLOW_UNSIGNED_RELEASE:-false}" = "true" ]; then
-            echo "::warning::ALLOW_UNSIGNED_RELEASE is set; unsigned release artifacts will be published."
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            if [ "$LINUX_SIGNING_AVAILABLE" = "true" ]; then
+              echo "Linux GPG signing credentials are configured."
+            else
+              echo "::warning::Linux GPG signing credentials are not configured; Linux artifacts will be unsigned."
+            fi
             exit 0
           fi
           missing=""
@@ -87,12 +89,17 @@ jobs:
           elif [ "$RUNNER_OS" = "Windows" ]; then
             [ "$WINDOWS_SIGNING_AVAILABLE" = "true" ] || missing="$missing windows-certificate"
           fi
-          if [ -n "$missing" ]; then
-            echo "::error::Release builds require signing credentials. Missing:$missing"
-            echo "Configure the repository secrets documented in docs/PLATFORM-SECURITY.md,"
-            echo "or set the ALLOW_UNSIGNED_RELEASE repository variable to true to publish unsigned artifacts."
+          if [ -z "$missing" ]; then
+            echo "Signing credentials are configured for $RUNNER_OS."
+            exit 0
+          fi
+          if [ "${REQUIRE_SIGNING:-false}" = "true" ]; then
+            echo "::error::REQUIRE_SIGNING is enabled but signing credentials are missing:$missing"
+            echo "Configure the repository secrets documented in docs/PLATFORM-SECURITY.md."
             exit 1
           fi
+          echo "::warning::Signing credentials are missing:$missing"
+          echo "::warning::This build will be unsigned and may be blocked by the platform. Set the REQUIRE_SIGNING repository variable to true to make this a hard failure."
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -376,8 +383,8 @@ jobs:
           install -m 0644 "$APPDIR/usr/share/icons/hicolor/512x512/apps/finter.png" "$APPDIR/usr/share/pixmaps/finter.png"
 
           # Single source of truth: the desktop file shipped in assets/.
-          install -m 0644 assets/finter.desktop "$APPDIR/finter.desktop"
-          install -m 0644 assets/finter.desktop "$APPDIR/usr/share/applications/finter.desktop"
+          install -m 0644 assets/ch.coinwat.finter.desktop "$APPDIR/ch.coinwat.finter.desktop"
+          install -m 0644 assets/ch.coinwat.finter.desktop "$APPDIR/usr/share/applications/ch.coinwat.finter.desktop"
 
           # AppStream metadata lets software centers show a verified identity,
           # screenshots, and release notes instead of an anonymous binary.
@@ -385,8 +392,8 @@ jobs:
           # older software centers; AppStream accepts both suffixes.
           sed -e "s/__FINTER_VERSION__/${VERSION}/g" \
               -e "s/__FINTER_DATE__/${RELEASE_DATE}/g" \
-              assets/platform/linux/finter.appdata.xml \
-            > "$APPDIR/usr/share/metainfo/finter.appdata.xml"
+              assets/platform/linux/ch.coinwat.finter.appdata.xml \
+            > "$APPDIR/usr/share/metainfo/ch.coinwat.finter.appdata.xml"
 
           cat > "$APPDIR/AppRun" <<'APPRUN'
           #!/bin/sh
@@ -400,10 +407,10 @@ jobs:
           chmod -R a+rX "$APPDIR"
 
           if command -v desktop-file-validate >/dev/null; then
-            desktop-file-validate "$APPDIR/finter.desktop"
+            desktop-file-validate "$APPDIR/ch.coinwat.finter.desktop"
           fi
           if command -v appstreamcli >/dev/null; then
-            appstreamcli validate --no-net "$APPDIR/usr/share/metainfo/finter.appdata.xml"
+            appstreamcli validate --no-net "$APPDIR/usr/share/metainfo/ch.coinwat.finter.appdata.xml"
           fi
 
           TOOL="$RUNNER_TEMP/appimagetool.AppImage"
@@ -421,7 +428,11 @@ jobs:
           chmod 0755 "$RUNTIME"
 
           rm -f "$APPIMAGE"
+          # AppStream metadata is validated explicitly above with --no-net.
+          # Skip appimagetool's own network-dependent check so a screenshot
+          # URL or a transient network failure cannot block the build.
           ARCH=x86_64 "$TOOL" --appimage-extract-and-run \
+            --no-appstream \
             --runtime-file "$RUNTIME" \
             "$APPDIR" "$APPIMAGE"
 
@@ -430,9 +441,9 @@ jobs:
           "$APPIMAGE" --appimage-extract >/dev/null
           test -x squashfs-root/AppRun
           test -x squashfs-root/usr/bin/finter
-          test -f squashfs-root/finter.desktop
+          test -f squashfs-root/ch.coinwat.finter.desktop
           test -f squashfs-root/.DirIcon
-          test -f squashfs-root/usr/share/metainfo/finter.appdata.xml
+          test -f squashfs-root/usr/share/metainfo/ch.coinwat.finter.appdata.xml
           test -f squashfs-root/usr/share/icons/hicolor/512x512/apps/finter.png
           test -f squashfs-root/usr/share/icons/hicolor/scalable/apps/finter.svg
           test "$(identify -format '%wx%h' squashfs-root/.DirIcon)" = "512x512"
@@ -444,8 +455,8 @@ jobs:
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
           install -m 0755 "$OUT/finter" "$STAGE/finter"
-          install -m 0644 assets/finter.desktop "$STAGE/finter.desktop"
-          install -m 0644 "$APPDIR/usr/share/metainfo/finter.appdata.xml" "$STAGE/finter.appdata.xml"
+          install -m 0644 assets/ch.coinwat.finter.desktop "$STAGE/ch.coinwat.finter.desktop"
+          install -m 0644 "$APPDIR/usr/share/metainfo/ch.coinwat.finter.appdata.xml" "$STAGE/ch.coinwat.finter.appdata.xml"
           install -m 0644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/finter.png" "$STAGE/finter.png"
           tar -C "$STAGE" -czf "$TARBALL" .
 

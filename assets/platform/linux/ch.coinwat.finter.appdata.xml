@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>finter</id>
+  <id>ch.coinwat.finter</id>
   <name>FinTer</name>
   <summary>Native market terminal for live crypto and financial charts</summary>
   <metadata_license>MIT</metadata_license>
@@ -21,16 +21,15 @@
       <li>Local-first guest mode with optional cloud sync.</li>
     </ul>
   </description>
-  <launchable type="desktop-id">finter.desktop</launchable>
+  <launchable type="desktop-id">ch.coinwat.finter.desktop</launchable>
   <url type="homepage">https://github.com/coin-watch/FinTer</url>
   <url type="bugtracker">https://github.com/coin-watch/FinTer/issues</url>
   <provides>
     <binary>finter</binary>
   </provides>
   <categories>
-    <category>Finance</category>
     <category>Office</category>
-    <category>Network</category>
+    <category>Finance</category>
   </categories>
   <icon type="stock">finter</icon>
   <screenshots>

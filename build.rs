@@ -45,7 +45,10 @@ fn main() {
         if let Ok(out_dir) = env::var("OUT_DIR") {
             if let Some(target_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
                 let _ = std::fs::copy("assets/app-icon.png", target_dir.join("finter.png"));
-                let _ = std::fs::copy("assets/finter.desktop", target_dir.join("finter.desktop"));
+                let _ = std::fs::copy(
+                    "assets/ch.coinwat.finter.desktop",
+                    target_dir.join("ch.coinwat.finter.desktop"),
+                );
             }
         }
     }

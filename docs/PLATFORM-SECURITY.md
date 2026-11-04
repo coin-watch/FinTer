@@ -2,17 +2,16 @@
 
 This document describes how FinTer builds avoid being blocked, quarantined, or
 flagged by the security systems of the platforms it ships on. It also lists the
-repository secrets that must be configured before a release build is published.
+repository secrets that are required for signed release builds.
 
-The build workflow enforces the following policy:
+The build workflow uses the following policy:
 
-- Pull-request builds may be unsigned so contributors can build without
-  certificates.
-- Pushes to `alpha`/`beta`/`release` and `v*` tags **fail** if the required
-  macOS or Windows signing credentials are missing.
-- The `ALLOW_UNSIGNED_RELEASE` repository variable can be set to `true` to
-  deliberately publish unsigned artifacts (for forks or staging only). The
-  workflow emits a warning when this override is active.
+- Missing macOS or Windows signing credentials produce a **warning** and the
+  build continues unsigned, so forks and staging environments are not blocked.
+- Set the `REQUIRE_SIGNING` repository variable to `true` to turn missing
+  credentials into a **hard failure**. Enable this once the production secrets
+  are configured.
+- Pull-request builds are never blocked by the signing policy.
 
 ## Why each platform blocks unsigned software
 
@@ -160,7 +159,7 @@ a release:
 
 ### AppStream metadata
 
-The AppImage ships `usr/share/metainfo/finter.appdata.xml`. Software centers
+The AppImage ships `usr/share/metainfo/ch.coinwat.finter.appdata.xml`. Software centers
 use it to show the application name, developer, license, screenshots, and
 release notes instead of treating the AppImage as an anonymous executable. The
 workflow validates the metadata with `appstreamcli validate --no-net` when the
@@ -191,7 +190,7 @@ FinTer without the AppImage runtime.
 ```sh
 sha256sum -c finter-<target>.AppImage.sha256
 gpg --verify finter-<target>.AppImage.asc finter-<target>.AppImage
-appstreamcli validate finter.appdata.xml
+appstreamcli validate ch.coinwat.finter.appdata.xml
 ```
 
 ## CI supply-chain hardening

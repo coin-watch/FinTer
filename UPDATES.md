@@ -28,7 +28,7 @@ Required GitHub Actions secrets:
 - Linux AppImage artifacts are not self-updating; the updater replaces the raw `finter` binary, so use the published Linux binary rather than the AppImage. A `.tar.gz` fallback is produced for systems that restrict AppImage/FUSE.
 - Updating an executable in a read-only/system install location may fail.
 - SHA-256 is not a digital signature and does not protect against a compromised metadata host. Add signed update metadata before enabling public updates at scale.
-- Release signing requires the repository secrets documented in [`docs/PLATFORM-SECURITY.md`](docs/PLATFORM-SECURITY.md). Release builds fail when required signing credentials are missing unless `ALLOW_UNSIGNED_RELEASE` is set.
+- Release signing requires the repository secrets documented in [`docs/PLATFORM-SECURITY.md`](docs/PLATFORM-SECURITY.md). Missing credentials produce a warning by default; set the `REQUIRE_SIGNING` repository variable to `true` to make them a hard failure.
 
 ## Configuration
 

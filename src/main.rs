@@ -214,14 +214,22 @@ fn install_linux_desktop_entry() {
         Exec={exec} %u\n\
         Icon=finter\n\
         Terminal=false\n\
-        Categories=Finance;Office;Network;\n\
+        Categories=Office;Finance;\n\
         StartupWMClass=finter\n\
         StartupNotify=true\n\
         Keywords=crypto;trading;finance;terminal;bitcoin;\n"
     );
 
+    // The launcher uses a reverse-DNS file name so it matches the AppStream
+    // component ID. Remove the legacy `finter.desktop` entry so the same app
+    // does not appear twice in application menus.
+    let legacy_desktop = data_dir.join("applications/finter.desktop");
+    if legacy_desktop.exists() {
+        changed |= std::fs::remove_file(&legacy_desktop).is_ok();
+    }
+
     changed |= write_if_changed(
-        &data_dir.join("applications/finter.desktop"),
+        &data_dir.join("applications/ch.coinwat.finter.desktop"),
         desktop_content.as_bytes(),
     );
 
