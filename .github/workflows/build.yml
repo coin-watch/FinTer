@@ -125,7 +125,7 @@ jobs:
             libwayland-dev libvulkan-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libasound2-dev \
-            libssl-dev pkg-config \
+            libssl-dev libdbus-1-dev pkg-config \
             desktop-file-utils zsync file \
             appstream \
             imagemagick

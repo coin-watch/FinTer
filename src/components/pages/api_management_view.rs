@@ -248,7 +248,7 @@ impl ApiManagementView {
             self.editing_id = None;
             self.feedback_message = Some((
                 false,
-                "API key stored securely in local vault (~/.config/finter/api_providers.json)."
+                "API key encrypted with AES-256-GCM and stored in ~/.config/finter/api_providers.json."
                     .to_string(),
             ));
         }
@@ -368,14 +368,14 @@ impl Render for ApiManagementView {
                                                     .text_xs()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(primary_color)
-                                                    .child("POSIX 0600 RESTRICTED"),
+                                                    .child("AES-256-GCM · 0600"),
                                             ),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(text_muted)
-                                            .child("All API keys and secrets are saved exclusively in ~/.config/finter/api_providers.json with user-only permissions. Zero cloud sync, zero telemetry."),
+                                            .child("All API keys and secrets are encrypted with AES-256-GCM before being written to ~/.config/finter/api_providers.json (user-only permissions). The encryption key is held in the OS keyring, never in the config file. Zero cloud sync, zero telemetry."),
                                     ),
                             ),
                     ),
@@ -720,7 +720,7 @@ impl Render for ApiManagementView {
                                 .text_center()
                                 .text_xs()
                                 .text_color(text_muted)
-                                .child("Connect Binance, Bybit, OKX, or other supported exchanges to enable authenticated order execution, balance tracking, and private WebSocket streams. All credentials stay locally encrypted."),
+                                .child("Connect Binance, Bybit, OKX, or other supported exchanges to enable authenticated order execution, balance tracking, and private WebSocket streams. All credentials are encrypted at rest with AES-256-GCM."),
                         )
                         .child(
                             Button::new("add-first-key-btn")

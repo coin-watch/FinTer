@@ -1,10 +1,17 @@
 //! Local-only exchange API credentials.
-//! Stored in ~/.config/finter/api_providers.json with restricted 0600 permissions.
-//! Never synced to the remote server or included in cloud backups.
+//!
+//! Credentials are encrypted with AES-256-GCM before being written to
+//! `~/.config/finter/api_providers.json` (mode 0600). The encryption key lives
+//! in the OS keyring and is only loaded into process memory while FinTer is
+//! running, so the on-disk file is ciphertext at rest. Nothing is synced to the
+//! remote server or included in cloud backups.
 use anyhow::{Context, Result};
 use gpui::SharedString;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use zeroize::Zeroizing;
+
+use crate::data::credential_crypto;
 
 pub const CCXT_EXCHANGES: &[&str] = &[
     "alpaca", "apex", "aster", "backpack", "bequant", "bigone", "binance",
@@ -59,34 +66,49 @@ fn credentials_file_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|p| p.join("finter/api_providers.json"))
 }
 
-pub fn load() -> Vec<ExchangeCredential> {
-    let Some(path) = credentials_file_path() else { return Vec::new(); };
-    let Ok(bytes) = std::fs::read(&path) else { return Vec::new(); };
-
-    // Try parsing as new ExchangeCredential list
-    if let Ok(mut list) = serde_json::from_slice::<Vec<ExchangeCredential>>(&bytes) {
-        if !list.is_empty() && !list[0].exchange.is_empty() {
-            for (idx, item) in list.iter_mut().enumerate() {
-                if item.id.trim().is_empty() {
-                    item.id = format!("{}-{}", item.exchange.to_lowercase(), idx + 1);
-                }
-                if item.label.trim().is_empty() {
-                    item.label = format!("{} Account", item.exchange.to_uppercase());
-                }
-            }
-            return list;
+/// Fill in stable ids and labels for credentials that predate those fields.
+fn normalize(list: &mut [ExchangeCredential]) {
+    for (idx, item) in list.iter_mut().enumerate() {
+        if item.id.trim().is_empty() {
+            item.id = format!("{}-{}", item.exchange.to_lowercase(), idx + 1);
+        }
+        if item.label.trim().is_empty() {
+            item.label = format!("{} Account", item.exchange.to_uppercase());
         }
     }
-    // Try parsing as legacy ApiProvider list
-    if let Ok(list) = serde_json::from_slice::<Vec<ApiProvider>>(&bytes) {
-        return list
+}
+
+/// Parse the pre-encryption on-disk formats.
+///
+/// Returns `None` when the bytes are neither the current `ExchangeCredential`
+/// list nor the legacy `ApiProvider` list.
+fn parse_plaintext(bytes: &[u8]) -> Option<Vec<ExchangeCredential>> {
+    // New ExchangeCredential list.
+    if let Ok(mut list) = serde_json::from_slice::<Vec<ExchangeCredential>>(bytes) {
+        if !list.is_empty() && !list[0].exchange.is_empty() {
+            normalize(&mut list);
+            return Some(list);
+        }
+    }
+
+    // Legacy ApiProvider list.
+    if let Ok(list) = serde_json::from_slice::<Vec<ApiProvider>>(bytes) {
+        let mut mapped: Vec<ExchangeCredential> = list
             .into_iter()
             .enumerate()
             .map(|(idx, p)| {
-                let ex = if !p.base_url.is_empty() { p.base_url } else { p.name.to_lowercase() };
+                let ex = if !p.base_url.is_empty() {
+                    p.base_url
+                } else {
+                    p.name.to_lowercase()
+                };
                 ExchangeCredential {
                     id: format!("{}-{}", ex.to_lowercase(), idx + 1),
-                    label: if !p.name.is_empty() { p.name } else { format!("{} Key", ex.to_uppercase()) },
+                    label: if !p.name.is_empty() {
+                        p.name
+                    } else {
+                        format!("{} Key", ex.to_uppercase())
+                    },
                     exchange: ex,
                     api_key: p.api_key,
                     api_secret: p.api_secret,
@@ -96,29 +118,88 @@ pub fn load() -> Vec<ExchangeCredential> {
                 }
             })
             .collect();
+        normalize(&mut mapped);
+        return Some(mapped);
     }
-    Vec::new()
+
+    None
+}
+
+pub fn load() -> Vec<ExchangeCredential> {
+    let Some(path) = credentials_file_path() else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+
+    if credential_crypto::is_encrypted(&bytes) {
+        return match credential_crypto::decrypt(&bytes) {
+            Ok(plaintext) => match serde_json::from_slice::<Vec<ExchangeCredential>>(&plaintext) {
+                Ok(mut list) => {
+                    normalize(&mut list);
+                    list
+                }
+                Err(e) => {
+                    tracing::error!("decrypted API credentials are malformed: {e}");
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                tracing::error!("failed to decrypt API credentials: {e:#}");
+                Vec::new()
+            }
+        };
+    }
+
+    // Legacy plaintext file: read it, then re-save it encrypted in place.
+    let Some(list) = parse_plaintext(&bytes) else {
+        tracing::error!(
+            "API credential file {} is neither encrypted nor a recognised legacy format",
+            path.display()
+        );
+        return Vec::new();
+    };
+
+    tracing::warn!("migrating plaintext API credentials to encrypted storage");
+    if let Err(e) = save(&list) {
+        tracing::error!("failed to encrypt migrated API credentials: {e:#}");
+    }
+    list
 }
 
 pub fn save(items: &[ExchangeCredential]) -> Result<()> {
     use std::io::Write;
+
     let path = credentials_file_path().context("Local configuration directory unavailable")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Keep the containing directory owner-only as well.
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
+
+    let plaintext = Zeroizing::new(serde_json::to_vec(items)?);
+    let encrypted = credential_crypto::encrypt(&plaintext[..])?;
+
     let tmp = path.with_extension("tmp");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp)?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    f.write_all(&serde_json::to_vec_pretty(items)?)?;
+    f.write_all(&encrypted)?;
     f.sync_all()?;
     drop(f);
     std::fs::rename(tmp, path)?;
@@ -310,6 +391,31 @@ mod tests {
         assert_eq!(creds[1].label, "Scalp Bot");
         assert_eq!(creds[1].passphrase, "pass");
         assert_eq!(creds[1].is_testnet, true);
+    }
+
+    #[test]
+    fn test_legacy_plaintext_detection_and_normalization() {
+        let json = br#"[{"exchange":"binance","api_key":"k","api_secret":"s"}]"#;
+        let list = parse_plaintext(json).expect("legacy plaintext list");
+        assert_eq!(list[0].id, "binance-1");
+        assert_eq!(list[0].label, "BINANCE Account");
+    }
+
+    #[test]
+    fn test_legacy_api_provider_migration() {
+        let json = br#"[{"name":"My Binance","kind":"cex","base_url":"binance","api_key":"k","api_secret":"s"}]"#;
+        let list = parse_plaintext(json).expect("legacy provider list");
+        assert_eq!(list[0].exchange, "binance");
+        assert_eq!(list[0].label, "My Binance");
+    }
+
+    #[test]
+    fn test_encrypted_envelope_is_not_plaintext() {
+        let envelope =
+            br#"{"version":1,"alg":"AES-256-GCM","nonce":"AAAA","ciphertext":"AAAA"}"#;
+        assert!(credential_crypto::is_encrypted(envelope));
+        assert!(parse_plaintext(envelope).is_none());
+        assert!(!credential_crypto::is_encrypted(br#"[{"exchange":"binance"}]"#));
     }
 
     #[test]

@@ -66,7 +66,7 @@ sudo apt-get install -y \
   libxkbcommon-dev libxkbcommon-x11-dev \
   libwayland-dev libvulkan-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libssl-dev pkg-config
+  libssl-dev libdbus-1-dev pkg-config
 ```
 
 </details>
@@ -114,13 +114,16 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 
 **Credentials.** JWTs are stored in the operating system's credential vault through `keyring-rs` — Windows Credential Manager, macOS Keychain, or Linux Secret Service. Plaintext passwords are never persisted to disk.
 
+**Exchange API keys.** API keys, secrets, and passphrases are encrypted with AES-256-GCM before being written to `~/.config/finter/api_providers.json` (mode `0600`). The 256-bit key is generated on first use, stored in the OS keyring under `finter/api-credentials-key`, and only held in process memory while FinTer is running. Legacy plaintext credential files are encrypted in place on first load.
+
 **Guest and cloud data never share files.**
 
 | | Guest / offline | Cloud account |
 | --- | --- | --- |
 | Layout | `~/.config/finter/guest_layout.json` | `~/.config/finter/cloud_layout.json` |
 | Settings | `~/.config/finter/guest_settings.json` | `~/.config/finter/cloud_settings.json` |
-| Credentials | — | OS keyring (`finter/session`) |
+| Session credentials | — | OS keyring (`finter/session`) |
+| Exchange API keys | AES-256-GCM in `api_providers.json`; key in OS keyring (`finter/api-credentials-key`) | AES-256-GCM in `api_providers.json`; key in OS keyring (`finter/api-credentials-key`) |
 
 Cloud files are cached locally and synchronized with the backend. Logging out restores the guest workspace immediately, without erasing or altering cloud configurations.
 
@@ -131,6 +134,8 @@ Tab preferences (which dashboard tabs open on startup) are local-only and stored
 ## Privacy & security
 
 FinTer does not ship API keys, application credentials, user data, session tokens, database dumps, compiled artifacts, or vendored dependency build directories. Authentication tokens are obtained at runtime and stored through the OS keyring where available. When a keyring is unavailable, the fallback session file lives in the per-user configuration directory and is restricted to the current user on Unix systems.
+
+Exchange API credentials are never stored in plaintext. They are encrypted with AES-256-GCM and written to `~/.config/finter/api_providers.json` with owner-only permissions; the key is kept in the OS keyring. If the OS keyring is unavailable, FinTer cannot encrypt new credentials or decrypt existing ones, and it reports the failure instead of silently downgrading to an unprotected key file.
 
 Release builds are signed for each platform so operating-system security gates do not block them: macOS builds are signed with a Developer ID, hardened at runtime, notarized, and stapled; Windows builds are Authenticode-signed and timestamped; Linux AppImages ship AppStream metadata and an optional GPG signature. See [Platform security and release signing](docs/PLATFORM-SECURITY.md) for the required secrets, verification commands, and the release signing policy.
 

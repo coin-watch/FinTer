@@ -6,6 +6,7 @@ pub mod auth;
 pub mod bridge;
 pub mod candle_feed;
 pub mod client;
+pub mod credential_crypto;
 pub mod credits;
 pub mod dashboard_store;
 pub mod error;

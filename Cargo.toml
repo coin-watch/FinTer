@@ -57,7 +57,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
-keyring = { version = "3", features = ["linux-native", "apple-native", "windows-native"] }
+# `linux-native-sync-persistent` keeps the keyutils in-memory cache but backs it
+# with Secret Service so credentials survive reboots. Plain `linux-native` is
+# kernel-memory only and would make encrypted API credentials unrecoverable
+# after a restart.
+keyring = { version = "3", features = ["linux-native-sync-persistent", "apple-native", "windows-native", "crypto-rust"] }
 dirs = "5"
 rust-i18n = "3"
 smallvec = "1"
@@ -67,6 +71,9 @@ webbrowser = "1.0"
 url = "2"
 urlencoding = "2.1"
 sha2 = "0.10"
+aes-gcm = "0.10"
+base64 = "0.22"
+zeroize = "1"
 uuid = { version = "1.26.1", features = ["v4"] }
 rodio = { version = "0.19", default-features = false, features = ["wav"] }
 # Venues are enabled through the app's `exchange-*` features above, so a
