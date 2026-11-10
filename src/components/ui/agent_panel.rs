@@ -9,6 +9,9 @@ use gpui_component::theme::ActiveTheme;
 use gpui_component::text::TextView;
 use serde_json::Value;
 
+use crate::components::ui::agent_chart::AgentChart;
+use crate::data::agent::{ChartRequest, MessageSegment};
+
 #[derive(Clone)]
 struct ChatMessage {
     prompt: String,
@@ -39,6 +42,8 @@ pub struct AgentPanel {
     dashboard_count: usize,
     module_count: usize,
     context_bytes: usize,
+    /// Inline chart entities keyed by message + segment + market identity.
+    chart_views: std::collections::HashMap<String, Entity<AgentChart>>,
 }
 
 impl AgentPanel {
@@ -79,6 +84,7 @@ impl AgentPanel {
             dashboard_count: 0,
             module_count: 0,
             context_bytes: 0,
+            chart_views: std::collections::HashMap::new(),
         }
     }
 
@@ -93,6 +99,7 @@ impl AgentPanel {
         self.history.clear();
         self.response.clear();
         self.error = None;
+        self.chart_views.clear();
         self.chat_scroll.scroll_to_bottom();
         cx.notify();
     }
@@ -111,6 +118,7 @@ impl AgentPanel {
             }).collect();
             self.response.clear();
             self.error = None;
+            self.chart_views.clear();
             self.chat_scroll.scroll_to_bottom();
             cx.notify();
         }
@@ -149,6 +157,10 @@ impl AgentPanel {
         self.module_count = context.get("dashboards").and_then(Value::as_array).map_or(0, |dashboards| dashboards.iter().map(|d| d.get("market_data").map_or(0, |data| data.as_object().map_or(0, |obj| obj.values().map(|v| v.as_array().map_or(0, Vec::len)).sum()))).sum());
         self.context_bytes = serde_json::to_vec(&context).map_or(0, |v| v.len());
         self.context = context;
+    }
+
+    fn chart_key(message_index: usize, segment_index: usize, request: &ChartRequest) -> String {
+        format!("{message_index}:{segment_index}:{}", request.cache_key())
     }
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.prompt.trim().to_string();
@@ -255,7 +267,7 @@ impl AgentPanel {
 
     fn ensure_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.input.is_some() { return; }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Ask about your dashboards..."));
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Ask about your dashboards or request a chart..."));
         cx.subscribe_in(&input, window, |panel, _input, event: &InputEvent, window, cx| {
             match event {
                 InputEvent::Change => {
@@ -296,13 +308,47 @@ impl Render for AgentPanel {
             self.chat_scroll.scroll_to_bottom();
         }
 
+        // Parse completed replies once so inline charts can be materialised and
+        // rendered alongside their surrounding markdown.
+        let parsed_messages: Vec<Vec<MessageSegment>> = self
+            .history
+            .iter()
+            .map(|message| {
+                if message.typing {
+                    Vec::new()
+                } else {
+                    crate::data::agent::parse_message_segments(&message.response)
+                }
+            })
+            .collect();
+
+        let mut chart_entities: std::collections::HashMap<String, Entity<AgentChart>> =
+            std::collections::HashMap::new();
+        for (message_index, segments) in parsed_messages.iter().enumerate() {
+            for (segment_index, segment) in segments.iter().enumerate() {
+                let MessageSegment::Chart(request) = segment else {
+                    continue;
+                };
+                let key = Self::chart_key(message_index, segment_index, request);
+                let entity = self
+                    .chart_views
+                    .entry(key.clone())
+                    .or_insert_with(|| cx.new(|cx| AgentChart::new(request.clone(), cx)))
+                    .clone();
+                chart_entities.insert(key, entity);
+            }
+        }
+        // Drop entities for messages that no longer exist (new/loaded conversation).
+        self.chart_views
+            .retain(|key, _| chart_entities.contains_key(key));
+
         // Keep each question close to its answer, with more breathing room between exchanges.
         // `overflow_y_scroll` preserves scrolling without drawing a permanent scrollbar.
         let mut chat_view = v_flex().id("agent-response").track_scroll(&self.chat_scroll).w_full().min_w_0().min_h_0().flex_1().overflow_y_scroll().p(px(if compact { 5.0 } else { 8.0 })).gap(px(if compact { 10.0 } else { 16.0 }));
         if self.history.is_empty() {
             chat_view = chat_view.child(
                 div().text_color(colors.muted_foreground).text_sm()
-                    .child("Ask the Agent to analyse the data visible across your open dashboards.")
+                    .child("Ask the Agent to analyse your dashboards or chart any market, e.g. “Chart BTC/USDT on 1h”.")
             );
         } else {
             for (idx, msg) in self.history.iter().enumerate() {
@@ -324,10 +370,11 @@ impl Render for AgentPanel {
                                     .border_1().border_color(if msg.failed { colors.bearish.opacity(0.4) } else { colors.border.opacity(0.4) })
                                     .child(
                                         if msg.typing {
-                                            if msg.response.is_empty() {
-                                                div().text_color(colors.muted_foreground).text_xs().child("Thinking…").into_any_element()
+                                            let visible = crate::data::agent::strip_chart_directives(&msg.response);
+                                            if visible.trim().is_empty() {
+                                                div().text_color(colors.muted_foreground).text_xs().child("Preparing chart…").into_any_element()
                                             } else {
-                                                let lines: Vec<&str> = msg.response.split('\n').collect();
+                                                let lines: Vec<&str> = visible.split('\n').collect();
                                                 let mut content = v_flex().w_full().gap(px(2.0)).text_sm().text_color(colors.foreground);
                                                 let count = lines.len();
                                                 for (i, line) in lines.into_iter().enumerate() {
@@ -344,10 +391,31 @@ impl Render for AgentPanel {
                                                 content.into_any_element()
                                             }
                                         } else {
-                                            TextView::markdown(("agent-msg", idx), msg.response.clone(), window, cx)
-                                                .selectable(true)
-                                                .scrollable(false)
-                                                .into_any_element()
+                                            let mut content = v_flex().w_full().gap(px(6.0)).text_sm().text_color(colors.foreground);
+                                            for (segment_index, segment) in parsed_messages[idx].iter().enumerate() {
+                                                match segment {
+                                                    MessageSegment::Markdown(text) if !text.trim().is_empty() => {
+                                                        content = content.child(
+                                                            TextView::markdown(
+                                                                SharedString::from(format!("agent-msg-{idx}-{segment_index}")),
+                                                                text.clone(),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                            .selectable(true)
+                                                            .scrollable(false),
+                                                        );
+                                                    }
+                                                    MessageSegment::Chart(request) => {
+                                                        let key = Self::chart_key(idx, segment_index, request);
+                                                        if let Some(entity) = chart_entities.get(&key) {
+                                                            content = content.child(entity.clone());
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            content.into_any_element()
                                         }
                                     )
                             )

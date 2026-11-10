@@ -3,6 +3,40 @@ name = "finter"
 version = "0.1.8"
 edition = "2024"
 
+[features]
+# CCXT compiles one generated implementation per venue. Keep the default build
+# to the major spot/futures venues; enable extra venues explicitly, e.g.
+#   cargo build --features exchange-kraken,exchange-coinbaseexchange
+default = [
+    "exchange-binance",
+    "exchange-binanceusdm",
+    "exchange-binancecoinm",
+    "exchange-bybit",
+    "exchange-okx",
+    "exchange-kucoin",
+    "exchange-kucoinfutures",
+]
+# Smallest useful build: Binance spot + USDⓈ-M + COIN-M.
+minimal = [
+    "exchange-binance",
+    "exchange-binanceusdm",
+    "exchange-binancecoinm",
+]
+exchange-binance = ["ccxt/binance"]
+exchange-binanceusdm = ["ccxt/binanceusdm"]
+exchange-binancecoinm = ["ccxt/binancecoinm"]
+exchange-bybit = ["ccxt/bybit"]
+exchange-okx = ["ccxt/okx"]
+exchange-kucoin = ["ccxt/kucoin"]
+exchange-kucoinfutures = ["ccxt/kucoinfutures"]
+exchange-kraken = ["ccxt/kraken"]
+exchange-krakenfutures = ["ccxt/krakenfutures"]
+exchange-coinbaseexchange = ["ccxt/coinbaseexchange"]
+exchange-mexc = ["ccxt/mexc"]
+exchange-htx = ["ccxt/htx"]
+exchange-bitfinex = ["ccxt/bitfinex"]
+exchange-gemini = ["ccxt/gemini"]
+
 [dependencies]
 gpui = "0.2.2"
 gpui-component = "0.5.1"
@@ -35,28 +69,24 @@ urlencoding = "2.1"
 sha2 = "0.10"
 uuid = { version = "1.26.1", features = ["v4"] }
 rodio = { version = "0.19", default-features = false, features = ["wav"] }
-# Disable ccxt's default `all` feature: compiling every exchange exhausts memory.
-# Enable the venues the trade desk can query for live account balances.
-ccxt = { version = "4.5.90", default-features = false, features = [
-    "binance",
-    "binanceusdm",
-    "binancecoinm",
-    "bybit",
-    "okx",
-    "kraken",
-    "krakenfutures",
-    "coinbaseexchange",
-    "kucoin",
-    "kucoinfutures",
-    "mexc",
-    "htx",
-    "bitfinex",
-    "gemini",
-] }
+# Venues are enabled through the app's `exchange-*` features above, so a
+# minimal build does not compile every ccxt exchange implementation.
+ccxt = { version = "4.5.90", default-features = false }
 
 [patch.crates-io]
 gpui = { path = "gpui-patched" }
 gpui-component = { path = "gpui-component-patched" }
+
+# CCXT is only used for authenticated REST calls; skip its debug symbols to keep
+# incremental builds and the target directory smaller.
+[profile.dev.package.ccxt]
+debug = false
+
+[profile.dev.package.ccxt-base]
+debug = false
+
+[profile.dev.package.ccxt-common]
+debug = false
 
 [build-dependencies]
 winres = "0.1.12"

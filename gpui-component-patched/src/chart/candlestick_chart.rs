@@ -146,6 +146,8 @@ where
     show_horizontal_grid: bool,
     show_candles: bool,
     show_volume_pane: bool,
+    /// Whether to draw the last-price line, badge, and countdown.
+    show_last_price: bool,
     subpane_count: usize,
     /// Timestamp/value series painted over the price pane.
     indicator_lines: Vec<(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)>,
@@ -182,6 +184,7 @@ where
             show_horizontal_grid: false,
             show_candles: true,
             show_volume_pane: true,
+            show_last_price: true,
             subpane_count: 0,
             indicator_lines: Vec::new(),
             position_overlays: Vec::new(),
@@ -298,6 +301,12 @@ where
 
     pub fn show_volume_pane(mut self, show: bool) -> Self {
         self.show_volume_pane = show;
+        self
+    }
+
+    /// Toggle the last-price line, badge, and countdown.
+    pub fn show_last_price(mut self, show: bool) -> Self {
+        self.show_last_price = show;
         self
     }
 
@@ -1324,7 +1333,7 @@ where
         // price badge when the cursor hovers on the current price row.
         let mut crosshair_price_badge: Option<(SharedString, Hsla, f32)> = None;
         let last_close_px_y = y_scale.scale(last_close_f);
-        if self.show_candles && last_close_f > 0.0 {
+        if self.show_last_price && self.show_candles && last_close_f > 0.0 {
             let lcp_abs_y = origin.y.as_f32() + last_close_px_y;
             let label_color = if last_candle_is_bullish {
                 bullish_color

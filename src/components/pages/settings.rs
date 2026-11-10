@@ -19,6 +19,59 @@ use std::sync::Arc;
 
 type OnChangeFn = Option<Arc<dyn Fn(&mut App) + Send + Sync>>;
 
+/// Delay applied before cloud settings changes are pushed to the backend so
+/// that rapid edits (e.g. typing a server URL) collapse into a single sync.
+const CLOUD_SYNC_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
+
+/// Shared debounce state for automatic cloud settings sync.
+#[derive(Default)]
+struct CloudSyncState {
+    generation: u64,
+}
+
+/// Commits draft values into the committed settings and schedules a debounced
+/// save. Cloud-synced pages use this instead of an explicit Save button.
+#[derive(Clone)]
+struct CloudSync {
+    draft: Entity<AppSettings>,
+    committed: Entity<AppSettings>,
+    state: Entity<CloudSyncState>,
+    on_change: OnChangeFn,
+}
+
+impl CloudSync {
+    fn commit(&self, cx: &mut App) {
+        let values = self.draft.read(cx).clone();
+        self.committed.update(cx, |committed, _| {
+            committed.apply_cloud_fields(&values);
+        });
+
+        // Only the last change in a burst is allowed to reach the backend.
+        let generation = self.state.update(cx, |state, _| {
+            state.generation = state.generation.wrapping_add(1);
+            state.generation
+        });
+
+        let state = self.state.clone();
+        let on_change = self.on_change.clone();
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            cx.background_executor().timer(CLOUD_SYNC_DEBOUNCE).await;
+            let is_latest = cx
+                .read_entity(&state, |state, _| state.generation == generation)
+                .unwrap_or(false);
+            if !is_latest {
+                return;
+            }
+            let _ = cx.update(|cx| {
+                if let Some(callback) = &on_change {
+                    callback(cx);
+                }
+            });
+        })
+        .detach();
+    }
+}
+
 fn finter_timezones() -> Vec<(SharedString, SharedString)> {
     [
         ("UTC", "UTC"),
@@ -231,6 +284,31 @@ impl AppSettings {
         }
     }
 
+    /// Copy every cloud-synced field from `other` into `self`.
+    ///
+    /// Local-only settings (Agent provider, exchange API keys, startup tabs)
+    /// are intentionally left untouched.
+    pub fn apply_cloud_fields(&mut self, other: &AppSettings) {
+        self.server_url = other.server_url.clone();
+        self.dark_mode = other.dark_mode;
+        self.theme = other.theme.clone();
+        self.enable_animations = other.enable_animations;
+        self.default_exchange = other.default_exchange.clone();
+        self.default_trading_pair = other.default_trading_pair.clone();
+        self.max_fps = other.max_fps;
+        self.enable_price_alerts = other.enable_price_alerts;
+        self.enable_desktop_notifications = other.enable_desktop_notifications;
+        self.enable_sound_alerts = other.enable_sound_alerts;
+        self.auto_save_dashboard = other.auto_save_dashboard;
+        self.data_update_frequency = other.data_update_frequency;
+        self.enable_chart_grid = other.enable_chart_grid;
+        self.enable_magnet_snap = other.enable_magnet_snap;
+        self.auto_check_updates = other.auto_check_updates;
+        self.update_channel = other.update_channel.clone();
+        self.sync_dashboard_tabs = other.sync_dashboard_tabs;
+        self.default_timezone = other.default_timezone.clone();
+    }
+
     pub fn to_settings_data(&self) -> SettingsData {
         SettingsData {
             server_url: crate::data::client::normalize_api_origin(&self.server_url),
@@ -439,6 +517,7 @@ fn update_channel_selector(
 pub struct SettingsPage {
     settings: Entity<AppSettings>,
     committed: Entity<AppSettings>,
+    cloud_sync_state: Entity<CloudSyncState>,
     on_change: OnChangeFn,
     on_channel_selected: OnChangeFn,
     api_management: Entity<ApiManagementView>,
@@ -451,6 +530,7 @@ impl SettingsPage {
         Self {
             settings: cx.new(|_| AppSettings::default()),
             committed: cx.new(|_| AppSettings::default()),
+            cloud_sync_state: cx.new(|_| CloudSyncState::default()),
             on_change: None,
             on_channel_selected: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
@@ -466,6 +546,7 @@ impl SettingsPage {
         Self {
             settings: cx.new(|_| AppSettings::from_settings_data(data, profile)),
             committed: cx.new(|_| AppSettings::from_settings_data(data, profile)),
+            cloud_sync_state: cx.new(|_| CloudSyncState::default()),
             on_change: None,
             on_channel_selected: None,
             api_management: cx.new(|cx| ApiManagementView::new(cx)),
@@ -526,57 +607,55 @@ impl SettingsPage {
 
     fn build_settings(&self, _cx: &App) -> Settings {
         let settings = self.settings.clone();
-        let on_change = self.on_change.clone();
+        let cloud = CloudSync {
+            draft: self.settings.clone(),
+            committed: self.committed.clone(),
+            state: self.cloud_sync_state.clone(),
+            on_change: self.on_change.clone(),
+        };
 
         Settings::new("app-settings")
             .sidebar_width(px(220.))
-            .page(self.build_appearance_page(settings.clone(), on_change.clone()))
-            .page(self.build_network_page(settings.clone(), on_change.clone()))
+            .page(self.build_appearance_page(settings.clone(), cloud.clone()))
+            .page(self.build_network_page(settings.clone(), cloud.clone()))
             .page(self.build_agent_page(settings.clone()))
             .page(self.build_api_management_page(settings.clone()))
-            .page(self.build_trading_page(settings.clone(), on_change.clone()))
-            .page(self.build_alerts_page(settings.clone(), on_change.clone()))
-            .page(self.build_performance_page(settings.clone(), on_change.clone()))
-            .page(self.build_layout_page(settings.clone(), on_change.clone()))
-            .page(self.build_tabs_page(settings.clone(), on_change.clone()))
-            .page(self.build_updates_page(settings.clone(), on_change.clone()))
+            .page(self.build_trading_page(settings.clone(), cloud.clone()))
+            .page(self.build_alerts_page(settings.clone(), cloud.clone()))
+            .page(self.build_performance_page(settings.clone(), cloud.clone()))
+            .page(self.build_layout_page(settings.clone(), cloud.clone()))
+            .page(self.build_tabs_page(settings.clone(), self.on_change.clone()))
+            .page(self.build_updates_page(settings.clone(), cloud.clone()))
     }
 
-    fn save_section(&self, section: &'static str, draft: Entity<AppSettings>, callback: OnChangeFn) -> SettingGroup {
+    /// Save button for local-only settings: startup tab preferences are stored
+    /// on this machine and never synced, so they still need an explicit save.
+    fn save_tabs_section(&self, draft: Entity<AppSettings>, callback: OnChangeFn) -> SettingGroup {
         let committed = self.committed.clone();
         SettingGroup::new().item(SettingItem::render(move |_, _, _| {
-            let draft=draft.clone(); let committed=committed.clone(); let callback=callback.clone();
-            gpui_component::button::Button::new(SharedString::from(format!("save-{section}")))
+            let draft = draft.clone();
+            let committed = committed.clone();
+            let callback = callback.clone();
+            gpui_component::button::Button::new("save-tabs")
                 .label("Save Section")
                 .on_click(move |_, _, cx| {
-                    let values=draft.read(cx).clone();
+                    let values = draft.read(cx).clone();
                     committed.update(cx, |saved, _| {
-                        match section {
-                            "network" => { saved.server_url = values.server_url.clone(); },
-                            "appearance" => { saved.theme = values.theme.clone(); saved.dark_mode = values.dark_mode.clone(); saved.enable_animations = values.enable_animations.clone(); },
-                            "trading" => { saved.default_exchange = values.default_exchange.clone(); saved.default_trading_pair = values.default_trading_pair.clone(); },
-                            "alerts" => { saved.enable_price_alerts = values.enable_price_alerts.clone(); saved.enable_sound_alerts = values.enable_sound_alerts.clone(); saved.enable_desktop_notifications = values.enable_desktop_notifications.clone(); },
-                            "performance" => { saved.max_fps = values.max_fps.clone(); saved.data_update_frequency = values.data_update_frequency.clone(); },
-                            "layout" => { saved.sync_dashboard_tabs = values.sync_dashboard_tabs.clone(); saved.default_timezone = values.default_timezone.clone(); saved.auto_save_dashboard = values.auto_save_dashboard.clone(); },
-                            "tabs" => { saved.startup_tabs_mode = values.startup_tabs_mode.clone(); saved.startup_tab_ids = values.startup_tab_ids.clone(); },
-                            "updates" => { saved.auto_check_updates = values.auto_check_updates.clone(); saved.update_channel = values.update_channel.clone(); },
-                            _ => {}
-                        }
+                        saved.startup_tabs_mode = values.startup_tabs_mode.clone();
+                        saved.startup_tab_ids = values.startup_tab_ids.clone();
                     });
-                    if let Some(cb)=&callback { cb(cx); }
+                    if let Some(cb) = &callback {
+                        cb(cx);
+                    }
                 })
         }))
     }
 
-    fn build_network_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
+    fn build_network_page(&self, settings: Entity<AppSettings>, cloud: CloudSync) -> SettingPage {
         let settings_clone = settings.clone();
 
         SettingPage::new("Network & Server")
-            .description("Configure backend server API endpoint for cloud sync and account features")
+            .description("Configure backend server API endpoint for cloud sync and account features. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title("Backend Service")
@@ -590,9 +669,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.server_url = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -601,7 +681,6 @@ impl SettingsPage {
                         .description("URL of your API backend. Configure an endpoint for market data streaming and account synchronization."),
                     ),
             )
-            .group(self.save_section("network", settings.clone(), on_change.clone()))
     }
 
     fn build_agent_page(&self, settings: Entity<AppSettings>) -> SettingPage {
@@ -619,7 +698,7 @@ impl SettingsPage {
                     { let s=key_settings.clone(); move |cx| s.read(cx).agent_api_key.clone() },
                     { let s=key_settings.clone(); move |v, cx| s.update(cx, |x,_| x.agent_api_key=v) },
                 )).description("Saved only on this machine; never sent to the FinTer database."))
-                .item(SettingItem::render(move |_, _, cx| {
+                .item(SettingItem::render(move |_, _, _cx| {
                     let s=save_settings.clone();
                     gpui_component::button::Button::new("save-agent-settings").label("Save Agent Settings")
                         .on_click(move |_, _, cx| {
@@ -656,13 +735,13 @@ impl SettingsPage {
     fn build_appearance_page(
         &self,
         settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
+        cloud: CloudSync,
     ) -> SettingPage {
         let settings_clone = settings.clone();
         let settings_clone2 = settings.clone();
 
         SettingPage::new("Theme & Appearance")
-            .description("Customize the look and feel of your trading environment")
+            .description("Customize the look and feel of your trading environment. Changes are saved automatically.")
             .default_open(true)
             .group(
                 SettingGroup::new()
@@ -689,11 +768,14 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value: SharedString, cx| {
                                         let dark_mode = settings.read(cx).dark_mode;
                                         settings.update(cx, |s, _| s.theme = value.clone());
-
+                                        // Preview the theme immediately; the
+                                        // debounced sync persists it.
+                                        crate::data::theme::apply_theme(&value, dark_mode, cx);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -711,11 +793,12 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         let theme_name = settings.read(cx).theme.clone();
                                         settings.update(cx, |s, _| s.dark_mode = value);
-
+                                        crate::data::theme::apply_theme(&theme_name, value, cx);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -733,9 +816,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone2.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_animations = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -744,18 +828,13 @@ impl SettingsPage {
                         .description("Enable smooth UI animations"),
                     ),
             )
-            .group(self.save_section("appearance", settings.clone(), on_change.clone()))
     }
 
-    fn build_trading_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
+    fn build_trading_page(&self, settings: Entity<AppSettings>, cloud: CloudSync) -> SettingPage {
         let settings_clone = settings.clone();
 
         SettingPage::new("Trading & Exchange")
-            .description("Configure your default trading preferences")
+            .description("Configure your default trading preferences. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title("Exchange Settings")
@@ -777,9 +856,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.default_exchange = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -797,9 +877,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value: SharedString, cx| {
                                         settings.update(cx, |s, _| s.default_trading_pair = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -808,19 +889,14 @@ impl SettingsPage {
                         .description("Default symbol to load on startup"),
                     ),
             )
-            .group(self.save_section("trading", settings.clone(), on_change.clone()))
     }
 
-    fn build_alerts_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
+    fn build_alerts_page(&self, settings: Entity<AppSettings>, cloud: CloudSync) -> SettingPage {
         let settings_clone2 = settings.clone();
         let settings_clone3 = settings.clone();
 
         SettingPage::new("Alerts & Notifications")
-            .description("Manage your trading alerts and notification preferences")
+            .description("Manage your trading alerts and notification preferences. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title("Price Alerts")
@@ -834,9 +910,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_price_alerts = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -854,9 +931,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone2.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.enable_sound_alerts = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -876,10 +954,12 @@ impl SettingsPage {
                             },
                             {
                                 let settings = settings_clone3.clone();
-                                let on_change = on_change.clone();
+                                let cloud = cloud.clone();
                                 move |value, cx| {
-                                    settings
-                                        .update(cx, |s, _| s.enable_desktop_notifications = value);
+                                    settings.update(cx, |s, _| {
+                                        s.enable_desktop_notifications = value
+                                    });
+                                    cloud.commit(cx);
                                 }
                             },
                         )
@@ -888,18 +968,17 @@ impl SettingsPage {
                     .description("Show system notifications for alerts"),
                 ),
             )
-            .group(self.save_section("alerts", settings.clone(), on_change.clone()))
     }
 
     fn build_performance_page(
         &self,
         settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
+        cloud: CloudSync,
     ) -> SettingPage {
         let settings_clone = settings.clone();
 
         SettingPage::new("Performance")
-            .description("Optimize performance for your system capabilities")
+            .description("Optimize performance for your system capabilities. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title("Rendering")
@@ -918,9 +997,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.max_fps = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -943,9 +1023,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings_clone.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.data_update_frequency = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -954,16 +1035,11 @@ impl SettingsPage {
                         .description("How often to refresh market data (50-1000ms)"),
                     ),
             )
-            .group(self.save_section("performance", settings.clone(), on_change.clone()))
     }
 
-    fn build_layout_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
+    fn build_layout_page(&self, settings: Entity<AppSettings>, cloud: CloudSync) -> SettingPage {
         SettingPage::new("Layout Management")
-            .description("Save and restore your panel layouts")
+            .description("Save and restore your panel layouts. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title("Layout & Formatting")
@@ -977,9 +1053,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.sync_dashboard_tabs = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -998,9 +1075,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.default_timezone = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -1018,9 +1096,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.auto_save_dashboard = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -1029,7 +1108,6 @@ impl SettingsPage {
                         .description("Automatically save dashboard changes on exit"),
                     ),
             )
-            .group(self.save_section("layout", settings.clone(), on_change.clone()))
     }
 
     fn build_tabs_page(&self, settings: Entity<AppSettings>, on_change: OnChangeFn) -> SettingPage {
@@ -1038,7 +1116,7 @@ impl SettingsPage {
         let dashboards = self.dashboards.clone();
 
         SettingPage::new("Tabs")
-            .description("Choose which dashboard tabs open when FinTer starts. These preferences are stored locally on this machine and are never synced to your account.")
+            .description("Choose which dashboard tabs open when FinTer starts. These preferences are stored locally on this machine, are never synced to your account, and require Save Section to apply.")
             .group(
                 SettingGroup::new()
                     .title("Startup behavior")
@@ -1085,16 +1163,12 @@ impl SettingsPage {
                         .description("Choose multiple dashboards. Used when startup behavior is set to \"Open selected dashboards\"."),
                     ),
             )
-            .group(self.save_section("tabs", settings.clone(), on_change.clone()))
+            .group(self.save_tabs_section(settings.clone(), on_change.clone()))
     }
 
-    fn build_updates_page(
-        &self,
-        settings: Entity<AppSettings>,
-        on_change: OnChangeFn,
-    ) -> SettingPage {
+    fn build_updates_page(&self, settings: Entity<AppSettings>, cloud: CloudSync) -> SettingPage {
         SettingPage::new("Updates")
-            .description("Configure automatic updates and version information")
+            .description("Configure automatic updates and version information. Changes are saved automatically.")
             .group(
                 SettingGroup::new()
                     .title(format!(
@@ -1130,9 +1204,10 @@ impl SettingsPage {
                                 },
                                 {
                                     let settings = settings.clone();
-                                    let on_change = on_change.clone();
+                                    let cloud = cloud.clone();
                                     move |value, cx| {
                                         settings.update(cx, |s, _| s.auto_check_updates = value);
+                                        cloud.commit(cx);
                                     }
                                 },
                             )
@@ -1141,7 +1216,6 @@ impl SettingsPage {
                         .description("Automatically check for new versions every 24 hours"),
                     ),
             )
-            .group(self.save_section("updates", settings.clone(), on_change.clone()))
     }
 }
 
@@ -1153,5 +1227,44 @@ impl Render for SettingsPage {
             .size_full()
             .bg(cx.theme().background)
             .child(settings_widget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Avoid `use super::*`: it re-exports `gpui::test` and shadows `#[test]`.
+    use super::AppSettings;
+
+    #[test]
+    fn apply_cloud_fields_keeps_local_settings() {
+        let mut committed = AppSettings::default();
+        committed.agent_api_key = "local-agent-key".into();
+        committed.api_key = "local-api-key".into();
+        committed.startup_tabs_mode = "selected".into();
+        committed.startup_tab_ids = vec!["local-tab".to_string()];
+
+        let mut draft = AppSettings::default();
+        draft.theme = "nord".into();
+        draft.dark_mode = true;
+        draft.server_url = "https://example.test".into();
+        draft.default_trading_pair = "ETH/USDT".into();
+        draft.agent_api_key = "draft-agent-key".into();
+        draft.api_key = "draft-api-key".into();
+        draft.startup_tabs_mode = "all".into();
+        draft.startup_tab_ids = vec!["draft-tab".to_string()];
+
+        committed.apply_cloud_fields(&draft);
+
+        // Cloud-synced fields follow the draft.
+        assert_eq!(committed.theme.as_ref(), "nord");
+        assert!(committed.dark_mode);
+        assert_eq!(committed.server_url.as_ref(), "https://example.test");
+        assert_eq!(committed.default_trading_pair.as_ref(), "ETH/USDT");
+
+        // Local-only fields are never overwritten by a cloud sync.
+        assert_eq!(committed.agent_api_key.as_ref(), "local-agent-key");
+        assert_eq!(committed.api_key.as_ref(), "local-api-key");
+        assert_eq!(committed.startup_tabs_mode.as_ref(), "selected");
+        assert_eq!(committed.startup_tab_ids, vec!["local-tab".to_string()]);
     }
 }

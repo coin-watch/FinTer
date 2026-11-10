@@ -9,6 +9,45 @@ use crate::data::api_management;
 use crate::data::trade_store::MarketType;
 use ccxt::{Config, Params, TypedExchangeExt};
 
+/// Venues compiled into this build through the app's `exchange-*` features.
+pub fn compiled_exchanges() -> Vec<&'static str> {
+    let mut exchanges = Vec::new();
+    #[cfg(feature = "exchange-binance")]
+    exchanges.push("binance");
+    #[cfg(feature = "exchange-binanceusdm")]
+    exchanges.push("binanceusdm");
+    #[cfg(feature = "exchange-binancecoinm")]
+    exchanges.push("binancecoinm");
+    #[cfg(feature = "exchange-bybit")]
+    exchanges.push("bybit");
+    #[cfg(feature = "exchange-okx")]
+    exchanges.push("okx");
+    #[cfg(feature = "exchange-kucoin")]
+    exchanges.push("kucoin");
+    #[cfg(feature = "exchange-kucoinfutures")]
+    exchanges.push("kucoinfutures");
+    #[cfg(feature = "exchange-kraken")]
+    exchanges.push("kraken");
+    #[cfg(feature = "exchange-krakenfutures")]
+    exchanges.push("krakenfutures");
+    #[cfg(feature = "exchange-coinbaseexchange")]
+    exchanges.push("coinbaseexchange");
+    #[cfg(feature = "exchange-mexc")]
+    exchanges.push("mexc");
+    #[cfg(feature = "exchange-htx")]
+    exchanges.push("htx");
+    #[cfg(feature = "exchange-bitfinex")]
+    exchanges.push("bitfinex");
+    #[cfg(feature = "exchange-gemini")]
+    exchanges.push("gemini");
+    exchanges
+}
+
+pub fn is_exchange_available(exchange: &str) -> bool {
+    let ex = exchange.trim().to_ascii_lowercase();
+    compiled_exchanges().iter().any(|id| *id == ex)
+}
+
 /// Fetch the free balance of `quote` for `exchange`.
 ///
 /// Returns the `free` amount reported by the exchange, falling back to `total`
@@ -115,22 +154,9 @@ pub async fn fetch_available_balance(
 mod tests {
     #[test]
     fn compiled_venues_are_available_to_the_desk() {
-        for id in [
-            "binance",
-            "binanceusdm",
-            "binancecoinm",
-            "bybit",
-            "okx",
-            "kraken",
-            "krakenfutures",
-            "coinbaseexchange",
-            "kucoin",
-            "kucoinfutures",
-            "mexc",
-            "htx",
-            "bitfinex",
-            "gemini",
-        ] {
+        let venues = super::compiled_exchanges();
+        assert!(!venues.is_empty(), "at least one venue must be enabled");
+        for id in venues {
             assert!(
                 ccxt::from_id(id, None).is_some(),
                 "{id} should be compiled into ccxt"

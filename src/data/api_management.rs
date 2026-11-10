@@ -248,6 +248,8 @@ pub fn supported_api_exchanges() -> Vec<(SharedString, SharedString)> {
         }
     }
     set.into_iter()
+        // Only offer venues that this build can actually use for live API calls.
+        .filter(|ex| crate::data::exchange_balance::is_exchange_available(ex))
         .map(|ex| (SharedString::from(ex.clone()), SharedString::from(ex.to_uppercase())))
         .collect()
 }

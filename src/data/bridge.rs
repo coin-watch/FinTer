@@ -260,7 +260,7 @@ impl BridgeConfig {
     }
 
     /// REST URL for the initial 200-candle history fetch.
-    fn timeframe_to_ms(timeframe: &str) -> i64 {
+    pub fn timeframe_to_ms(timeframe: &str) -> i64 {
         let mut num = 0;
         let mut unit = "";
         if let Some(idx) = timeframe.find(|c: char| c.is_alphabetic()) {
@@ -1479,6 +1479,13 @@ mod tests {
         assert!(url.contains("timeframe=1m"), "url={url}");
         assert!(url.contains("limit=500"), "url={url}");
         assert!(url.contains("symbol=BTC%2FUSDT"), "url={url}");
+    }
+
+    #[test]
+    fn ohlcv_history_url_with_until_includes_window() {
+        let url = base_cfg().ohlcv_history_url(Some(1_600_000_000_000));
+        assert!(url.contains("&since="), "url={url}");
+        assert!(url.contains("&until=1600000000000"), "url={url}");
     }
 
     #[tokio::test]

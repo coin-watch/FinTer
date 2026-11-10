@@ -1113,7 +1113,7 @@ impl Render for ExecutionPanel {
             (bal, dep, upnl, eq)
         };
 
-        // Spot holdings drive whether the SELL pod is actionable. This is the
+        // Spot holdings drive whether the SELL button is actionable. This is the
         // ledger holding for the active mode, minus quantity reserved by open
         // spot sell orders.
         let (spot_holding_qty, spot_available_qty) = if self.market_type == MarketType::Spot {
@@ -1436,7 +1436,6 @@ impl Render for ExecutionPanel {
             })
             // ── Main Body Station ────────────────────────────────────────────
             .child({
-                let is_long = self.side == Side::Long;
                 let is_spot = self.market_type == MarketType::Spot;
 
                 // 0. Explicit venue account type (spot / margin / futures)
@@ -1509,173 +1508,7 @@ impl Render for ExecutionPanel {
                             }),
                     );
 
-                // 1. Dual Tactical Long / Short Pods
-                let pods_el = h_flex()
-                    .w_full()
-                    .gap_1p5()
-                    // BUY / LONG Pod
-                    .child(
-                        v_flex()
-                            .id("buy-long-pod")
-                            .flex_1()
-                            .min_w_0()
-                            .p(if is_micro_h {
-                                px(4.0)
-                            } else if is_compact_h {
-                                px(6.0)
-                            } else {
-                                px(8.0)
-                            })
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(if is_long {
-                                c.bullish
-                            } else {
-                                c.border
-                            })
-                            .bg(if is_long {
-                                c.bullish.opacity(0.12)
-                            } else {
-                                c.muted.opacity(0.22)
-                            })
-                            .hover(|s| s.border_color(c.bullish.opacity(0.8)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.side = Side::Long;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_long {
-                                                c.bullish
-                                            } else {
-                                                c.muted_foreground
-                                            })
-                                            .child(if is_very_narrow { "▲ BUY" } else { "▲ BUY / LONG" }),
-                                    )
-                                    .when(is_long && !is_very_narrow, |this| {
-                                        this.child(
-                                            Icon::new(IconName::Check)
-                                                .size(px(12.))
-                                                .text_color(c.bullish),
-                                        )
-                                    }),
-                            )
-                            .when(!is_compact_h && !is_narrow && !is_wide && !is_ultra_wide, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(c.muted_foreground)
-                                        .child("Profit on upward momentum"),
-                                )
-                            }),
-                    )
-                    // SELL / SHORT Pod
-                    .child(
-                        v_flex()
-                            .id("sell-short-pod")
-                            .flex_1()
-                            .min_w_0()
-                            .p(if is_micro_h {
-                                px(4.0)
-                            } else if is_compact_h {
-                                px(6.0)
-                            } else {
-                                px(8.0)
-                            })
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(if is_spot && !can_sell_spot {
-                                c.border
-                            } else if !is_long {
-                                c.bearish
-                            } else {
-                                c.border
-                            })
-                            .bg(if is_spot && !can_sell_spot {
-                                c.muted.opacity(0.15)
-                            } else if !is_long {
-                                c.bearish.opacity(0.12)
-                            } else {
-                                c.muted.opacity(0.22)
-                            })
-                            .when(is_spot && !can_sell_spot, |this| this.opacity(0.55))
-                            .when(!is_spot || can_sell_spot, |this| {
-                                this.hover(|s| s.border_color(c.bearish.opacity(0.8)))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.side = Side::Short;
-                                            // Never default a spot sell above the
-                                            // quantity actually held.
-                                            if this.market_type == MarketType::Spot {
-                                                let cap = this.max_order_amount(this.active_mode());
-                                                if cap > 0.0 && this.margin > cap {
-                                                    this.margin = cap;
-                                                }
-                                            }
-                                            cx.notify();
-                                        }),
-                                    )
-                            })
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(if is_spot && !can_sell_spot {
-                                                c.muted_foreground
-                                            } else if !is_long {
-                                                c.bearish
-                                            } else {
-                                                c.muted_foreground
-                                            })
-                                            .child(if is_spot || is_very_narrow {
-                                                "▼ SELL"
-                                            } else {
-                                                "▼ SELL / SHORT"
-                                            }),
-                                    )
-                                    .when(!is_long && (!is_spot || can_sell_spot) && !is_very_narrow, |this| {
-                                        this.child(
-                                            Icon::new(IconName::Check)
-                                                .size(px(12.))
-                                                .text_color(c.bearish),
-                                        )
-                                    }),
-                            )
-                            .when(!is_compact_h && !is_narrow && !is_wide && !is_ultra_wide, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(c.muted_foreground)
-                                        .child(if is_spot {
-                                            if can_sell_spot {
-                                                "Sell your spot holdings"
-                                            } else if spot_holding_qty > 0.0 {
-                                                "Holdings reserved by open sells"
-                                            } else {
-                                                "No spot holdings to sell"
-                                            }
-                                        } else {
-                                            "Profit on market drawdown"
-                                        }),
-                                )
-                            }),
-                    );
-
-                // 2. Order Execution Type Row (Exchange Segmented Control)
+                // 1. Order Execution Type Row (Exchange Segmented Control)
                 let type_row = h_flex()
                     .w_full()
                     .p(px(2.0))
@@ -1771,7 +1604,7 @@ impl Render for ExecutionPanel {
                     vec![1, 2, 5, 10, 20, 50, 100]
                 };
 
-                // 3. Leverage Multiplier Matrix with Risk Badging
+                // 2. Leverage Multiplier Matrix with Risk Badging
                 let leverage_el = v_flex()
                     .w_full()
                     .gap_1()
@@ -2060,7 +1893,7 @@ impl Render for ExecutionPanel {
                     div().into_any_element()
                 };
 
-                // 4. Custom Exchange Order Inputs Block (Price, Size, Margin, %, Steppers)
+                // 3. Custom Exchange Order Inputs Block (Price, Size, Margin, %, Steppers)
                 let inputs_el = v_flex()
                     .w_full()
                     .gap_1p5()
@@ -2211,7 +2044,7 @@ impl Render for ExecutionPanel {
                         )
                     });
 
-                // 5. Terminal Risk HUD & Liquidation Proximity Gauge
+                // 4. Terminal Risk HUD & Liquidation Proximity Gauge
                 let risk_hud_el = v_flex()
                     .w_full()
                     .gap_1()
@@ -2366,38 +2199,48 @@ impl Render for ExecutionPanel {
                         )
                     });
 
-                // 6. Tactical Execution Action Bar (Short & Compact)
-                let execute_btn_el = h_flex()
-                    .id("submit-order-btn")
-                    .w_full()
-                    .h(px(if is_micro_h {
-                        25.0
-                    } else if is_compact_h {
-                        27.0
-                    } else {
-                        29.0
-                    }))
+                // 5. Tactical Execution Action Bar — dual BUY/LONG & SELL/SHORT
+                let exec_h = px(if is_micro_h {
+                    25.0
+                } else if is_compact_h {
+                    27.0
+                } else {
+                    29.0
+                });
+                // Spot markets can only sell an existing holding; derivatives can
+                // always open either side.
+                let can_execute_sell = !is_spot || can_sell_spot;
+                let long_label = if is_spot || is_very_narrow {
+                    "▲ BUY"
+                } else {
+                    "▲ BUY / LONG"
+                };
+                let short_label = if is_spot || is_very_narrow {
+                    "▼ SELL"
+                } else {
+                    "▼ SELL / SHORT"
+                };
+                let mode_icon = if self.is_live_mode { "⚡" } else { "🛡" };
+
+                let buy_btn = h_flex()
+                    .id("submit-buy-btn")
+                    .flex_1()
+                    .min_w_0()
+                    .h(exec_h)
                     .items_center()
                     .justify_center()
                     .text_center()
                     .cursor_pointer()
                     .border_1()
-                    .border_color(if is_long {
-                        c.bullish.opacity(0.8)
-                    } else {
-                        c.bearish.opacity(0.8)
-                    })
-                    .bg(if is_long { c.bullish } else { c.bearish })
-                    .text_color(Self::contrasting_text(if is_long {
-                        c.bullish
-                    } else {
-                        c.bearish
-                    }))
+                    .border_color(c.bullish.opacity(0.8))
+                    .bg(c.bullish)
+                    .text_color(Self::contrasting_text(c.bullish))
                     .shadow_sm()
                     .hover(|s| s.opacity(0.92))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            this.side = Side::Long;
                             this.execute_order(cx);
                         }),
                     )
@@ -2408,45 +2251,94 @@ impl Render for ExecutionPanel {
                         h_flex()
                             .items_center()
                             .justify_center()
-                            .gap(px(6.0))
-                            .when(!is_very_narrow, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .line_height(gpui::relative(1.0))
-                                        .font_weight(FontWeight::BOLD)
-                                        .child("EXECUTE"),
-                                )
-                            })
+                            .gap(px(4.0))
                             .child(
                                 div()
                                     .text_xs()
                                     .line_height(gpui::relative(1.0))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(if self.is_live_mode { "⚡" } else { "🛡" }),
+                                    .child(mode_icon),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .line_height(gpui::relative(1.0))
                                     .font_weight(FontWeight::BOLD)
-                                    .child(if is_very_narrow {
-                                        format!(
-                                            "{} {} {}",
-                                            if self.is_live_mode { "LIVE" } else { "PAPER" },
-                                            if is_long { "BUY" } else { "SELL" },
-                                            Self::fmt_size(qty)
-                                        )
-                                    } else {
-                                        format!(
-                                            "{} {} {} {base}",
-                                            if self.is_live_mode { "LIVE" } else { "PAPER" },
-                                            if is_long { "BUY" } else { "SELL" },
-                                            Self::fmt_size(qty)
-                                        )
-                                    }),
+                                    .child(long_label),
                             ),
                     );
+
+                let sell_btn = h_flex()
+                    .id("submit-sell-btn")
+                    .flex_1()
+                    .min_w_0()
+                    .h(exec_h)
+                    .items_center()
+                    .justify_center()
+                    .text_center()
+                    .border_1()
+                    .border_color(if can_execute_sell {
+                        c.bearish.opacity(0.8)
+                    } else {
+                        c.border
+                    })
+                    .bg(if can_execute_sell {
+                        c.bearish
+                    } else {
+                        c.muted.opacity(0.3)
+                    })
+                    .text_color(if can_execute_sell {
+                        Self::contrasting_text(c.bearish)
+                    } else {
+                        c.muted_foreground
+                    })
+                    .shadow_sm()
+                    .when(can_execute_sell, |this| {
+                        this.cursor_pointer()
+                            .hover(|s| s.opacity(0.92))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.side = Side::Short;
+                                    // Never default a spot sell above the
+                                    // quantity actually held.
+                                    if this.market_type == MarketType::Spot {
+                                        let cap = this.max_order_amount(this.active_mode());
+                                        if cap > 0.0 && this.margin > cap {
+                                            this.margin = cap;
+                                        }
+                                    }
+                                    this.execute_order(cx);
+                                }),
+                            )
+                    })
+                    .when(!can_execute_sell, |this| this.opacity(0.55))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(gpui::relative(1.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(mode_icon),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .line_height(gpui::relative(1.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(short_label),
+                            ),
+                    );
+
+                let execute_btn_el = h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .child(buy_btn)
+                    .child(sell_btn);
 
                 v_flex()
                     .id("trade-desk-body")
@@ -2471,7 +2363,6 @@ impl Render for ExecutionPanel {
                                     .min_w_0()
                                     .gap_2()
                                     .child(market_row)
-                                    .child(pods_el)
                                     .child(type_row),
                             )
                             .child(
@@ -2502,7 +2393,6 @@ impl Render for ExecutionPanel {
                                     .min_w_0()
                                     .gap(if is_compact_h { px(4.0) } else { px(6.0) })
                                     .child(market_row)
-                                    .child(pods_el)
                                     .child(type_row)
                                     .child(inputs_el)
                                     .child(leverage_el),
@@ -2527,7 +2417,6 @@ impl Render for ExecutionPanel {
                                 px(8.0)
                             })
                             .child(market_row)
-                            .child(pods_el)
                             .child(type_row)
                             .child(inputs_el)
                             .child(leverage_el)

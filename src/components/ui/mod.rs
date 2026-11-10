@@ -1,3 +1,4 @@
+pub mod agent_chart;
 pub mod agent_panel;
 pub mod alerts_panel;
 pub mod avatar;
