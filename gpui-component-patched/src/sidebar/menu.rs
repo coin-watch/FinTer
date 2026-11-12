@@ -64,12 +64,17 @@ impl Styled for SidebarMenu {
 
 impl RenderOnce for SidebarMenu {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        v_flex().gap_2().refine_style(&self.style).children(
-            self.items
-                .into_iter()
-                .enumerate()
-                .map(|(ix, item)| item.id(ix).collapsed(self.collapsed)),
-        )
+        v_flex()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .refine_style(&self.style)
+            .children(
+                self.items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, item)| item.id(ix).collapsed(self.collapsed)),
+            )
     }
 }
 
@@ -197,9 +202,11 @@ impl RenderOnce for SidebarMenuItem {
         div()
             .id(self.id.clone())
             .w_full()
+            .min_w_0()
             .child(
                 h_flex()
                     .size_full()
+                    .min_w_0()
                     .id("item")
                     .overflow_x_hidden()
                     .flex_shrink_0()
@@ -234,10 +241,13 @@ impl RenderOnce for SidebarMenuItem {
                                     .justify_between()
                                     .overflow_x_hidden()
                                     .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .overflow_x_hidden()
-                                            .child(self.label.clone()),
+                                        h_flex().flex_1().min_w_0().overflow_x_hidden().child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(self.label.clone()),
+                                        ),
                                     )
                                     .when_some(self.suffix, |this, suffix| this.child(suffix)),
                             )

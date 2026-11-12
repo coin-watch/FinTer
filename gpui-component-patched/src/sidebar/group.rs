@@ -54,16 +54,18 @@ impl<E: Collapsible + IntoElement> RenderOnce for SidebarGroup<E> {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .relative()
+            .min_w_0()
             .when(!self.collapsed, |this| {
                 this.child(
                     h_flex()
                         .flex_shrink_0()
+                        .min_w_0()
                         .px_2()
                         .rounded(cx.theme().radius)
                         .text_xs()
                         .text_color(cx.theme().sidebar_foreground.opacity(0.7))
                         .h_8()
-                        .child(self.label),
+                        .child(div().min_w_0().truncate().child(self.label)),
                 )
             })
             .child(

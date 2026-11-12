@@ -1,9 +1,12 @@
-//! OpenAI-compatible, read-only dashboard analysis client with automatic model discovery.
+//! OpenAI-compatible dashboard analysis and trading client with automatic model discovery.
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::data::models::OhlcvCandle;
+use crate::data::trade_store::{
+    self, MarketType, TradeOrder, TradeOrderType, TradeSide, TradeStore, TradingMode,
+};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessageRecord {
@@ -13,6 +16,10 @@ pub struct ChatMessageRecord {
     pub failed: bool,
     #[serde(default)]
     pub timestamp: Option<String>,
+    /// Receipts for the trade directives in `response`, captured the single time
+    /// they were executed. Re-parsing or reloading never re-executes a trade.
+    #[serde(default)]
+    pub trade_receipts: Vec<TradeActionResult>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -57,6 +64,9 @@ pub fn load_all_conversations() -> Vec<ConversationRecord> {
                                             response: m.response,
                                             failed: m.failed,
                                             timestamp: None,
+                                            // Legacy history is display-only: never replay
+                                            // past trade directives on migration.
+                                            trade_receipts: Vec::new(),
                                         }).collect(),
                                     });
                                 }
@@ -238,7 +248,53 @@ pub async fn discover_models() -> Result<Vec<String>> {
     Ok(models)
 }
 
-const SYSTEM_PROMPT: &str = r#"You are FinTer's read-only market analysis agent. Analyse only the supplied dashboard snapshot, distinguish facts from inference, explicitly identify missing/stale data, and never claim to place or execute trades. This is informational, not financial advice.
+const SYSTEM_PROMPT: &str = r#"You are FinTer's autonomous trading agent. You analyse the supplied dashboard snapshot, distinguish facts from inference, explicitly identify missing/stale data, and you can execute trades directly on the FinTer trade desk. This is informational, not financial advice.
+
+## Executing trades
+
+You can place orders, cancel resting orders, and close open positions by emitting a fenced `trade` block. The application parses the JSON and executes it immediately against the FinTer trade store; the result (order id, status, fill price, quantity) is shown to the user as a receipt. Emit one fenced block per action, each on its own lines, and never wrap the JSON in extra prose or markdown inside the fence.
+
+Place an order:
+
+```trade
+{"action":"place_order","symbol":"BTC/USDT","side":"buy","order_type":"market","margin":1000,"leverage":5,"market_type":"futures","mode":"paper"}
+```
+
+```trade
+{"action":"place_order","symbol":"ETH/USDT","side":"sell","order_type":"limit","price":3200,"margin":500,"leverage":10,"market_type":"futures","mode":"paper"}
+```
+
+Cancel a resting order:
+
+```trade
+{"action":"cancel_order","order_id":"1a2b3c4d"}
+```
+
+Close an open position:
+
+```trade
+{"action":"close_position","pos_id":"1a2b3c4d","current_price":64250.5}
+```
+
+Allowed keys for `place_order`:
+- action: "place_order" (required).
+- symbol: BASE/QUOTE, for example BTC/USDT (required).
+- side: buy, sell, long, or short. On spot, "sell" disposes of an existing holding instead of opening a short.
+- order_type: market (default) or limit. Limit orders require `price` and rest as OPEN until the market reaches it.
+- price: optional limit price. For market orders it is ignored; the desk uses the latest mark price.
+- margin: quote-currency margin to commit (required, greater than 0).
+- leverage: integer leverage, default 1. Spot orders must use 1x.
+- market_type: spot or futures (margin is also accepted), default futures.
+- mode: paper (default) or live. Only use live when the user explicitly asks for a live order.
+
+Rules:
+- Only emit a `trade` block when the user asks you to trade, or clearly approves a trade you proposed. Never trade speculatively or without a request.
+- Default to paper mode unless the user explicitly asks to trade live.
+- Keep `margin` within the account balance shown in the snapshot. If a trade would be rejected, explain why instead of emitting a block.
+- After each `trade` block, briefly describe what you executed and why. The app reports the authoritative result; never invent an order id or fill.
+- You may combine `trade` and `chart` blocks in one reply.
+
+## Inline charts
 
 You can render candlestick charts inline in this conversation. When the user asks to chart, plot, visualise, or inspect price action, emit a fenced block exactly like this, on its own lines:
 
@@ -357,6 +413,323 @@ pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Resu
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("AI provider returned no message content"))
+}
+
+// ---------------------------------------------------------------------------
+// Trade directives
+// ---------------------------------------------------------------------------
+
+/// A structured trade action the assistant asked to execute.
+///
+/// The model emits a fenced `trade` block containing this JSON. The app parses
+/// the block and executes it immediately against [`TradeStore::global`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TradeAction {
+    /// Open an order (market executes immediately, limit rests as OPEN).
+    PlaceOrder {
+        #[serde(default)]
+        symbol: String,
+        #[serde(default)]
+        side: String,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        order_type: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_f64")]
+        price: Option<f64>,
+        #[serde(default, deserialize_with = "deserialize_optional_f64")]
+        margin: Option<f64>,
+        #[serde(default, deserialize_with = "deserialize_optional_f64")]
+        leverage: Option<f64>,
+        #[serde(default)]
+        market_type: Option<String>,
+        #[serde(default)]
+        mode: Option<String>,
+    },
+    /// Cancel a resting OPEN order by id.
+    CancelOrder {
+        #[serde(default, alias = "id")]
+        order_id: String,
+    },
+    /// Close an open position by id at an optional price.
+    ClosePosition {
+        #[serde(default, alias = "id", alias = "position_id")]
+        pos_id: String,
+        #[serde(default, deserialize_with = "deserialize_optional_f64")]
+        current_price: Option<f64>,
+    },
+}
+
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text
+            .trim()
+            .trim_start_matches('$')
+            .replace([',', '_'], "")
+            .parse::<f64>()
+            .ok(),
+        _ => None,
+    })
+}
+
+fn parse_trade_side(raw: &str) -> Option<TradeSide> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "buy" | "long" | "bid" => Some(TradeSide::Long),
+        "sell" | "short" | "ask" => Some(TradeSide::Short),
+        _ => None,
+    }
+}
+
+fn parse_trading_mode(raw: Option<&str>) -> TradingMode {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "live" | "real" => TradingMode::Live,
+        _ => TradingMode::Paper,
+    }
+}
+
+impl TradeAction {
+    /// Short label for the receipt header, e.g. "Place order".
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            TradeAction::PlaceOrder { .. } => "Place order",
+            TradeAction::CancelOrder { .. } => "Cancel order",
+            TradeAction::ClosePosition { .. } => "Close position",
+        }
+    }
+
+    /// True when the action targets the live ledger.
+    pub fn is_live(&self) -> bool {
+        match self {
+            TradeAction::PlaceOrder { mode, .. } => parse_trading_mode(mode.as_deref()) == TradingMode::Live,
+            _ => false,
+        }
+    }
+
+    /// Validates the action before it touches the trade store.
+    fn validate(&self) -> Result<()> {
+        match self {
+            TradeAction::PlaceOrder { symbol, side, order_type, price, margin, leverage, .. } => {
+                if symbol.trim().is_empty() {
+                    return Err(anyhow!("Trade directive is missing a symbol."));
+                }
+                if parse_trade_side(side).is_none() {
+                    return Err(anyhow!(
+                        "Invalid side '{side}': use buy, sell, long, or short."
+                    ));
+                }
+                if let Some(order_type) = order_type.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                    match order_type.to_ascii_lowercase().as_str() {
+                        "market" | "limit" => {}
+                        other => return Err(anyhow!("Invalid order_type '{other}': use market or limit.")),
+                    }
+                }
+                if order_type.as_deref().map(|t| t.trim().eq_ignore_ascii_case("limit")).unwrap_or(false)
+                    && !price.map(|p| p.is_finite() && p > 0.0).unwrap_or(false)
+                {
+                    return Err(anyhow!("Limit orders require a positive price."));
+                }
+                if !margin.map(|m| m.is_finite() && m > 0.0).unwrap_or(false) {
+                    return Err(anyhow!("Trade directive requires a positive margin."));
+                }
+                if let Some(leverage) = leverage {
+                    if !leverage.is_finite() || *leverage < 1.0 {
+                        return Err(anyhow!("Leverage must be at least 1."));
+                    }
+                }
+                Ok(())
+            }
+            TradeAction::CancelOrder { order_id } => {
+                if order_id.trim().is_empty() {
+                    return Err(anyhow!("Cancel directive is missing an order_id."));
+                }
+                Ok(())
+            }
+            TradeAction::ClosePosition { pos_id, .. } => {
+                if pos_id.trim().is_empty() {
+                    return Err(anyhow!("Close directive is missing a pos_id."));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The authoritative outcome of executing a [`TradeAction`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TradeActionResult {
+    pub action: String,
+    pub ok: bool,
+    pub order_id: Option<String>,
+    pub symbol: Option<String>,
+    pub side: Option<String>,
+    pub order_type: Option<String>,
+    pub market_type: Option<String>,
+    pub mode: Option<String>,
+    pub status: Option<String>,
+    pub price: Option<f64>,
+    pub quantity: Option<f64>,
+    pub notional: Option<f64>,
+    pub leverage: Option<u32>,
+    pub margin: Option<f64>,
+    /// Realised P&L for a closed position.
+    pub pnl: Option<f64>,
+    pub message: String,
+}
+
+impl TradeActionResult {
+    fn from_order(action: &str, order: &TradeOrder) -> Self {
+        let side = match (order.market_type, order.side) {
+            (MarketType::Spot, TradeSide::Short) => "sell",
+            (_, TradeSide::Long) => "buy",
+            (_, TradeSide::Short) => "sell",
+        };
+        Self {
+            action: action.to_string(),
+            ok: true,
+            order_id: Some(order.id.clone()),
+            symbol: Some(order.symbol.clone()),
+            side: Some(side.to_string()),
+            order_type: Some(match order.order_type {
+                TradeOrderType::Market => "market",
+                TradeOrderType::Limit => "limit",
+            }
+            .to_string()),
+            market_type: Some(order.market_type.as_str().to_string()),
+            mode: Some(order.mode.as_str().to_lowercase()),
+            status: Some(order.status.to_string()),
+            price: Some(order.price),
+            quantity: Some(order.quantity),
+            notional: Some(order.notional),
+            leverage: Some(order.leverage),
+            margin: Some(order.margin),
+            pnl: None,
+            message: format!("{} {} {} @ {}", order.status, order.symbol, side.to_uppercase(), order.price),
+        }
+    }
+
+    fn failure(action: &str, error: impl std::fmt::Display) -> Self {
+        Self {
+            action: action.to_string(),
+            ok: false,
+            order_id: None,
+            symbol: None,
+            side: None,
+            order_type: None,
+            market_type: None,
+            mode: None,
+            status: None,
+            price: None,
+            quantity: None,
+            notional: None,
+            leverage: None,
+            margin: None,
+            pnl: None,
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Executes a parsed trade directive against the global trade store.
+///
+/// Market orders fill immediately at the supplied price (or the current mark
+/// price when omitted); limit orders rest as OPEN. Spot sells dispose of an
+/// existing holding instead of opening a short.
+pub fn execute_trade_directive(action: &TradeAction) -> Result<TradeActionResult> {
+    action.validate()?;
+    let mut store = TradeStore::global()
+        .lock()
+        .map_err(|_| anyhow!("Trade store lock is poisoned."))?;
+
+    match action {
+        TradeAction::PlaceOrder {
+            symbol,
+            side,
+            order_type,
+            price,
+            margin,
+            leverage,
+            market_type,
+            mode,
+        } => {
+            let side = parse_trade_side(side)
+                .ok_or_else(|| anyhow!("Invalid side '{side}'."))?;
+            let order_type = match order_type.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(raw) if raw.eq_ignore_ascii_case("limit") => TradeOrderType::Limit,
+                _ => TradeOrderType::Market,
+            };
+            let market_type = MarketType::from_str(market_type.as_deref().unwrap_or("futures"));
+            let mode = parse_trading_mode(mode.as_deref());
+            let margin = margin.ok_or_else(|| anyhow!("Trade directive requires a margin."))?;
+            let leverage = leverage.unwrap_or(1.0).max(1.0).round() as u32;
+
+            let symbol = trade_store::normalize_symbol(symbol);
+            let exec_price = match (order_type, price) {
+                (TradeOrderType::Limit, Some(price)) => *price,
+                _ => store
+                    .get_mark_price(&symbol)
+                    .or(*price)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "No market price available for {symbol}; supply a limit price or wait for a live quote."
+                        )
+                    })?,
+            };
+
+            let result = if market_type == MarketType::Spot && side == TradeSide::Short {
+                // Spot sells dispose of an existing holding; the quote amount is
+                // converted to base quantity at the execution price.
+                let quantity = margin / exec_price;
+                store.execute_spot_sell(mode, symbol, order_type, exec_price, quantity)
+            } else {
+                store.execute_order_typed(
+                    mode,
+                    market_type,
+                    symbol,
+                    side,
+                    order_type,
+                    exec_price,
+                    margin,
+                    leverage,
+                )
+            };
+            result
+                .map(|order| TradeActionResult::from_order("place_order", &order))
+                .map_err(|error| anyhow!("{error}"))
+        }
+        TradeAction::CancelOrder { order_id } => store
+            .cancel_order(order_id.trim())
+            .map(|order| TradeActionResult::from_order("cancel_order", &order))
+            .map_err(|error| anyhow!("{error}")),
+        TradeAction::ClosePosition { pos_id, current_price } => {
+            let pos_id = pos_id.trim();
+            let pnl = store
+                .positions
+                .iter()
+                .find(|position| position.id == pos_id)
+                .map(|position| {
+                    let mark = current_price
+                        .filter(|price| price.is_finite() && *price > 0.0)
+                        .or_else(|| store.get_mark_price(&position.symbol))
+                        .unwrap_or(position.entry_price);
+                    match position.side {
+                        TradeSide::Long => (mark - position.entry_price) * position.quantity,
+                        TradeSide::Short => (position.entry_price - mark) * position.quantity,
+                    }
+                });
+            store
+                .close_position(pos_id, current_price.filter(|price| price.is_finite() && *price > 0.0))
+                .map(|order| {
+                    let mut result = TradeActionResult::from_order("close_position", &order);
+                    result.pnl = pnl;
+                    result
+                })
+                .map_err(|error| anyhow!("{error}"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -645,23 +1018,35 @@ fn normalize_timeframe(raw: &str) -> String {
     format!("{amount}{unit}")
 }
 
-/// A parsed assistant message: markdown prose interleaved with chart requests.
+/// A parsed assistant message: markdown prose interleaved with chart requests
+/// and executed trade directives.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageSegment {
     Markdown(String),
     Chart(ChartRequest),
+    /// A trade directive and, once executed, its authoritative result.
+    Trade(TradeAction, Option<TradeActionResult>),
 }
 
-fn is_chart_fence(line: &str) -> bool {
+/// The directive language of a fenced block, if it is one FinTer understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectiveFence {
+    Chart,
+    Trade,
+}
+
+fn directive_fence(line: &str) -> Option<DirectiveFence> {
     let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return false;
-    };
+    let rest = trimmed.strip_prefix("```")?;
     let language = rest.trim().to_ascii_lowercase();
-    language == "chart"
-        || language == "finter-chart"
-        || language.starts_with("chart ")
-        || language.starts_with("finter-chart ")
+    let language = language.split_whitespace().next().unwrap_or("");
+    match language {
+        "chart" | "finter-chart" => Some(DirectiveFence::Chart),
+        "trade" | "finter-trade" | "agent-action" | "finter-agent-action" => {
+            Some(DirectiveFence::Trade)
+        }
+        _ => None,
+    }
 }
 
 fn parse_chart_request(body: &str) -> Option<ChartRequest> {
@@ -672,20 +1057,63 @@ fn parse_chart_request(body: &str) -> Option<ChartRequest> {
     Some(request.normalized())
 }
 
-/// Splits an assistant reply into markdown and inline chart segments.
+/// Parses a `trade` / `agent-action` block body into an action, without
+/// executing it. An unparseable block yields `None` so the caller can preserve
+/// the raw text as markdown.
+fn parse_trade_action(body: &str) -> Option<TradeAction> {
+    serde_json::from_str::<TradeAction>(body.trim()).ok()
+}
+
+impl TradeAction {
+    /// Wire name of the action, used for receipts and error reporting.
+    pub fn action_name(&self) -> String {
+        match self {
+            TradeAction::PlaceOrder { .. } => "place_order",
+            TradeAction::CancelOrder { .. } => "cancel_order",
+            TradeAction::ClosePosition { .. } => "close_position",
+        }
+        .to_string()
+    }
+}
+
+/// Splits an assistant reply into markdown, inline chart, and trade segments.
 ///
-/// Invalid or unclosed chart fences are preserved as markdown so no model output
-/// is silently discarded.
+/// This is a **pure** parse: trade directives are returned as
+/// `MessageSegment::Trade(action, None)` and are *never* executed here. Callers
+/// must run [`execute_trade_directives_in_text`] exactly once when a reply
+/// arrives and attach the returned receipts to the message, so that later
+/// renders or reloads only display historical results.
+///
+/// Invalid or unclosed fences are preserved as markdown so no model output is
+/// silently discarded.
 pub fn parse_message_segments(text: &str) -> Vec<MessageSegment> {
+    parse_segments(text, &[])
+}
+
+/// Splits an assistant reply into segments, attaching previously executed trade
+/// receipts to their matching `trade` directives in order.
+///
+/// Receipts are matched positionally (the n-th receipt belongs to the n-th
+/// trade block). Missing receipts leave the segment as `Trade(action, None)`.
+/// This function never executes anything.
+pub fn parse_message_segments_with_results(
+    text: &str,
+    receipts: &[TradeActionResult],
+) -> Vec<MessageSegment> {
+    parse_segments(text, receipts)
+}
+
+fn parse_segments(text: &str, receipts: &[TradeActionResult]) -> Vec<MessageSegment> {
     let mut segments = Vec::new();
     let mut markdown = String::new();
     let mut lines = text.split_inclusive('\n').peekable();
+    let mut receipt_index = 0usize;
 
     while let Some(line) = lines.next() {
-        if !is_chart_fence(line) {
+        let Some(kind) = directive_fence(line) else {
             markdown.push_str(line);
             continue;
-        }
+        };
 
         let mut body = String::new();
         let mut closing = None;
@@ -699,11 +1127,28 @@ pub fn parse_message_segments(text: &str) -> Vec<MessageSegment> {
 
         match closing {
             Some(close) => {
-                if let Some(request) = parse_chart_request(&body) {
+                let segment = match kind {
+                    DirectiveFence::Chart => {
+                        parse_chart_request(&body).map(MessageSegment::Chart)
+                    }
+                    DirectiveFence::Trade => parse_trade_action(&body).map(|action| {
+                        let result = receipts.get(receipt_index).cloned();
+                        receipt_index += 1;
+                        MessageSegment::Trade(action, result)
+                    }),
+                };
+                if let Some(segment) = segment {
                     if !markdown.is_empty() {
                         segments.push(MessageSegment::Markdown(std::mem::take(&mut markdown)));
                     }
-                    segments.push(MessageSegment::Chart(request));
+                    // Trade receipts are rendered as cards, so keep the blank line
+                    // that followed the closing fence to separate them from the prose
+                    // below. Charts render inline and keep their existing spacing.
+                    let keep_trailing_newline = kind == DirectiveFence::Trade;
+                    segments.push(segment);
+                    if keep_trailing_newline && close.ends_with('\n') {
+                        markdown.push('\n');
+                    }
                 } else {
                     markdown.push_str(line);
                     markdown.push_str(&body);
@@ -726,23 +1171,122 @@ pub fn parse_message_segments(text: &str) -> Vec<MessageSegment> {
     segments
 }
 
-/// Removes chart fences while a reply is still being typed out.
+/// Extracts the trade directives from `text` without executing them.
+///
+/// Unparseable blocks are skipped (they stay visible as markdown).
+pub fn parse_trade_directives_in_text(text: &str) -> Vec<TradeAction> {
+    let mut actions = Vec::new();
+    for (kind, body) in fenced_blocks(text) {
+        if kind != DirectiveFence::Trade {
+            continue;
+        }
+        if let Some(action) = parse_trade_action(&body) {
+            actions.push(action);
+        }
+    }
+    actions
+}
+
+/// Executes every `trade` directive in `text` exactly once, in order.
+///
+/// This is the *only* entry point that executes directives from a reply. Call it
+/// once when an assistant response arrives, persist the receipts, and render
+/// them later via [`parse_message_segments_with_results`]. Calling it again on
+/// the same text would place duplicate orders, so never call it from a render
+/// path or when loading saved conversations.
+pub fn execute_trade_directives_in_text(text: &str) -> Vec<(TradeAction, TradeActionResult)> {
+    parse_trade_directives_in_text(text)
+        .into_iter()
+        .map(|action| {
+            let result = execute_trade_directive(&action).unwrap_or_else(|error| {
+                TradeActionResult::failure(&action.action_name(), error)
+            });
+            (action, result)
+        })
+        .collect()
+}
+
+/// Executes the trade directives in a completed assistant reply once and
+/// returns just the receipts, ready to store on the message record.
+pub fn execute_trades_in_reply(text: &str) -> Vec<TradeActionResult> {
+    execute_trade_directives_in_text(text)
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect()
+}
+
+/// Iterates over the complete fenced directive blocks in `text`, yielding the
+/// fence kind and its body. Unclosed fences are ignored.
+fn fenced_blocks(text: &str) -> Vec<(DirectiveFence, String)> {
+    let mut blocks = Vec::new();
+    let mut lines = text.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        let Some(kind) = directive_fence(line) else {
+            continue;
+        };
+        let mut body = String::new();
+        let mut closed = false;
+        for inner in lines.by_ref() {
+            if inner.trim_start().starts_with("```") {
+                closed = true;
+                break;
+            }
+            body.push_str(inner);
+        }
+        if closed {
+            blocks.push((kind, body));
+        }
+    }
+    blocks
+}
+
+/// True when `line` is a partially streamed directive fence opener, e.g. "``",
+/// "```", "```tra", or "```agent-a". Such a line is withheld while typing so
+/// the marker never flickers into the visible reply.
+fn is_partial_directive_opener(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("``") else {
+        return false;
+    };
+    let language = rest.trim_start_matches('`').trim().to_ascii_lowercase();
+    if language.is_empty() {
+        return true;
+    }
+    [
+        "chart",
+        "finter-chart",
+        "trade",
+        "finter-trade",
+        "agent-action",
+        "finter-agent-action",
+    ]
+    .iter()
+    .any(|known| known.starts_with(&language))
+}
+
+/// Removes chart and trade fences while a reply is still being typed out.
 ///
 /// An unclosed fence is dropped through to the end of the streamed text so the
-/// user never sees half-written JSON.
+/// user never sees half-written JSON. A fence whose opening line has not fully
+/// arrived yet (for example a trailing "``" or "```tra") is dropped as well, so
+/// directive markers never flicker into the typing view.
 pub fn strip_chart_directives(text: &str) -> String {
     let mut output = String::new();
     let mut lines = text.split_inclusive('\n').peekable();
     while let Some(line) = lines.next() {
-        if !is_chart_fence(line) {
-            output.push_str(line);
+        if directive_fence(line).is_some() {
+            while let Some(inner) = lines.next() {
+                if inner.trim_start().starts_with("```") {
+                    break;
+                }
+            }
             continue;
         }
-        while let Some(inner) = lines.next() {
-            if inner.trim_start().starts_with("```") {
-                break;
-            }
+        // A trailing, still-streaming fence opener such as "``", "```tra" or
+        // "```agent-a" is held back until the language is known.
+        if !line.ends_with('\n') && is_partial_directive_opener(line) {
+            continue;
         }
+        output.push_str(line);
     }
     output
 }
@@ -1032,5 +1576,212 @@ mod tests {
 
         let normal_code = "Before\n```rust\nfn main() {}\n```\nAfter";
         assert_eq!(strip_chart_directives(normal_code), normal_code);
+    }
+
+    #[test]
+    fn strips_trade_directives_while_typing() {
+        let complete = "Buying now.\n```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\"}\n```\nDone.";
+        assert_eq!(strip_chart_directives(complete), "Buying now.\nDone.");
+
+        let agent_action = "```agent-action\n{\"action\":\"cancel_order\",\"order_id\":\"abc\"}\n```";
+        assert_eq!(strip_chart_directives(agent_action), "");
+
+        let streaming = "Buying\n```trade\n{\"action\":\"place_";
+        assert_eq!(strip_chart_directives(streaming), "Buying\n");
+    }
+
+    #[test]
+    fn partial_fence_openers_do_not_flicker() {
+        for partial in ["Before\n``", "Before\n```", "Before\n```tra", "Before\n```agent-a"] {
+            assert_eq!(strip_chart_directives(partial), "Before\n", "input={partial}");
+        }
+        // A complete opener without a body yet hides the whole (empty) block.
+        assert_eq!(strip_chart_directives("Before\n```trade"), "Before\n");
+        // Non-directive fences are untouched.
+        assert_eq!(strip_chart_directives("Before\n```rust"), "Before\n```rust");
+    }
+
+    #[test]
+    fn parses_trade_action_variants() {
+        let action: TradeAction = serde_json::from_str(
+            "{\"action\":\"place_order\",\"symbol\":\"btcusdt\",\"side\":\"long\",\"order_type\":\"limit\",\"price\":\"64000\",\"margin\":1000,\"leverage\":5,\"market_type\":\"futures\",\"mode\":\"paper\"}",
+        )
+        .expect("valid place_order");
+        match &action {
+            TradeAction::PlaceOrder { symbol, side, order_type, price, margin, leverage, market_type, mode } => {
+                assert_eq!(symbol, "btcusdt");
+                assert_eq!(side, "long");
+                assert_eq!(order_type.as_deref(), Some("limit"));
+                assert_eq!(*price, Some(64_000.0));
+                assert_eq!(*margin, Some(1_000.0));
+                assert_eq!(*leverage, Some(5.0));
+                assert_eq!(market_type.as_deref(), Some("futures"));
+                assert_eq!(mode.as_deref(), Some("paper"));
+            }
+            other => panic!("expected place_order, got {other:?}"),
+        }
+        assert_eq!(action.kind_label(), "Place order");
+        assert!(!action.is_live());
+
+        let cancel: TradeAction =
+            serde_json::from_str("{\"action\":\"cancel_order\",\"order_id\":\"abc123\"}").expect("valid cancel");
+        assert_eq!(cancel.action_name(), "cancel_order");
+
+        let close: TradeAction = serde_json::from_str(
+            "{\"action\":\"close_position\",\"pos_id\":\"abc123\",\"current_price\":64250.5}",
+        )
+        .expect("valid close");
+        assert_eq!(close.action_name(), "close_position");
+    }
+
+    #[test]
+    fn trade_action_validation_rejects_bad_input() {
+        let missing_symbol: TradeAction = serde_json::from_str(
+            "{\"action\":\"place_order\",\"side\":\"buy\",\"margin\":100}",
+        )
+        .expect("parses");
+        assert!(missing_symbol.validate().is_err());
+
+        let bad_side: TradeAction = serde_json::from_str(
+            "{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"sideways\",\"margin\":100}",
+        )
+        .expect("parses");
+        assert!(bad_side.validate().is_err());
+
+        let limit_without_price: TradeAction = serde_json::from_str(
+            "{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"order_type\":\"limit\",\"margin\":100}",
+        )
+        .expect("parses");
+        assert!(limit_without_price.validate().is_err());
+
+        let no_margin: TradeAction = serde_json::from_str(
+            "{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\"}",
+        )
+        .expect("parses");
+        assert!(no_margin.validate().is_err());
+    }
+
+    #[test]
+    fn parses_trade_block_without_executing() {
+        // A rejected action still yields a Trade segment, but parsing is pure:
+        // no result is attached until the caller executes the reply once.
+        let reply = "Placing.\n```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"margin\":-5}\n```\nDone.";
+        let segments = parse_message_segments(reply);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], MessageSegment::Markdown("Placing.\n".to_string()));
+        match &segments[1] {
+            MessageSegment::Trade(action, result) => {
+                assert_eq!(action.action_name(), "place_order");
+                assert!(result.is_none(), "parsing must not execute trades");
+            }
+            other => panic!("expected trade, got {other:?}"),
+        }
+        assert_eq!(segments[2], MessageSegment::Markdown("\nDone.".to_string()));
+    }
+
+    #[test]
+    fn agent_action_fence_is_a_trade_directive() {
+        let reply = "```agent-action\n{\"action\":\"cancel_order\"}\n```";
+        let segments = parse_message_segments(reply);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            MessageSegment::Trade(action, result) => {
+                assert_eq!(action.action_name(), "cancel_order");
+                assert!(result.is_none());
+            }
+            other => panic!("expected trade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn receipts_are_attached_to_matching_trade_segments() {
+        let reply = "A\n```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"margin\":-5}\n```\nB\n```trade\n{\"action\":\"cancel_order\"}\n```";
+        let receipt = TradeActionResult::failure("place_order", "rejected");
+        let segments = parse_message_segments_with_results(reply, &[receipt.clone()]);
+        let trades: Vec<_> = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                MessageSegment::Trade(action, result) => Some((action.action_name(), result.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].1, Some(receipt));
+        // Missing receipts stay unexecuted rather than inventing a result.
+        assert_eq!(trades[1].1, None);
+    }
+
+    #[test]
+    fn parsing_never_executes_trades() {
+        // Count the orders in the global store before and after repeated parses.
+        let reply = "```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"order_type\":\"limit\",\"price\":100,\"margin\":10}\n```";
+        let before = TradeStore::global().lock().unwrap().orders.len();
+        for _ in 0..5 {
+            let _ = parse_message_segments(reply);
+            let _ = parse_message_segments_with_results(reply, &[]);
+        }
+        let after = TradeStore::global().lock().unwrap().orders.len();
+        assert_eq!(before, after, "rendering/parsing must not place orders");
+    }
+
+    #[test]
+    fn executes_directives_once_per_explicit_call() {
+        let reply = "```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"order_type\":\"limit\",\"price\":100,\"margin\":10}\n```\n```trade\n{\"action\":\"place_order\",\"symbol\":\"BTC/USDT\",\"side\":\"buy\",\"margin\":-1}\n```";
+        let directives = parse_trade_directives_in_text(reply);
+        assert_eq!(directives.len(), 2);
+
+        let before = TradeStore::global().lock().unwrap().orders.len();
+        let results = execute_trade_directives_in_text(reply);
+        let after = TradeStore::global().lock().unwrap().orders.len();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.ok);
+        assert!(!results[1].1.ok);
+        // Exactly one order was placed for the two directives.
+        assert_eq!(after, before + 1);
+
+        // Re-parsing the same text with the stored receipts does not execute again.
+        let receipts: Vec<TradeActionResult> =
+            results.into_iter().map(|(_, result)| result).collect();
+        let segments = parse_message_segments_with_results(reply, &receipts);
+        assert_eq!(
+            segments
+                .iter()
+                .filter(|segment| matches!(segment, MessageSegment::Trade(..)))
+                .count(),
+            2
+        );
+        let after_render = TradeStore::global().lock().unwrap().orders.len();
+        assert_eq!(after_render, after, "re-rendering must not place orders");
+    }
+
+    #[test]
+    fn message_record_persists_trade_receipts() {
+        let record = ChatMessageRecord {
+            prompt: "buy".into(),
+            response: "ok".into(),
+            failed: false,
+            timestamp: None,
+            trade_receipts: vec![TradeActionResult::failure("place_order", "rejected")],
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let decoded: ChatMessageRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.trade_receipts.len(), 1);
+        assert!(!decoded.trade_receipts[0].ok);
+
+        // Older records without the field still load with no receipts.
+        let legacy: ChatMessageRecord =
+            serde_json::from_str("{\"prompt\":\"p\",\"response\":\"r\"}").expect("legacy");
+        assert!(legacy.trade_receipts.is_empty());
+    }
+
+    #[test]
+    fn invalid_trade_block_is_preserved_as_markdown() {
+        let reply = "```trade\nnot json\n```";
+        let segments = parse_message_segments(reply);
+        assert_eq!(segments.len(), 1);
+        match &segments[0] {
+            MessageSegment::Markdown(text) => assert!(text.contains("not json")),
+            other => panic!("expected markdown, got {other:?}"),
+        }
     }
 }

@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Axis, Div, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    Stateful, Styled, Window, div, prelude::FluentBuilder as _,
+    Stateful, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use std::{any::TypeId, ops::Deref, rc::Rc};
 
@@ -171,45 +171,77 @@ impl SettingItem {
                     description,
                     layout,
                     field,
-                } => div()
-                    .w_full()
-                    .overflow_hidden()
-                    .map(|this| {
-                        if layout.is_horizontal() {
-                            this.h_flex().justify_between().items_start()
-                        } else {
-                            this.v_flex()
-                        }
-                    })
-                    .gap_3()
-                    .child(
-                        v_flex()
-                            .map(|this| {
-                                if layout.is_horizontal() {
-                                    this.flex_1().max_w_3_5()
-                                } else {
-                                    this.w_full()
-                                }
-                            })
-                            .gap_1()
-                            .child(Label::new(title.clone()).text_sm())
-                            .when_some(description.clone(), |this, description| {
-                                this.child(
-                                    div()
-                                        .size_full()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(description),
-                                )
-                            }),
-                    )
-                    .child(div().id("field").child(Self::render_field(
-                        field,
-                        RenderOptions { layout, ..*options },
-                        window,
-                        cx,
-                    )))
-                    .into_any_element(),
+                } => {
+                    let field_type = field.field_type();
+                    let wide_field = field_type.is_input()
+                        || field_type.is_number_input()
+                        || field_type.is_dropdown()
+                        || field_type.is_combobox();
+                    let is_element = field_type.is_element();
+
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .map(|this| {
+                            if layout.is_horizontal() {
+                                // Wrap the field onto its own line when the
+                                // content area is narrower than label + field.
+                                this.h_flex().justify_between().items_start().flex_wrap()
+                            } else {
+                                this.v_flex()
+                            }
+                        })
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .map(|this| {
+                                    if layout.is_horizontal() {
+                                        // Keep enough room for the title so it
+                                        // wraps normally instead of collapsing
+                                        // into a one-character-wide column, but
+                                        // let it shrink on compact windows.
+                                        this.flex_1().min_w(px(120.)).max_w_3_5()
+                                    } else {
+                                        this.w_full()
+                                    }
+                                })
+                                .gap_1()
+                                .child(Label::new(title.clone()).text_sm())
+                                .when_some(description.clone(), |this, description| {
+                                    this.child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(description),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("field")
+                                .min_w_0()
+                                .when(layout.is_vertical(), |this| this.w_full())
+                                .when(layout.is_horizontal() && wide_field, |this| {
+                                    // Keep a comfortable preferred width, but let
+                                    // the field shrink with the row (flex-wrap
+                                    // moves it onto its own line when needed) so
+                                    // narrow windows never push horizontal scroll.
+                                    this.w(px(256.)).min_w(px(140.)).max_w_full().flex_1()
+                                })
+                                .when(layout.is_horizontal() && is_element, |this| this.flex_1())
+                                .child(Self::render_field(
+                                    field,
+                                    RenderOptions { layout, ..*options },
+                                    window,
+                                    cx,
+                                )),
+                        )
+                        .into_any_element()
+                }
                 SettingItem::Element { render } => {
                     (render)(&options, window, cx).into_any_element()
                 }

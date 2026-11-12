@@ -514,29 +514,43 @@ where
         }
 
         // ------------------------------------------------------------------ //
-        // 3. Timestamp-based X scale (LinearScale over Unix ms)
+        // 3. Slot (index) based X layout
         // ------------------------------------------------------------------ //
+        // Financial charts never map candles onto a continuous time axis: gaps
+        // (weekends, non-trading hours, cache/live seams) would either stretch
+        // the scale or push candles off-screen. Each visible candle instead
+        // owns one discrete slot of `slot_w` pixels, so candles always sit
+        // adjacent to one another and every candle stays on screen.
         let visible_count_f = if let Some(ref st) = self.state {
-            st.visible_count as f64
+            st.visible_count.max(1) as f32
         } else {
             100.0
         };
+        let slot_w = (chart_w / visible_count_f).max(1.0);
+        let body_w = (slot_w * self.body_width_ratio).clamp(1.0, 50.0);
 
-        let mut ts_min = *timestamps.first().unwrap_or(&0) as f64;
-        let mut ts_max = ts_min + (visible_count_f - 1.0f64) * (interval_ms as f64);
-
-        // Apply panning shift to X-axis domain to support dragging into empty space
+        // Sub-candle pan offset: `viewport_offset` may sit between two candles
+        // while dragging, so shift the whole strip by the fractional part.
         let shift_candles = if let Some(ref st) = self.state {
-            let actual_start = (st.viewport_offset.floor() as isize).max(0) as f64;
-            actual_start - st.viewport_offset
+            let actual_start = (st.viewport_offset.floor() as isize).max(0) as f32;
+            actual_start - st.viewport_offset as f32
         } else {
             0.0
         };
-        let ts_shift = shift_candles * (interval_ms as f64);
-        ts_min -= ts_shift;
-        ts_max -= ts_shift;
 
-        let x_scale = LinearScale::new(ts_min, ts_max, 0.0, chart_w);
+        // Per-candle centre X pixel (relative to chart area, not bounds).
+        let mut centres_x: Vec<f32> = Vec::with_capacity(visible.len());
+        for i in 0..visible.len() {
+            centres_x.push((i as f32 + shift_candles + 0.5) * slot_w);
+        }
+
+        // Timestamp → slot centre, so indicator series can be positioned on the
+        // exact candle slot they belong to (they may be sparse or offset).
+        let mut ts_to_x: std::collections::HashMap<i64, f32> =
+            std::collections::HashMap::with_capacity(visible.len());
+        for (i, &ts) in timestamps.iter().enumerate() {
+            ts_to_x.insert(ts, centres_x[i]);
+        }
 
         // ------------------------------------------------------------------ //
         // 4. Y scale (price → pixel, inverted)
@@ -571,9 +585,11 @@ where
         let visible_y_vals: Vec<f64> = visible
             .iter()
             .enumerate()
-            .zip(timestamps.iter())
-            .filter(|&((_, _), &ts)| (ts as f64) >= ts_min && (ts as f64) <= ts_max)
-            .flat_map(|((i, d), _)| {
+            .filter(|&(i, _)| {
+                let cx = (i as f32 + shift_candles + 0.5) * slot_w;
+                cx >= -slot_w && cx <= chart_w + slot_w
+            })
+            .flat_map(|(i, d)| {
                 if self.candle_type == CandleType::HeikinAshi {
                     let (ho, hh, hl, hc) = ha_data[i];
                     vec![hh, hl, ho, hc]
@@ -659,7 +675,10 @@ where
         if let Some(ref st) = self.state {
             st.candle_plot_origin.set(Some((origin.x.as_f32(), origin.y.as_f32())));
             st.candle_plot_size.set(Some((chart_w, candle_h)));
-            st.candle_ts_range.set(Some((ts_min, ts_max)));
+            st.candle_ts_range.set(Some((
+                *timestamps.first().unwrap_or(&0) as f64,
+                *timestamps.last().unwrap_or(&0) as f64,
+            )));
             st.candle_price_range.set(Some((y_min_padded, y_max_padded)));
         }
         let bullish_color = cx.theme().bullish;
@@ -678,27 +697,16 @@ where
         let crosshair_fg = cx.theme().background;
         let candle_type = self.candle_type;
 
-        // Per-candle slot width in pixels.
-        let slot_w = if n > 1 {
-            let first_px = x_scale.scale(timestamps[0] as f64);
-            let second_px = x_scale.scale(timestamps[1] as f64);
-            (second_px - first_px).abs()
-        } else {
-            chart_w / 10.0
-        };
-        let body_w = (slot_w * self.body_width_ratio).max(1.0);
-
         let mut period_high_f = f64::NEG_INFINITY;
         let mut period_low_f = f64::INFINITY;
         let mut period_high_px = (0f32, 0f32);
         let mut period_low_px = (0f32, 0f32);
 
-        // Per-candle centre X pixel (relative to chart area, not bounds).
-        let mut centres_x: Vec<f32> = Vec::with_capacity(n);
         // For Area type: collect (x, close_y) points.
         let mut area_points: Vec<(f32, f32)> = Vec::with_capacity(n);
 
-        // Determine which candle is being hovered (if any)
+        // Determine which candle is being hovered (if any) directly from the
+        // cursor's slot index — no timestamp inversion needed.
         let hovered_candle_idx: Option<usize> = if let Some(ref st) = self.state {
             if let Some(cursor) = st.crosshair_pos {
                 let cursor_rel = cursor - origin;
@@ -707,12 +715,13 @@ where
                     st.last_cursor_frac.set(cursor_x_in_chart / chart_w);
                 }
                 if cursor_x_in_chart >= 0.0 && cursor_x_in_chart <= chart_w {
-                    let cursor_ts = x_scale.inverse(cursor_x_in_chart);
-                    timestamps
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|&(_, ts)| (*ts as f64 - cursor_ts).abs() as i64)
-                        .map(|(idx, _)| idx)
+                    let idx_f = (cursor_x_in_chart / slot_w) - shift_candles;
+                    let idx = idx_f.floor() as isize;
+                    if idx >= 0 && (idx as usize) < visible.len() {
+                        Some(idx as usize)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -723,9 +732,8 @@ where
             None
         };
 
-        for (i, (d, &ts)) in visible.iter().zip(timestamps.iter()).enumerate() {
-            let center_x = x_scale.scale(ts as f64);
-            centres_x.push(center_x);
+        for (i, (d, _ts)) in visible.iter().zip(timestamps.iter()).enumerate() {
+            let center_x = centres_x[i];
 
             let mut open_v = open_fn(d).to_f64().unwrap_or(0.0);
             let mut high_v = high_fn(d).to_f64().unwrap_or(0.0);
@@ -974,7 +982,7 @@ where
                     let mut line_path = gpui::PathBuilder::stroke(gpui::px(1.5));
                     let mut started = false;
                     for &(ts, val) in series {
-                        let px_x = x_scale.scale(ts as f64);
+                        let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
                         if px_x < 0.0 || px_x > chart_w || val.is_nan() { continue; }
                         let y_abs = origin.y.as_f32() + scale_y(val);
                         let x_abs = origin.x.as_f32() + px_x;
@@ -992,10 +1000,10 @@ where
                     }
                 } else if *style == IndicatorStyle::Histogram {
                     let zero_y = scale_y(0.0).clamp(pane_y0, pane_y0 + pane_h);
-                    let bar_w = (chart_w / visible.len() as f32 * 0.8).clamp(1.0, 10.0);
-                    
+                    let bar_w = (slot_w * self.body_width_ratio).clamp(1.0, 10.0);
+
                     for &(ts, val) in series {
-                        let px_x = x_scale.scale(ts as f64);
+                        let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
                         if px_x < 0.0 || px_x > chart_w || val.is_nan() { continue; }
                         let y_abs = scale_y(val);
                         let x_abs = origin.x.as_f32() + px_x - bar_w / 2.0;
@@ -1032,7 +1040,7 @@ where
                     let mut p_max = f64::NEG_INFINITY;
                     for (series, _, style, _) in lines {
                         for &(ts, val) in series {
-                            let px_x = x_scale.scale(ts as f64);
+                            let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
                             if px_x >= 0.0 && px_x <= chart_w && !val.is_nan() {
                                 p_min = p_min.min(val);
                                 p_max = p_max.max(val);
@@ -1136,7 +1144,7 @@ where
                     window.paint_path(p, cx.theme().border);
                 }
 
-                for (d, (&ts, &vol)) in visible.iter().zip(timestamps.iter().zip(vols.iter())) {
+                for (i, (d, &vol)) in visible.iter().zip(vols.iter()).enumerate() {
                     let is_bull =
                         close_fn(d).to_f64().unwrap_or(0.0) >= open_fn(d).to_f64().unwrap_or(0.0);
                     let color: Hsla = if is_bull {
@@ -1144,7 +1152,10 @@ where
                     } else {
                         bearish_color.opacity(0.5)
                     };
-                    let center_x = x_scale.scale(ts as f64);
+                    let center_x = centres_x
+                        .get(i)
+                        .copied()
+                        .unwrap_or((i as f32 + shift_candles + 0.5) * slot_w);
                     let pane_h = avail * subpane_ratios[0];
                     let bar_h = ((vol / max_vol) as f32 * pane_h).max(1.0);
                     let bx = center_x - body_w / 2.;
@@ -1212,26 +1223,22 @@ where
             }
         }
 
-        // 6. X-axis tick labels (timestamp-based)
+        // 6. X-axis tick labels (slot-based, evenly spaced)
         // ------------------------------------------------------------------ //
         {
             let origin = bounds.origin;
             let axis_y = origin.y.as_f32() + full_h - AXIS_GAP;
 
-            let mut last_drawn_ts: Option<i64> = None;
-            for (i, (&ts, _)) in timestamps.iter().zip(visible.iter()).enumerate() {
-                let current_bucket = ((ts as f64) / best_interval).floor() as i64;
-                let prev_bucket = if i > 0 {
-                    ((timestamps[i - 1] as f64) / best_interval).floor() as i64
-                } else {
-                    current_bucket
-                };
+            // Space labels out so they never collide: at most one label per
+            // `min_label_spacing` pixels of chart width.
+            let min_label_spacing = 80.0f32;
+            let max_ticks = ((chart_w / min_label_spacing).floor() as usize).max(2);
+            let step = (visible.len() / max_ticks).max(1);
 
-                // Always draw the first candle, or when crossing a bucket boundary
-                if i != 0 && current_bucket <= prev_bucket {
-                    continue;
-                }
-                let px_x = x_scale.scale(ts as f64);
+            let mut last_drawn_ts: Option<i64> = None;
+            for i in (0..visible.len()).step_by(step) {
+                let ts = timestamps[i];
+                let px_x = (i as f32 + shift_candles + 0.5) * slot_w;
                 let abs_x = origin.x.as_f32() + px_x;
                 let label: SharedString = self
                     .format_timestamp_short
@@ -1933,14 +1940,16 @@ where
                 let cursor_rel = cursor - origin;
                 let cursor_x_in_chart = cursor_rel.x.as_f32();
                 if cursor_x_in_chart >= 0.0 && cursor_x_in_chart <= chart_w {
-                    // Find the nearest candle using the X scale for accurate alignment.
-                    let cursor_ts = x_scale.inverse(cursor_x_in_chart);
-                    let idx_opt = timestamps
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|&(_, ts)| (*ts as f64 - cursor_ts).abs() as i64);
+                    // Snap to the candle slot under the cursor.
+                    let idx_f = (cursor_x_in_chart / slot_w) - shift_candles;
+                    let idx_signed = idx_f.floor() as isize;
+                    let idx_opt = if idx_signed >= 0 && (idx_signed as usize) < visible.len() {
+                        Some(idx_signed as usize)
+                    } else {
+                        None
+                    };
 
-                    if let Some((idx, _)) = idx_opt {
+                    if let Some(idx) = idx_opt {
                         if idx < visible.len() {
                             let abs_idx = st.visible_range(self.data.len()).start + idx;
                             st.crosshair_index.set(Some(abs_idx));
@@ -2203,7 +2212,10 @@ where
         window: &mut Window,
         cx: &mut App,
     ) {
-        let gold: Hsla = rgb(0xf0c060).into();
+        // Theme-adaptive marker colour: the hardcoded gold was designed for
+        // dark backgrounds only and had near-zero contrast on the light
+        // parchment/sepia theme.
+        let gold: Hsla = cx.theme().foreground.opacity(0.85);
         let (cx_rel, cy_rel) = px_pos;
         let abs_x = origin_x + cx_rel;
         let abs_y = origin_y + cy_rel;
@@ -2222,15 +2234,27 @@ where
         let lh = 12.0_f32;
         let label_offset = 13.0_f32;
 
-        let (text_y, connector_end_y) = if is_high {
-            let ty = (abs_y - label_offset).max(origin_y + 2.);
-            (ty, ty)
+        // Label placement: prefer outside the extreme (above the period high,
+        // below the period low) but flip to the other side when there is not
+        // enough room before the chart edge. Without this flip, a low at the
+        // bottom of the plot painted the price label on top of the X-axis date
+        // ticks.
+        let (ly, connector_end_y) = if is_high {
+            if abs_y - label_offset - lh < origin_y + 2.0 {
+                (abs_y + label_offset + 1.0, abs_y + label_offset)
+            } else {
+                (abs_y - label_offset - lh, abs_y - label_offset)
+            }
         } else {
-            let ty = (abs_y + label_offset).min(origin_y + candle_h - 2.);
-            (ty, ty)
+            if abs_y + label_offset + lh > origin_y + candle_h - 2.0 {
+                // No room below the price point: flip the label above it.
+                (abs_y - label_offset - lh, abs_y - label_offset)
+            } else {
+                (abs_y + label_offset + 1.0, abs_y + label_offset)
+            }
         };
 
-        // Vertical connector.
+        // Vertical connector from the extreme to the label side.
         let mut conn = PathBuilder::stroke(px(1.));
         conn.move_to(gpui::point(px(abs_x), px(abs_y)));
         conn.line_to(gpui::point(px(abs_x), px(connector_end_y)));
@@ -2243,11 +2267,6 @@ where
             abs_x + 6.0
         } else {
             (abs_x - lw - 6.0).max(origin_x)
-        };
-        let ly = if is_high {
-            text_y - lh - 1.
-        } else {
-            text_y + 1.
         };
         let label_bounds = Bounds::from_corners(
             gpui::point(px(lx), px(ly)),

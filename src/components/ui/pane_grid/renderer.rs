@@ -179,14 +179,15 @@ fn infer_market_type(exchange: &str, symbol: &str) -> crate::data::trade_store::
     if MarketType::is_dedicated_futures_exchange(exchange) {
         return MarketType::Futures;
     }
-    let infos = crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(exchange);
+    let exchange = api_exchange_id(exchange);
+    let infos = crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(&exchange);
     if let Some(info) = infos
         .iter()
         .find(|info| symbol_matches(&info.symbol, symbol))
     {
         return MarketType::from_symbol_type(&info.symbol_type);
     }
-    MarketType::default_for_exchange(exchange)
+    MarketType::default_for_exchange(&exchange)
 }
 
 fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Value, window: &mut Window, cx: &mut App) {
@@ -318,13 +319,24 @@ fn timezone_choices() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Normalize an exchange id to the spelling the `api-service` / CCXT
+/// endpoints expect. Gate.io was renamed to Gate in CCXT, so the legacy
+/// `gateio` id (still present in older saved layouts) must be sent as `gate`.
+pub(crate) fn api_exchange_id(exchange: &str) -> String {
+    let ex = exchange.trim().to_lowercase();
+    match ex.as_str() {
+        "gateio" => "gate".to_string(),
+        _ => ex,
+    }
+}
+
 fn exchange_choices() -> Vec<String> {
     let reg_exchanges = crate::data::gateway_registry::GatewayRegistry::global().exchanges();
     if !reg_exchanges.is_empty() {
         return reg_exchanges;
     }
     vec![
-        "binance", "bybit", "okx", "kraken", "coinbase", "kucoin", "gateio",
+        "binance", "bybit", "okx", "kraken", "coinbase", "kucoin", "gate",
     ]
     .into_iter()
     .map(str::to_string)
@@ -332,7 +344,8 @@ fn exchange_choices() -> Vec<String> {
 }
 
 fn symbol_choices(exchange: &str) -> Vec<String> {
-    let reg_symbols = crate::data::gateway_registry::GatewayRegistry::global().symbols(exchange);
+    let exchange = api_exchange_id(exchange);
+    let reg_symbols = crate::data::gateway_registry::GatewayRegistry::global().symbols(&exchange);
     if !reg_symbols.is_empty() {
         return reg_symbols;
     }
@@ -353,18 +366,20 @@ fn symbol_choices_for_market(
     market_type: crate::data::trade_store::MarketType,
 ) -> Vec<String> {
     use crate::data::trade_store::MarketType;
+    let exchange = api_exchange_id(exchange);
     // Dedicated futures venues may not have rich symbol metadata loaded yet.
-    if MarketType::is_dedicated_futures_exchange(exchange) {
-        return symbol_choices(exchange);
+    if MarketType::is_dedicated_futures_exchange(&exchange) {
+        return symbol_choices(&exchange);
     }
-    let infos = crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(exchange);
+    let infos =
+        crate::data::gateway_registry::GatewayRegistry::global().symbol_infos(&exchange);
     let filtered: Vec<String> = infos
         .iter()
         .filter(|info| MarketType::from_symbol_type(&info.symbol_type) == market_type)
         .map(|info| info.symbol.clone())
         .collect();
     if filtered.is_empty() {
-        symbol_choices(exchange)
+        symbol_choices(&exchange)
     } else {
         filtered
     }
@@ -1964,7 +1979,8 @@ impl PaneGridRenderer {
                             .child(match module_type.to_lowercase().as_str() {
                                 "chart" => {
                                     let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
+                                    // Send the CCXT/api-service id (e.g. `gate`, not `gateio`).
+                                    let exchange = api_exchange_id(&config_str(config, "exchange", "binance"));
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
                                     // Older FinTer layouts used `timeframe`; web layouts use `interval`.
                                     let timeframe = config_str(config, "interval", &config_str(config, "timeframe", "1m"));
@@ -2076,7 +2092,8 @@ impl PaneGridRenderer {
                                 }
                                 "ticker" => {
                                     let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
+                                    // Send the CCXT/api-service id (e.g. `gate`, not `gateio`).
+                                    let exchange = api_exchange_id(&config_str(config, "exchange", "binance"));
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
 
                                     let mut ticker_map = self.ticker_views.borrow_mut();
@@ -2109,7 +2126,8 @@ impl PaneGridRenderer {
                                 }
                                 "orderbook" => {
                                     let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
+                                    // Send the CCXT/api-service id (e.g. `gate`, not `gateio`).
+                                    let exchange = api_exchange_id(&config_str(config, "exchange", "binance"));
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
                                     let limit = config_usize(config, "limit", 20);
 
@@ -2175,7 +2193,8 @@ impl PaneGridRenderer {
                                 }
                                 "trades" | "tape" => {
                                     let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
+                                    // Send the CCXT/api-service id (e.g. `gate`, not `gateio`).
+                                    let exchange = api_exchange_id(&config_str(config, "exchange", "binance"));
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
                                     let mut tape_map = self.tape_views.borrow_mut();
                                     let needs_recreate = match tape_map.get(&pane_id) {
@@ -2244,7 +2263,8 @@ impl PaneGridRenderer {
                                 }
                                 "execution" | "tradedesk" => {
                                     let config = data.config.as_object();
-                                    let exchange = config_str(config, "exchange", "binance");
+                                    // Send the CCXT/api-service id (e.g. `gate`, not `gateio`).
+                                    let exchange = api_exchange_id(&config_str(config, "exchange", "binance"));
                                     let symbol = config_str(config, "symbol", "BTC/USDT");
                                     let live_mode = config_bool(config, "live_mode", true);
                                     let market_type =

@@ -1,8 +1,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    prelude::FluentBuilder as _, AnyElement, App, Corner, IntoElement, SharedString,
-    StyleRefinement, Styled, Window,
+    AnyElement, App, Corner, IntoElement, SharedString, StyleRefinement, Styled, Window,
 };
 
 use crate::{
@@ -12,7 +11,7 @@ use crate::{
         fields::{get_value, set_value, SettingFieldRender},
         AnySettingField, RenderOptions,
     },
-    AxisExt, Sizable, StyledExt,
+    Sizable, StyledExt,
 };
 
 pub(crate) struct DropdownField<T> {
@@ -52,7 +51,7 @@ where
             .unwrap_or_else(|| old_value.clone().into());
 
         Button::new("btn")
-            .when(options.layout.is_vertical(), |this| this.w_full())
+            .w_full()
             .label(old_label)
             .dropdown_caret(true)
             .outline()

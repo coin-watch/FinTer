@@ -978,6 +978,20 @@ fn handle_message(
     // Data push — dispatch by channel
     let Some(data) = msg.data else { return };
 
+    // A single gateway connection may multiplex several subscriptions, so drop
+    // any push that belongs to a different exchange / symbol than this bridge.
+    if !message_matches_config(&msg.exchange, &msg.symbol, &config.exchange, &config.symbol) {
+        debug!(
+            "gateway: ignoring {:?} push for {}/{} (bridge is {}/{})",
+            msg.channel,
+            msg.exchange.as_deref().unwrap_or("?"),
+            msg.symbol.as_deref().unwrap_or("?"),
+            config.exchange,
+            config.symbol
+        );
+        return;
+    }
+
     match msg.channel.as_deref() {
         Some("ticker") => {
             let target = if let Some(inner) = data.get("data").or_else(|| data.get("ticker")) {
@@ -1174,6 +1188,38 @@ fn handle_message(
     let _ = history_cache;
 }
 
+/// True when a gateway push belongs to the bridge's exchange/symbol.
+///
+/// Messages without an `exchange`/`symbol` field are accepted (the gateway
+/// only sends those on single-subscription connections). Exchange ids are
+/// compared case-insensitively and symbol separators (`/`, `-`, `_`, `:`) are
+/// ignored so `BTC/USDT`, `BTC-USDT` and `BTC/USDT:USDT` all match.
+fn message_matches_config(
+    msg_exchange: &Option<String>,
+    msg_symbol: &Option<String>,
+    config_exchange: &str,
+    config_symbol: &str,
+) -> bool {
+    let exchange_matches = match msg_exchange {
+        Some(exchange) => exchange.trim().eq_ignore_ascii_case(config_exchange.trim()),
+        None => true,
+    };
+    let symbol_matches = match msg_symbol {
+        Some(symbol) => normalize_symbol_key(symbol) == normalize_symbol_key(config_symbol),
+        None => true,
+    };
+    exchange_matches && symbol_matches
+}
+
+/// Lowercase a symbol and strip the separators exchanges disagree about.
+fn normalize_symbol_key(symbol: &str) -> String {
+    symbol
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
     if let Ok(candle) = serde_json::from_value::<OhlcvCandle>(val.clone()) {
         return Some(candle);
@@ -1264,6 +1310,95 @@ fn parse_kline_payload(data: &serde_json::Value) -> Vec<OhlcvCandle> {
 // REST helper — OHLCV history only
 // ---------------------------------------------------------------------------
 
+/// Issue the metered OHLCV history request with the given bearer token.
+async fn send_ohlcv_request(
+    config: &BridgeConfig,
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<reqwest::Response> {
+    let mut req = reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .header("Origin", &config.rest_base_url)
+        .header("Referer", format!("{}/", &config.rest_base_url));
+    if let Some(token) = token {
+        req = req.bearer_auth(token);
+    }
+    Ok(req.timeout(Duration::from_secs(30)).send().await?)
+}
+
+/// Exchange the stored refresh token for a fresh access token.
+///
+/// The refreshed session is persisted (keyring + `~/.config/finter/session.json`)
+/// so every other consumer of the session picks up the new credentials, and the
+/// new access token is returned for the caller's immediate retry.
+async fn refresh_session_token(config: &BridgeConfig) -> Option<String> {
+    let stored = crate::data::session_store::load_session().ok().flatten()?;
+
+    // Prefer the configured API origin, falling back to the hosted staging
+    // origin used by the desktop client's auth flow.
+    let base = {
+        let configured = config.rest_base_url.trim().trim_end_matches('/');
+        if configured.is_empty() {
+            "https://staging.coinwat.ch".to_string()
+        } else {
+            configured.to_string()
+        }
+    };
+    let url = format!("{base}/api/auth/refresh");
+    let body = crate::data::models::RefreshRequest {
+        refresh_token: stored.refresh_token.clone(),
+    };
+
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("Origin", &base)
+        .header("Referer", format!("{base}/"))
+        .json(&body)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| warn!("gateway: session refresh request failed: {e}"))
+        .ok()?;
+
+    let status = response.status();
+    let bytes = response.bytes().await.ok()?;
+    if !status.is_success() {
+        warn!("gateway: session refresh returned HTTP {status}");
+        return None;
+    }
+    let auth: crate::data::models::AuthResponse = serde_json::from_slice(&bytes)
+        .map_err(|e| warn!("gateway: session refresh response parse error: {e}"))
+        .ok()?;
+    if !auth.success {
+        warn!(
+            "gateway: session refresh rejected: {}",
+            auth.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+        return None;
+    }
+
+    let access_token = auth.access_token()?;
+    let session = crate::data::models::AuthSession {
+        user_id: auth.user_id().unwrap_or(stored.user_id),
+        email: auth.email().unwrap_or(stored.email),
+        access_token: access_token.clone(),
+        refresh_token: auth.refresh_token().unwrap_or(stored.refresh_token),
+        expires_at: auth.expires_at().or(stored.expires_at),
+        name: auth.name().filter(|s| !s.is_empty()).or(stored.name),
+        avatar_url: auth
+            .avatar_url()
+            .filter(|s| !s.is_empty())
+            .or(stored.avatar_url),
+    };
+    if let Err(e) = crate::data::session_store::save_session(&session) {
+        warn!("gateway: refreshed session could not be persisted: {e}");
+    } else {
+        info!("gateway: session refreshed and persisted");
+    }
+    Some(access_token)
+}
+
 pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> anyhow::Result<Vec<OhlcvCandle>> {
     if config.rest_base_url.trim().is_empty() {
         anyhow::bail!("No API service URL configured");
@@ -1291,15 +1426,26 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
     }
     debug!("gateway: GET {}", url.split('?').next().unwrap_or(&url));
 
-    let mut req = reqwest::Client::new()
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .header("Origin", &config.rest_base_url)
-        .header("Referer", format!("{}/", &config.rest_base_url));
-    if let Some(token) = token {
-        req = req.bearer_auth(token);
-    }
-    let response = req.timeout(Duration::from_secs(30)).send().await?;
+    let response = send_ohlcv_request(config, &url, token.as_deref()).await?;
+    let (response, cache_key) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // The stored access token has expired (or was revoked). Refresh it once
+        // with the stored refresh token, persist the new session and retry.
+        warn!("gateway: OHLCV history returned 401 — attempting session refresh");
+        match refresh_session_token(config).await {
+            Some(refreshed) => {
+                let digest = {
+                    use sha2::{Digest, Sha256};
+                    format!("{:x}", Sha256::digest(refreshed.as_bytes()))
+                };
+                let retry_key = format!("{digest}:{url}");
+                let retry = send_ohlcv_request(config, &url, Some(&refreshed)).await?;
+                (retry, retry_key)
+            }
+            None => (response, cache_key),
+        }
+    } else {
+        (response, cache_key)
+    };
     if !response.status().is_success() {
         let status = response.status();
         let error: serde_json::Value = response.json().await.unwrap_or_default();
@@ -1562,6 +1708,47 @@ mod tests {
         server.await.unwrap();
         // Since REST returned 500, no tick was seeded from REST, but connect_and_stream finished without panicking
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn message_filter_accepts_matching_exchange_and_symbol() {
+        assert!(message_matches_config(
+            &Some("binance".into()),
+            &Some("BTC-USDT".into()),
+            "binance",
+            "BTC/USDT",
+        ));
+        // Exchange ids are case-insensitive, separators in symbols are ignored.
+        assert!(message_matches_config(
+            &Some("BINANCE".into()),
+            &Some("BTC/USDT".into()),
+            "binance",
+            "BTC-USDT",
+        ));
+        // Messages without routing fields are accepted.
+        assert!(message_matches_config(&None, &None, "binance", "BTC/USDT"));
+    }
+
+    #[test]
+    fn message_filter_rejects_foreign_exchange_or_symbol() {
+        assert!(!message_matches_config(
+            &Some("okx".into()),
+            &Some("BTC/USDT".into()),
+            "binance",
+            "BTC/USDT",
+        ));
+        assert!(!message_matches_config(
+            &Some("binance".into()),
+            &Some("ETH/USDT".into()),
+            "binance",
+            "BTC/USDT",
+        ));
+        assert!(!message_matches_config(
+            &Some("binance".into()),
+            &Some("BTC/USDT:USDT".into()),
+            "binance",
+            "BTC/USDT",
+        ));
     }
 
     #[test]

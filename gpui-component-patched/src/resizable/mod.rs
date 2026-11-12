@@ -265,6 +265,8 @@ impl ResizableState {
     /// Adjust panel sizes according to the container size.
     ///
     /// When the container size changes, the panels should take up the same percentage as they did before.
+    /// Each panel is clamped to its own `size_range` so that compact containers never squeeze a panel
+    /// below its minimum width (which would force its content to overflow horizontally).
     fn adjust_to_container_size(&mut self, cx: &mut Context<Self>) {
         if self.container_size().is_zero() {
             return;
@@ -275,12 +277,39 @@ impl ResizableState {
 
         for i in 0..self.panels.len() {
             let size = self.sizes[i];
-            let ratio = size / total_size;
-            let new_size = container_size * ratio;
+            let ratio = if total_size.is_zero() {
+                0.0
+            } else {
+                size / total_size
+            };
+            let size_range = self.panel_size_range(i);
+            let new_size = (container_size * ratio).clamp(size_range.start, size_range.end);
 
             self.sizes[i] = new_size;
             self.panels[i].size = Some(new_size);
         }
+
+        // If the clamped panels no longer fit the container, give the space back
+        // by shrinking the flexible panels (those without a fixed initial size)
+        // before falling back to the last panel.
+        let total_size = px(self.sizes.iter().map(|s| s.as_f32()).sum::<f32>());
+        if total_size > container_size && !self.panels.is_empty() {
+            let mut overflow = total_size - container_size;
+
+            // Prefer shrinking from the right-most flexible panel backwards.
+            for i in (0..self.panels.len()).rev() {
+                if overflow <= px(0.) {
+                    break;
+                }
+                let size_range = self.panel_size_range(i);
+                let available = (self.sizes[i] - size_range.start).max(px(0.));
+                let to_reduce = overflow.min(available);
+                self.sizes[i] -= to_reduce;
+                self.panels[i].size = Some(self.sizes[i]);
+                overflow -= to_reduce;
+            }
+        }
+
         cx.notify();
     }
 }

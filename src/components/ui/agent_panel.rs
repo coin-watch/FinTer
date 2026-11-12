@@ -1,7 +1,7 @@
-//! AI Agent module: read-only analysis of data from the active dashboards.
+//! AI Agent module: analysis of the active dashboards plus agentic trade execution.
 use gpui::*;
 use gpui::prelude::FluentBuilder;
-use gpui_component::v_flex;
+use gpui_component::{h_flex, v_flex};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -10,7 +10,7 @@ use gpui_component::text::TextView;
 use serde_json::Value;
 
 use crate::components::ui::agent_chart::AgentChart;
-use crate::data::agent::{ChartRequest, MessageSegment};
+use crate::data::agent::{ChartRequest, MessageSegment, TradeAction, TradeActionResult};
 
 #[derive(Clone)]
 struct ChatMessage {
@@ -19,6 +19,9 @@ struct ChatMessage {
     failed: bool,
     typing: bool,
     timestamp: Option<String>,
+    /// Receipts for the trade directives in `response`, produced exactly once
+    /// when the reply arrives and persisted so renders/reloads never re-execute.
+    trade_receipts: Vec<TradeActionResult>,
 }
 
 pub struct AgentPanel { 
@@ -109,12 +112,15 @@ impl AgentPanel {
         if let Some(conv) = crate::data::agent::load_conversation(id) {
             self.conversation_id = Some(conv.id);
             self.conversation_title = conv.title;
+            // Saved conversations are display-only: reuse the persisted receipts
+            // and never re-execute historical trade directives.
             self.history = conv.messages.into_iter().map(|m| ChatMessage {
                 prompt: m.prompt,
                 response: m.response,
                 failed: m.failed,
                 typing: false,
                 timestamp: m.timestamp,
+                trade_receipts: m.trade_receipts,
             }).collect();
             self.response.clear();
             self.error = None;
@@ -144,6 +150,7 @@ impl AgentPanel {
                 response: m.response.clone(),
                 failed: m.failed,
                 timestamp: m.timestamp.clone(),
+                trade_receipts: m.trade_receipts.clone(),
             }).collect(),
         };
         if let Err(e) = crate::data::agent::save_conversation(&record) {
@@ -161,6 +168,180 @@ impl AgentPanel {
 
     fn chart_key(message_index: usize, segment_index: usize, request: &ChartRequest) -> String {
         format!("{message_index}:{segment_index}:{}", request.cache_key())
+    }
+
+    /// Renders the receipt for an executed (or rejected) trade directive.
+    fn render_trade_receipt(
+        index: usize,
+        action: &TradeAction,
+        result: Option<&TradeActionResult>,
+        colors: &gpui_component::theme::ThemeColor,
+        mono_font: &SharedString,
+    ) -> AnyElement {
+        let ok = result.map(|r| r.ok).unwrap_or(true);
+        let accent = if ok { colors.bullish } else { colors.bearish };
+        let status = result
+            .and_then(|r| r.status.clone())
+            .unwrap_or_else(|| if ok { "PENDING".to_string() } else { "REJECTED".to_string() });
+        let is_buy = result
+            .and_then(|r| r.side.as_deref())
+            .map(|side| side == "buy")
+            .unwrap_or(false);
+        let side_color = if is_buy { colors.bullish } else { colors.bearish };
+        let live = result
+            .and_then(|r| r.mode.as_deref())
+            .map(|mode| mode == "live")
+            .unwrap_or_else(|| action.is_live());
+
+        let badge = |label: String, fg: Hsla, bg: Hsla| {
+            div()
+                .px(px(5.0))
+                .py(px(1.0))
+                .rounded(px(3.0))
+                .bg(bg)
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(fg)
+                .child(label)
+        };
+        let field = |label: &'static str, value: String| {
+            h_flex()
+                .gap(px(4.0))
+                .items_baseline()
+                .child(div().text_xs().text_color(colors.muted_foreground).child(label))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(mono_font.clone())
+                        .text_color(colors.foreground)
+                        .child(value),
+                )
+        };
+        let fmt_price = |value: f64| {
+            if value >= 1000.0 {
+                format!("{value:.2}")
+            } else if value >= 1.0 {
+                format!("{value:.4}")
+            } else {
+                format!("{value:.6}")
+            }
+        };
+        let fmt_size = |value: f64| {
+            if value >= 1000.0 {
+                format!("{value:.1}")
+            } else if value >= 1.0 {
+                format!("{value:.4}")
+            } else {
+                format!("{value:.6}")
+            }
+        };
+
+        let mut header = h_flex().w_full().gap(px(5.0)).items_center().flex_wrap();
+        header = header
+            .child(badge(
+                if live { "LIVE".to_string() } else { "PAPER".to_string() },
+                if live { colors.danger } else { colors.primary },
+                if live { colors.danger.opacity(0.18) } else { colors.primary.opacity(0.15) },
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(colors.foreground)
+                    .child(action.kind_label()),
+            );
+        if let Some(result) = result {
+            if let Some(side) = result.side.as_deref() {
+                header = header.child(badge(
+                    side.to_ascii_uppercase(),
+                    side_color,
+                    side_color.opacity(0.18),
+                ));
+            }
+            if let Some(symbol) = result.symbol.as_deref() {
+                header = header.child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(colors.foreground)
+                        .child(symbol.to_string()),
+                );
+            }
+        }
+        header = header.child(badge(status.clone(), accent, accent.opacity(0.18)));
+        if let Some(order_id) = result.and_then(|r| r.order_id.as_deref()) {
+            header = header.child(
+                div()
+                    .text_xs()
+                    .font_family(mono_font.clone())
+                    .text_color(colors.muted_foreground)
+                    .child(format!("#{order_id}")),
+            );
+        }
+
+        let mut body = v_flex().w_full().gap(px(3.0));
+        match result {
+            Some(result) if result.ok => {
+                let mut row = h_flex().w_full().gap(px(12.0)).flex_wrap();
+                if let Some(price) = result.price {
+                    row = row.child(field("Fill", format!("${}", fmt_price(price))));
+                }
+                if let Some(quantity) = result.quantity {
+                    row = row.child(field("Qty", fmt_size(quantity)));
+                }
+                if let Some(notional) = result.notional {
+                    row = row.child(field("Notional", format!("${notional:.2}")));
+                }
+                if let Some(leverage) = result.leverage.filter(|l| *l > 1) {
+                    row = row.child(field("Lev", format!("{leverage}x")));
+                }
+                if let Some(pnl) = result.pnl {
+                    row = row.child(
+                        h_flex()
+                            .gap(px(4.0))
+                            .items_baseline()
+                            .child(div().text_xs().text_color(colors.muted_foreground).child("PnL"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_family(mono_font.clone())
+                                    .text_color(if pnl >= 0.0 { colors.bullish } else { colors.bearish })
+                                    .child(format!("{}{:.2}", if pnl >= 0.0 { "+" } else { "" }, pnl)),
+                            ),
+                    );
+                }
+                body = body.child(row);
+            }
+            Some(result) => {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.bearish)
+                        .child(result.message.clone()),
+                );
+            }
+            None => {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted_foreground)
+                        .child("Executing…"),
+                );
+            }
+        }
+
+        v_flex()
+            .id(ElementId::Name(format!("agent-trade-{index}").into()))
+            .w_full()
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(colors.muted.opacity(0.25))
+            .border_1()
+            .border_color(accent.opacity(0.35))
+            .gap(px(4.0))
+            .child(header)
+            .child(body)
+            .into_any_element()
     }
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.prompt.trim().to_string();
@@ -189,6 +370,7 @@ impl AgentPanel {
             failed: false,
             typing: true,
             timestamp: Some(chrono::Local::now().format("%b %d, %H:%M").to_string()),
+            trade_receipts: Vec::new(),
         });
         self.response.clear();
         self.persist_active_conversation();
@@ -201,11 +383,16 @@ impl AgentPanel {
 
             match result {
                 Ok(text) => {
+                    // Execute the reply's trade directives exactly once, here, as
+                    // the response arrives. The receipts are stored on the message
+                    // and persisted, so renders and reloads only display them.
+                    let trade_receipts = crate::data::agent::execute_trades_in_reply(&text);
                     // Persist the full answer before animating it, so closing the
                     // pane during the typing effect does not discard the reply.
                     let _ = this.update(cx, |panel, _| {
                         if let Some(message) = panel.history.get_mut(message_index) {
                             message.response = text.clone();
+                            message.trade_receipts = trade_receipts;
                         }
                         panel.persist_active_conversation();
                         if let Some(message) = panel.history.get_mut(message_index) {
@@ -294,7 +481,7 @@ impl Render for AgentPanel {
             self.selected_model = "Select model".into();
         }
         if !self.discovery_attempted && !self.models_loading { self.refresh_models(cx); }
-        let colors=cx.theme().colors.clone(); let input=self.input.as_ref().unwrap().clone();
+        let colors=cx.theme().colors.clone(); let mono_font=cx.theme().mono_font_family.clone(); let input=self.input.as_ref().unwrap().clone();
         let models=self.models.clone(); let selected=self.selected_model.clone();
         let owner = cx.entity().downgrade();
         let compact = self.width < 360.0 || self.height < 260.0;
@@ -309,7 +496,8 @@ impl Render for AgentPanel {
         }
 
         // Parse completed replies once so inline charts can be materialised and
-        // rendered alongside their surrounding markdown.
+        // rendered alongside their surrounding markdown. Parsing is pure: trade
+        // receipts were executed once on arrival and are only attached here.
         let parsed_messages: Vec<Vec<MessageSegment>> = self
             .history
             .iter()
@@ -317,7 +505,10 @@ impl Render for AgentPanel {
                 if message.typing {
                     Vec::new()
                 } else {
-                    crate::data::agent::parse_message_segments(&message.response)
+                    crate::data::agent::parse_message_segments_with_results(
+                        &message.response,
+                        &message.trade_receipts,
+                    )
                 }
             })
             .collect();
@@ -372,7 +563,7 @@ impl Render for AgentPanel {
                                         if msg.typing {
                                             let visible = crate::data::agent::strip_chart_directives(&msg.response);
                                             if visible.trim().is_empty() {
-                                                div().text_color(colors.muted_foreground).text_xs().child("Preparing chart…").into_any_element()
+                                                div().text_color(colors.muted_foreground).text_xs().child("Thinking…").into_any_element()
                                             } else {
                                                 let lines: Vec<&str> = visible.split('\n').collect();
                                                 let mut content = v_flex().w_full().gap(px(2.0)).text_sm().text_color(colors.foreground);
@@ -411,6 +602,15 @@ impl Render for AgentPanel {
                                                         if let Some(entity) = chart_entities.get(&key) {
                                                             content = content.child(entity.clone());
                                                         }
+                                                    }
+                                                    MessageSegment::Trade(action, result) => {
+                                                        content = content.child(Self::render_trade_receipt(
+                                                            idx * 1000 + segment_index,
+                                                            action,
+                                                            result.as_ref(),
+                                                            &colors,
+                                                            &mono_font,
+                                                        ));
                                                     }
                                                     _ => {}
                                                 }

@@ -921,19 +921,13 @@ impl Render for ChartPanel {
             })
             .collect();
 
-        if let Some(mark) = crate::data::trade_store::TradeStore::global()
-            .lock()
-            .ok()
-            .and_then(|ts| ts.get_mark_price(&self.symbol))
-        {
-            if mark > 0.0 && mark.is_finite() {
-                if let Some(last) = candles.last_mut() {
-                    last.close = mark;
-                    last.high = last.high.max(mark);
-                    last.low = last.low.min(mark);
-                }
-            }
-        }
+        // NOTE: The candle series from `self.feed.snapshot_with_version()` is
+        // authoritative. `CandleFeed` already subscribes to and maintains the
+        // live forming candle for `(self.exchange, self.symbol)`. Do not
+        // overwrite it with `TradeStore::get_mark_price(&self.symbol)` — that
+        // lookup is venue-agnostic, so a ticker from another exchange could
+        // corrupt this chart, and ratcheting `last.low`/`last.high` on every
+        // render frame permanently stretches the wicks.
 
         if matches!(self.candle_type, CandleType::HeikinAshi) {
             let mut ha_candles = Vec::with_capacity(candles.len());

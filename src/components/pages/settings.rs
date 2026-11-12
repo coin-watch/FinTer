@@ -416,7 +416,9 @@ fn dashboard_multi_select(
                 });
 
             let mut list = div()
-                .w(px(280.0))
+                .w_full()
+                .min_w(px(200.0))
+                .max_w(px(340.0))
                 .max_h(px(320.0))
                 .overflow_y_scrollbar()
                 .flex()
@@ -425,6 +427,8 @@ fn dashboard_multi_select(
                 .p(px(6.0))
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .px(px(6.0))
                         .py(px(4.0))
                         .border_b_1()
@@ -437,7 +441,7 @@ fn dashboard_multi_select(
                 let checkbox_settings = settings.clone();
                 let checkbox_id = id.clone();
                 list = list.child(
-                    div().px(px(6.0)).py(px(3.0)).child(
+                    div().w_full().min_w_0().px(px(6.0)).py(px(3.0)).child(
                         Checkbox::new(ElementId::Name(SharedString::from(format!(
                             "tabs-dashboard-{id}"
                         ))))
@@ -478,7 +482,14 @@ fn update_channel_selector(
     cx: &mut App,
 ) -> AnyElement {
     let selected = settings.read(cx).update_channel.clone();
-    let mut row = div().flex().flex_row();
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(px(6.0))
+        .w_full()
+        .min_w_0();
 
     for channel in [
         crate::data::version::UpdateChannel::Stable,
@@ -722,13 +733,16 @@ impl SettingsPage {
 
     fn build_api_management_page(&self, _settings: Entity<AppSettings>) -> SettingPage {
         let view = self.api_management.clone();
+        // The API management view manages its own card layout, so it is rendered
+        // as a single full-width custom item inside a plain (unpadded) group.
+        // Keeping the group borderless avoids nesting the view's cards inside a
+        // second frame, which wastes horizontal space on narrow panels.
         SettingPage::new("APIs Management")
             .description("Configure and manage local exchange API keys. Stored only on this machine with 0600 permissions.")
             .group(
-                SettingGroup::new()
-                    .item(SettingItem::render(move |_, _, _| {
-                        view.clone()
-                    })),
+                SettingGroup::new().item(SettingItem::render(move |_, _, _| {
+                    div().w_full().min_w_0().child(view.clone())
+                })),
             )
     }
 

@@ -90,6 +90,12 @@ fn main() {
                     window_decorations: Some(WindowDecorations::Client),
                     app_id: Some("ch.coinwat.finter".to_string()),
                     icon: window_icon,
+                    // Keep the settings pages usable: below this size the
+                    // navigation sidebars leave too little room for content.
+                    window_min_size: Some(Size {
+                        width: px(800.),
+                        height: px(600.),
+                    }),
                     ..Default::default()
                 },
                 |window, cx| {

@@ -270,14 +270,15 @@ impl RenderOnce for Checkbox {
                 .when(self.label.is_some() || !self.children.is_empty(), |this| {
                     this.child(
                         v_flex()
-                            .w_full()
+                            .flex_1()
+                            .min_w_0()
                             .line_height(relative(1.2))
                             .gap_1()
                             .map(|this| {
                                 if let Some(label) = self.label {
                                     this.child(
                                         div()
-                                            .size_full()
+                                            .w_full()
                                             .text_color(cx.theme().foreground)
                                             .when(self.disabled, |this| {
                                                 this.text_color(cx.theme().muted_foreground)

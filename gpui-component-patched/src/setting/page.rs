@@ -131,24 +131,35 @@ impl SettingPage {
                     .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(h_flex().justify_between().child(self.title.clone()).when(
-                        self.is_resettable(cx),
-                        |this| {
-                            this.child(
-                                Button::new("reset")
-                                    .icon(IconName::Undo2)
-                                    .ghost()
-                                    .small()
-                                    .tooltip(t!("Settings.Reset All"))
-                                    .on_click({
-                                        let page = self.clone();
-                                        move |_, window, cx| {
-                                            page.reset_all(window, cx);
-                                        }
-                                    }),
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(self.title.clone()),
                             )
-                        },
-                    ))
+                            .when(self.is_resettable(cx), |this| {
+                                this.child(
+                                    Button::new("reset")
+                                        .flex_shrink_0()
+                                        .icon(IconName::Undo2)
+                                        .ghost()
+                                        .small()
+                                        .tooltip(t!("Settings.Reset All"))
+                                        .on_click({
+                                            let page = self.clone();
+                                            move |_, window, cx| {
+                                                page.reset_all(window, cx);
+                                            }
+                                        }),
+                                )
+                            }),
+                    )
                     .when_some(self.description.clone(), |this, description| {
                         this.child(
                             Label::new(description)

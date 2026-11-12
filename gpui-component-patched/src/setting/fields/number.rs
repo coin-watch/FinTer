@@ -2,11 +2,11 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, Entity, IntoElement, SharedString, StyleRefinement, Styled,
-    Subscription, Window, prelude::FluentBuilder as _,
+    Subscription, Window,
 };
 
 use crate::{
-    AxisExt, Sizable, StyledExt,
+    Sizable, StyledExt,
     input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     setting::{
         AnySettingField, RenderOptions,
@@ -138,13 +138,7 @@ impl SettingFieldRender for NumberField {
 
         NumberInput::new(&state.input)
             .with_size(options.size)
-            .map(|this| {
-                if options.layout.is_horizontal() {
-                    this.w_32()
-                } else {
-                    this.w_full()
-                }
-            })
+            .w_full()
             .refine_style(style)
             .into_any_element()
     }

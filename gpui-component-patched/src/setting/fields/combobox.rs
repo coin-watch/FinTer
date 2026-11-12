@@ -16,7 +16,7 @@ use crate::{
         fields::{get_value, set_value, SettingFieldRender},
         AnySettingField, RenderOptions,
     },
-    v_flex, ActiveTheme, AxisExt, Icon, IconName, Sizable, StyledExt,
+    v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt,
 };
 
 pub(crate) struct ComboboxField<T> {
@@ -72,7 +72,7 @@ where
             .track_focus(&search_focus)
             .trigger(
                 Button::new("btn")
-                    .when(options.layout.is_vertical(), |this| this.w_full())
+                    .w_full()
                     .label(old_label)
                     .dropdown_caret(true)
                     .outline()
@@ -162,6 +162,7 @@ where
 
                     v_flex()
                         .w(px(320.0))
+                        .max_w_full()
                         .bg(theme.colors.background)
                         .border_1()
                         .border_color(theme.colors.border)

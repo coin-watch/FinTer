@@ -318,24 +318,31 @@ impl Render for ApiManagementView {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .gap(px(16.))
             .child(
                 // Security Banner & Protocol Info
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .p(px(14.))
                     .rounded(px(6.))
                     .bg(card_bg)
                     .border_1()
                     .border_color(border_color)
-                    .justify_between()
                     .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .flex_wrap()
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap(px(12.))
                             .items_center()
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .p(px(8.))
                                     .rounded(px(6.))
                                     .bg(cx.theme().muted)
@@ -347,13 +354,18 @@ impl Render for ApiManagementView {
                             )
                             .child(
                                 v_flex()
+                                    .flex_1()
+                                    .min_w_0()
                                     .gap(px(3.))
                                     .child(
                                         h_flex()
+                                            .min_w_0()
                                             .gap(px(8.))
                                             .items_center()
+                                            .flex_wrap()
                                             .child(
                                                 div()
+                                                    .min_w_0()
                                                     .text_sm()
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(text_primary)
@@ -361,6 +373,7 @@ impl Render for ApiManagementView {
                                             )
                                             .child(
                                                 div()
+                                                    .flex_shrink_0()
                                                     .px(px(6.))
                                                     .py(px(1.5))
                                                     .rounded(px(4.))
@@ -373,10 +386,38 @@ impl Render for ApiManagementView {
                                     )
                                     .child(
                                         div()
+                                            .min_w_0()
                                             .text_xs()
                                             .text_color(text_muted)
-                                            .child("All API keys and secrets are encrypted with AES-256-GCM before being written to ~/.config/finter/api_providers.json (user-only permissions). The encryption key is held in the OS keyring, never in the config file. Zero cloud sync, zero telemetry."),
+                                            .child("All API keys and secrets are encrypted with AES-256-GCM before being written to the FinTer config directory (user-only permissions). The encryption key is held in the OS keyring, never in the config file. Zero cloud sync, zero telemetry."),
                                     ),
+                            ),
+                    )
+                    // Encryption status badge — wraps beneath the copy on narrow panels
+                    // instead of being clipped by the description column.
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .bg(cx.theme().primary.opacity(0.08))
+                            .border_1()
+                            .border_color(primary_color.opacity(0.25))
+                            .child(
+                                Icon::new(IconName::Check)
+                                    .size(px(12.))
+                                    .flex_shrink_0()
+                                    .text_color(primary_color),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(primary_color)
+                                    .child("AES-256-GCM ENCRYPTED"),
                             ),
                     ),
             )
@@ -430,15 +471,21 @@ impl Render for ApiManagementView {
             .child(
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .justify_between()
                     .items_center()
+                    .gap(px(8.))
+                    .flex_wrap()
                     .py(px(4.))
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap(px(8.))
                             .items_center()
+                            .flex_wrap()
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(text_primary)
@@ -446,6 +493,7 @@ impl Render for ApiManagementView {
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .px(px(6.))
                                     .py(px(1.5))
                                     .rounded(px(10.))
@@ -459,6 +507,7 @@ impl Render for ApiManagementView {
                     .child(
                         if self.is_editing {
                             Button::new("cancel-btn")
+                                .flex_shrink_0()
                                 .outline()
                                 .label("Close Editor")
                                 .on_click(cx.listener(|this, _event, _window, cx| {
@@ -466,6 +515,7 @@ impl Render for ApiManagementView {
                                 }))
                         } else {
                             Button::new("add-key-btn")
+                                .flex_shrink_0()
                                 .primary()
                                 .label("+ Add Exchange Key")
                                 .on_click(cx.listener(|this, _event, window, cx| {
@@ -491,8 +541,11 @@ impl Render for ApiManagementView {
                         .child(
                             h_flex()
                                 .w_full()
+                                .min_w_0()
                                 .justify_between()
                                 .items_center()
+                                .gap(px(8.))
+                                .flex_wrap()
                                 .child(
                                     div()
                                         .text_sm()
@@ -506,6 +559,7 @@ impl Render for ApiManagementView {
                                 )
                                 .child(
                                     div()
+                                        .min_w_0()
                                         .text_xs()
                                         .text_color(text_muted)
                                         .child("Required: Exchange, API Key, API Secret"),
@@ -520,13 +574,16 @@ impl Render for ApiManagementView {
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .min_w_0()
                                         .gap(px(12.))
                                         .items_end()
+                                        .flex_wrap()
                                         // Exchange combobox
                                         .child(
                                             v_flex()
                                                 .gap(px(4.))
-                                                .w(px(220.))
+                                                .flex_1()
+                                                .min_w(px(130.))
                                                 .child(
                                                     div()
                                                         .text_xs()
@@ -554,6 +611,7 @@ impl Render for ApiManagementView {
                                             v_flex()
                                                 .gap(px(4.))
                                                 .flex_1()
+                                                .min_w(px(130.))
                                                 .child(
                                                     div()
                                                         .text_xs()
@@ -569,7 +627,8 @@ impl Render for ApiManagementView {
                                         .child(
                                             v_flex()
                                                 .gap(px(4.))
-                                                .w(px(180.))
+                                                .flex_1()
+                                                .min_w(px(130.))
                                                 .child(
                                                     div()
                                                         .text_xs()
@@ -579,7 +638,9 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     h_flex()
+                                                        .min_w_0()
                                                         .gap(px(4.))
+                                                        .flex_wrap()
                                                         .child(
                                                             Button::new("env-live")
                                                                 .label("LIVE")
@@ -642,7 +703,9 @@ impl Render for ApiManagementView {
                                         .w_full()
                                         .child(
                                             h_flex()
+                                                .min_w_0()
                                                 .gap(px(6.))
+                                                .flex_wrap()
                                                 .child(
                                                     div()
                                                         .text_xs()
@@ -652,6 +715,7 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .min_w_0()
                                                         .text_xs()
                                                         .text_color(cx.theme().muted_foreground.opacity(0.8))
                                                         .child("— Required for OKX, KuCoin, Coinbase, Bitget"),
@@ -668,6 +732,7 @@ impl Render for ApiManagementView {
                                 .w_full()
                                 .justify_end()
                                 .gap(px(8.))
+                                .flex_wrap()
                                 .child(
                                     Button::new("cancel-form-btn")
                                         .outline()
@@ -693,6 +758,7 @@ impl Render for ApiManagementView {
                     // Empty State
                     v_flex()
                         .w_full()
+                        .min_w_0()
                         .items_center()
                         .justify_center()
                         .py(px(48.))
@@ -716,6 +782,7 @@ impl Render for ApiManagementView {
                         )
                         .child(
                             div()
+                                .w_full()
                                 .max_w(px(460.))
                                 .text_center()
                                 .text_xs()
@@ -738,6 +805,7 @@ impl Render for ApiManagementView {
 
                     v_flex()
                         .w_full()
+                        .min_w_0()
                         .gap(px(10.))
                         .children(creds.into_iter().map(|cred| {
                             let id_for_edit = cred.id.clone();
@@ -750,6 +818,7 @@ impl Render for ApiManagementView {
 
                             v_flex()
                                 .w_full()
+                                .min_w_0()
                                 .p(px(12.))
                                 .rounded(px(6.))
                                 .bg(card_bg)
@@ -760,14 +829,21 @@ impl Render for ApiManagementView {
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .min_w_0()
                                         .justify_between()
                                         .items_center()
+                                        .gap(px(8.))
+                                        .flex_wrap()
                                         .child(
                                             h_flex()
+                                                .min_w_0()
+                                                .flex_1()
                                                 .gap(px(8.))
                                                 .items_center()
+                                                .flex_wrap()
                                                 .child(
                                                     div()
+                                                        .flex_shrink_0()
                                                         .px(px(8.))
                                                         .py(px(2.))
                                                         .rounded(px(4.))
@@ -779,6 +855,9 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .max_w(px(240.))
                                                         .text_sm()
                                                         .font_weight(FontWeight::BOLD)
                                                         .text_color(text_primary)
@@ -786,6 +865,7 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex_shrink_0()
                                                         .px(px(6.))
                                                         .py(px(1.5))
                                                         .rounded(px(4.))
@@ -806,10 +886,14 @@ impl Render for ApiManagementView {
                                         )
                                         .child(
                                             h_flex()
+                                                .flex_shrink_0()
+                                                .min_w_0()
                                                 .gap(px(6.))
                                                 .items_center()
+                                                .flex_wrap()
                                                 .child(
                                                     Button::new(SharedString::from(format!("edit-{}", cred.id)))
+                                                        .flex_shrink_0()
                                                         .outline()
                                                         .label("Edit")
                                                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -820,12 +904,14 @@ impl Render for ApiManagementView {
                                                     if is_confirming_del {
                                                         let id_del_exec = id_for_del.clone();
                                                         Button::new(SharedString::from(format!("confirm-del-{}", cred.id)))
+                                                            .flex_shrink_0()
                                                             .label("Confirm Delete?")
                                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                                 this.delete_key(&id_del_exec, cx);
                                                             }))
                                                     } else {
                                                         Button::new(SharedString::from(format!("del-{}", cred.id)))
+                                                            .flex_shrink_0()
                                                             .outline()
                                                             .label("Delete")
                                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -836,21 +922,29 @@ impl Render for ApiManagementView {
                                                 ),
                                         ),
                                 )
-                                // Key Details Row
+                                // Key Details Row — masked credential pill
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .min_w_0()
                                         .p(px(8.))
                                         .rounded(px(4.))
                                         .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(border_color.opacity(0.4))
                                         .justify_between()
                                         .items_center()
+                                        .gap(px(8.))
+                                        .flex_wrap()
                                         .child(
                                             h_flex()
+                                                .min_w_0()
+                                                .flex_1()
                                                 .gap(px(8.))
                                                 .items_center()
                                                 .child(
                                                     div()
+                                                        .flex_shrink_0()
                                                         .text_xs()
                                                         .font_weight(FontWeight::BOLD)
                                                         .text_color(text_muted)
@@ -858,6 +952,9 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .truncate()
                                                         .text_xs()
                                                         .font_family("monospace")
                                                         .text_color(text_primary)
@@ -866,6 +963,7 @@ impl Render for ApiManagementView {
                                         )
                                         .child(
                                             Button::new(SharedString::from(format!("copy-{}", cred.id)))
+                                                .flex_shrink_0()
                                                 .outline()
                                                 .label(if is_copied { "Copied!" } else { "Copy Key" })
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -877,26 +975,36 @@ impl Render for ApiManagementView {
                                 .child(
                                     h_flex()
                                         .w_full()
+                                        .min_w_0()
                                         .justify_between()
                                         .items_center()
+                                        .gap_x(px(10.))
+                                        .gap_y(px(4.))
+                                        .flex_wrap()
                                         .text_xs()
                                         .text_color(text_muted)
                                         .child(
                                             h_flex()
-                                                .gap(px(14.))
+                                                .min_w_0()
+                                                .gap_x(px(14.))
+                                                .gap_y(px(4.))
+                                                .flex_wrap()
                                                 .child(
                                                     h_flex()
+                                                        .flex_shrink_0()
                                                         .gap(px(4.))
                                                         .items_center()
                                                         .child(
                                                             Icon::new(IconName::Check)
                                                                 .size(px(12.))
+                                                                .flex_shrink_0()
                                                                 .text_color(primary_color),
                                                         )
                                                         .child("API Secret Stored"),
                                                 )
                                                 .child(
                                                     h_flex()
+                                                        .flex_shrink_0()
                                                         .gap(px(4.))
                                                         .items_center()
                                                         .child(
@@ -906,6 +1014,7 @@ impl Render for ApiManagementView {
                                                                 IconName::Check
                                                             })
                                                             .size(px(12.))
+                                                            .flex_shrink_0()
                                                             .text_color(if cred.passphrase.trim().is_empty() {
                                                                 text_muted
                                                             } else {
@@ -921,6 +1030,7 @@ impl Render for ApiManagementView {
                                         )
                                         .child(
                                             div()
+                                                .flex_shrink_0()
                                                 .font_family("monospace")
                                                 .child("STORAGE: LOCAL 0600"),
                                         )
