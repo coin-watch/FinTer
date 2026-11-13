@@ -182,6 +182,16 @@ impl CandleFeed {
             .len()
     }
 
+    /// Candles currently in the chart viewport, in the same order and with the
+    /// same range as the chart's own `ChartState::visible_range` slice.
+    ///
+    /// Used to map a mouse position to the candle occupying that slot.
+    pub fn visible_slice(&self, state: &gpui_component::chart::ChartState) -> Vec<OhlcvCandle> {
+        let inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        let range = state.visible_range(inner.candles.len());
+        inner.candles[range].to_vec()
+    }
+
     /// True when no candles have been received yet.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

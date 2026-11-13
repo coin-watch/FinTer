@@ -300,11 +300,13 @@ impl BridgeConfig {
             urlencoding::encode(&format!("Chart · {} ({})", self.symbol, self.timeframe)),
         );
         if let Some(u) = until {
-            // SvelteKit routes to proxyToLive if either 'since' or 'until' is present
-            let interval_ms = Self::timeframe_to_ms(&self.timeframe);
-            let limit = self.ohlcv_limit as i64;
-            let since = u - limit * interval_ms;
-            url.push_str(&format!("&since={}&until={}", since, u));
+            // Only send `until` (matching the web version's fallback in
+            // `shim.ts`). Forcing a `since` window would pin the request to a
+            // fixed span, so a quiet market (weekend, holiday, illiquid pair)
+            // could return an empty window and stall backward paging. Letting
+            // the backend / CCXT traverse backwards from `until` jumps over
+            // those gaps.
+            url.push_str(&format!("&until={}", u));
         }
         url
     }
@@ -1628,9 +1630,9 @@ mod tests {
     }
 
     #[test]
-    fn ohlcv_history_url_with_until_includes_window() {
+    fn ohlcv_history_url_with_until_sends_only_until() {
         let url = base_cfg().ohlcv_history_url(Some(1_600_000_000_000));
-        assert!(url.contains("&since="), "url={url}");
+        assert!(!url.contains("&since="), "url={url}");
         assert!(url.contains("&until=1600000000000"), "url={url}");
     }
 

@@ -890,7 +890,7 @@ impl Render for ChartPanel {
             && self.history_retry_at.is_none_or(|at| std::time::Instant::now() >= at)
             && self.load_more_attempts < 3
             && current_oldest > 0
-            && self.chart_state.viewport_offset <= 0.0
+            && self.chart_state.viewport_offset <= 15.0
         {
             if let Some(on_load_more) = &self.on_load_more {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -2146,10 +2146,32 @@ impl Render for ChartPanel {
                 {
                     let mouse_x = pos.x.as_f32();
                     let mouse_y = pos.y.as_f32();
-                    let frac_x = ((mouse_x - orig.0) / sz.0.max(1.0)).clamp(0.0, 1.0) as f64;
-                    let ts = (ts_min + frac_x * (ts_max - ts_min)).round() as i64;
                     let frac_y = ((mouse_y - orig.1) / sz.1.max(1.0)).clamp(0.0, 1.0) as f64;
                     let p = p_max - frac_y * (p_max - p_min);
+
+                    // Slot-accurate timestamp: the chart lays candles out on
+                    // discrete slots (see `candlestick_chart.rs`), so snap to
+                    // the candle under the cursor instead of interpolating on a
+                    // continuous time axis (which drifts across data gaps).
+                    let visible = this.feed.visible_slice(&this.chart_state);
+                    let chart_w = sz.0;
+                    let mut snapped = None;
+                    if !visible.is_empty() && chart_w > 0.0 {
+                        let visible_count_f = this.chart_state.visible_count.max(1) as f32;
+                        let slot_w = (chart_w / visible_count_f).max(1.0);
+                        let actual_start =
+                            (this.chart_state.viewport_offset.floor() as isize).max(0) as f32;
+                        let shift_candles = actual_start - this.chart_state.viewport_offset as f32;
+                        let idx = (((mouse_x - orig.0) / slot_w) - shift_candles).floor() as isize;
+                        if idx >= 0 && (idx as usize) < visible.len() {
+                            snapped = Some(visible[idx as usize].timestamp);
+                        }
+                    }
+
+                    let ts = snapped.unwrap_or_else(|| {
+                        let frac_x = ((mouse_x - orig.0) / sz.0.max(1.0)).clamp(0.0, 1.0) as f64;
+                        (ts_min + frac_x * (ts_max - ts_min)).round() as i64
+                    });
 
                     this.drawing_cursor_point = Some(DrawingPoint {
                         timestamp: ts,

@@ -214,14 +214,26 @@ where
         where
             E: de::Error,
         {
-            Ok(value)
+            // Normalize second-precision timestamps to milliseconds so every
+            // candle in FinTer is uniformly 13 digits.
+            if value > 0 && value < 10_000_000_000 {
+                Ok(value * 1000)
+            } else {
+                Ok(value)
+            }
         }
 
         fn visit_u64<E>(self, value: u64) -> Result<i64, E>
         where
             E: de::Error,
         {
-            Ok(value as i64)
+            // Normalize second-precision timestamps to milliseconds so every
+            // candle in FinTer is uniformly 13 digits.
+            if value > 0 && value < 10_000_000_000 {
+                Ok((value * 1000) as i64)
+            } else {
+                Ok(value as i64)
+            }
         }
 
         fn visit_str<E>(self, value: &str) -> Result<i64, E>
@@ -558,5 +570,41 @@ impl AuthResponse {
                             .map(|s| s.to_string())
                     })
             })
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::OhlcvCandle;
+
+    fn parse(ts_json: &str) -> OhlcvCandle {
+        serde_json::from_str(&format!(
+            r#"{{"timestamp":{},"open":1.0,"high":2.0,"low":0.5,"close":1.5,"volume":10.0}}"#,
+            ts_json
+        ))
+        .expect("candle should deserialize")
+    }
+
+    #[test]
+    fn seconds_are_normalized_to_milliseconds() {
+        assert_eq!(parse("1600000000").timestamp, 1_600_000_000_000);
+    }
+
+    #[test]
+    fn millisecond_timestamps_are_preserved() {
+        assert_eq!(parse("1600000000000").timestamp, 1_600_000_000_000);
+        assert_eq!(parse("1700000000123").timestamp, 1_700_000_000_123);
+    }
+
+    #[test]
+    fn zero_and_negative_timestamps_are_preserved() {
+        assert_eq!(parse("0").timestamp, 0);
+        assert_eq!(parse("-1000").timestamp, -1000);
+    }
+
+    #[test]
+    fn iso_strings_stay_in_milliseconds() {
+        let c = parse(r#""2026-04-08T04:43:00.000Z""#);
+        assert_eq!(c.timestamp, 1_775_623_380_000);
     }
 }
