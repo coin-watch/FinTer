@@ -2031,7 +2031,7 @@ impl PaneGridRenderer {
                                                 let title = format!("{} {}", exchange.to_uppercase(), symbol);
                                                 let tf = timeframe.clone();
                                                 
-                                                let bc = bridge_config_clone;
+                                                let bc = bridge_config_clone.clone();
                                                 let feed_clone = feed.clone();
                                                 let load_more: std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync> = std::sync::Arc::new(move |until: i64, done: std::sync::mpsc::Sender<()>| {
                                                     let bc = bc.clone();
@@ -2053,9 +2053,25 @@ impl PaneGridRenderer {
                                                     });
                                                 });
                                                 
+                                                let bc_refresh = bridge_config_clone.clone();
+                                                let feed_refresh = feed.clone();
+                                                let refresh_latest: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                                                    let bc = bc_refresh.clone();
+                                                    let feed = feed_refresh.clone();
+                                                    crate::data::client::tokio_runtime().spawn(async move {
+                                                        match crate::data::bridge::fetch_ohlcv_history(&bc, None).await {
+                                                            Ok(history) if !history.is_empty() => {
+                                                                feed.merge_history(&history);
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    });
+                                                });
+
                                                 let chart_panel = cx.new(|cx| {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
                                                     panel.on_load_more = Some(load_more);
+                                                    panel.on_refresh_latest = Some(refresh_latest);
                                                     panel.set_size(content_w, content_h);
                                                     panel
                                                 });

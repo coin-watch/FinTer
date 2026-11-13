@@ -41,6 +41,10 @@ use crate::data::models::OhlcvCandle;
 /// Maximum number of candles to retain in the buffer (oldest are evicted).
 pub const MAX_CANDLES: usize = 10_000;
 
+/// Maximum number of missing periods the clock-driven rollover will backfill
+/// in one step. Larger gaps skip straight to the current bucket.
+const MAX_BACKFILL_PERIODS: i64 = 500;
+
 // ---------------------------------------------------------------------------
 // CandleFeedConfig — kept for API compat / ChartPanel construction
 // ---------------------------------------------------------------------------
@@ -93,11 +97,13 @@ impl CandleFeedConfig {
 #[derive(Clone)]
 pub struct CandleFeed {
     inner: Arc<Mutex<CandleFeedInner>>,
+    /// Timeframe this feed was created for (e.g. "1m").
+    timeframe: Option<String>,
     /// Keep the background drain task alive.
     _task: Arc<JoinHandle<()>>,
 }
 
-struct CandleFeedInner {
+pub(crate) struct CandleFeedInner {
     /// Sorted oldest → newest.
     candles: Vec<OhlcvCandle>,
     /// Millisecond timestamp of the last update.
@@ -134,7 +140,7 @@ impl CandleFeed {
         }));
 
         let drain_inner = Arc::clone(&inner);
-        let tf = timeframe.unwrap_or_else(|| "1m".to_string());
+        let tf = timeframe.clone().unwrap_or_else(|| "1m".to_string());
 
         let task = tokio_runtime().spawn(async move {
             drain_loop(rx, tick_rx, tf, drain_inner).await;
@@ -142,14 +148,55 @@ impl CandleFeed {
 
         Self {
             inner,
+            timeframe,
             _task: Arc::new(task),
+        }
+    }
+
+    /// Advance the live candle to the current wall-clock bucket if a period
+    /// boundary has been crossed. Returns `true` when candles changed.
+    fn rollover_to_now(&self, inner: &mut CandleFeedInner) -> bool {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let tf = self.timeframe.as_deref().unwrap_or("1m").to_string();
+        let interval_ms = get_interval_ms(&tf);
+        if check_and_form_live_candle(inner, interval_ms, &tf, now_ms) {
+            inner.version = inner.version.saturating_add(1);
+            inner.last_update_ms = now_ms;
+            true
+        } else {
+            false
         }
     }
 
     /// Return a point-in-time snapshot of the candles (oldest first).
     ///
     /// Acquires the mutex briefly; safe to call from the GPUI render thread.
-    
+    pub fn snapshot(&self) -> Vec<OhlcvCandle> {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
+        inner.candles.clone()
+    }
+
+    /// Merge incoming historical candles into the buffer (upsert by timestamp).
+    pub fn merge_history(&self, incoming: &[OhlcvCandle]) {
+        if incoming.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        let ticker_ts = inner.live_ticker_candle_ts;
+        let latest_price = inner.latest_ticker_price;
+        if merge_candles(&mut inner.candles, incoming, ticker_ts, latest_price) {
+            inner.version = inner.version.saturating_add(1);
+            inner.last_update_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+        }
+    }
+
     pub fn prepend_history(&self, older_candles: &[OhlcvCandle]) {
         let mut inner = self.inner.lock().unwrap();
         let ticker_ts = inner.live_ticker_candle_ts;
@@ -159,27 +206,18 @@ impl CandleFeed {
         }
     }
 
-    pub fn snapshot(&self) -> Vec<OhlcvCandle> {
-        self.inner
-            .lock()
-            .expect("CandleFeed mutex poisoned")
-            .candles
-            .clone()
-    }
-
     /// Return a point-in-time snapshot of candles along with the feed version.
     pub fn snapshot_with_version(&self) -> (Vec<OhlcvCandle>, u64) {
-        let inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
         (inner.candles.clone(), inner.version)
     }
 
     /// Number of candles currently in the buffer.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("CandleFeed mutex poisoned")
-            .candles
-            .len()
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
+        inner.candles.len()
     }
 
     /// Candles currently in the chart viewport, in the same order and with the
@@ -187,7 +225,8 @@ impl CandleFeed {
     ///
     /// Used to map a mouse position to the candle occupying that slot.
     pub fn visible_slice(&self, state: &gpui_component::chart::ChartState) -> Vec<OhlcvCandle> {
-        let inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
         let range = state.visible_range(inner.candles.len());
         inner.candles[range].to_vec()
     }
@@ -315,6 +354,92 @@ fn align_timestamp(ts: i64, interval_ms: i64, timeframe: &str) -> i64 {
     }
 }
 
+/// Form and append any live candles whose period boundary has been crossed
+/// between the last buffered candle and `now_ms`.
+///
+/// This is the clock-driven counterpart to the ticker/kline driven rollover:
+/// when the market is quiet, no WebSocket messages arrive, so the chart would
+/// otherwise stay stuck on the previous candle while the countdown reaches 0.
+///
+/// Returns `true` when at least one candle was appended.
+pub(crate) fn check_and_form_live_candle(
+    inner: &mut CandleFeedInner,
+    interval_ms: i64,
+    timeframe: &str,
+    now_ms: i64,
+) -> bool {
+    if interval_ms <= 0 || inner.candles.is_empty() {
+        return false;
+    }
+
+    let last = match inner.candles.last() {
+        Some(c) => c.clone(),
+        None => return false,
+    };
+
+    let next_candle_ts = if timeframe == "1M" {
+        align_timestamp(last.timestamp + 32 * 86_400_000, interval_ms, timeframe)
+    } else {
+        last.timestamp + interval_ms
+    };
+
+    if now_ms < next_candle_ts {
+        return false;
+    }
+
+    // Guard against wildly stale data (e.g. synthetic/epoch timestamps or a
+    // feed that has been idle for a very long time): only bridge gaps of up to
+    // a bounded number of periods, otherwise skip forward to the current
+    // bucket instead of appending thousands of empty candles.
+    let current_bucket = align_timestamp(now_ms, interval_ms, timeframe);
+    let mut next_ts = next_candle_ts;
+    if interval_ms > 0 {
+        let periods_behind = (current_bucket.saturating_sub(next_candle_ts)) / interval_ms;
+        if periods_behind > MAX_BACKFILL_PERIODS {
+            next_ts = current_bucket;
+        }
+    }
+    let mut changed = false;
+    let mut prev_close = last.close;
+    let price = inner.latest_ticker_price.unwrap_or(prev_close);
+
+    while next_ts <= current_bucket {
+        let is_current = next_ts == current_bucket;
+        let c_price = if is_current { price } else { prev_close };
+        let new_candle = OhlcvCandle {
+            timestamp: next_ts,
+            open: prev_close,
+            high: prev_close.max(c_price),
+            low: prev_close.min(c_price),
+            close: c_price,
+            volume: 0.0,
+        };
+        inner.candles.push(new_candle);
+        prev_close = c_price;
+        changed = true;
+
+        if timeframe == "1M" {
+            next_ts = align_timestamp(next_ts + 32 * 86_400_000, interval_ms, timeframe);
+        } else {
+            next_ts += interval_ms;
+        }
+
+        if inner.candles.len() > MAX_CANDLES + 50 {
+            break;
+        }
+    }
+
+    if changed {
+        if inner.candles.len() > MAX_CANDLES {
+            let excess = inner.candles.len() - MAX_CANDLES;
+            inner.candles.drain(0..excess);
+        }
+        inner.live_ticker_candle_ts = Some(current_bucket);
+    }
+
+    changed
+}
+
 async fn drain_loop(
     mut rx: broadcast::Receiver<Arc<Vec<OhlcvCandle>>>,
     mut tick_rx: Option<broadcast::Receiver<Arc<crate::data::tick::UnifiedTick>>>,
@@ -324,8 +449,24 @@ async fn drain_loop(
     info!("CandleFeed: drain loop started, waiting for OHLCV and ticker messages");
     let interval_ms = get_interval_ms(&timeframe);
 
+    // Periodic wall-clock tick so the live candle rolls over even when the
+    // market is quiet and neither klines nor ticker ticks arrive.
+    let mut clock_interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    clock_interval.tick().await;
+
     loop {
         tokio::select! {
+            _ = clock_interval.tick() => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let mut inner = buffer.lock().expect("CandleFeed mutex poisoned");
+                if check_and_form_live_candle(&mut inner, interval_ms, &timeframe, now_ms) {
+                    inner.version = inner.version.saturating_add(1);
+                    inner.last_update_ms = now_ms;
+                }
+            }
             batch_res = rx.recv() => {
                 match batch_res {
                     Ok(batch) => {
@@ -364,14 +505,19 @@ async fn drain_loop(
                 if let Ok(tick) = tick_res {
                     let price = tick.price;
                     if price > 0.0 && price.is_finite() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let tick_ms = tick.timestamp_ms.max(now_ms);
                         let mut inner = buffer.lock().expect("CandleFeed mutex poisoned");
                         inner.latest_ticker_price = Some(price);
-                        
-                        let tick_ms = tick.timestamp_ms;
-                        let current_bucket_ts = align_timestamp(tick_ms, interval_ms, &timeframe);
 
-                        let mut changed = false;
+                        let mut changed =
+                            check_and_form_live_candle(&mut inner, interval_ms, &timeframe, tick_ms);
+
                         if inner.candles.is_empty() {
+                            let current_bucket_ts = align_timestamp(tick_ms, interval_ms, &timeframe);
                             let new_candle = OhlcvCandle {
                                 timestamp: current_bucket_ts,
                                 open: price,
@@ -384,40 +530,17 @@ async fn drain_loop(
                             inner.live_ticker_candle_ts = Some(current_bucket_ts);
                             changed = true;
                         } else if let Some(last) = inner.candles.last_mut() {
-                            let next_candle_ts = if timeframe == "1M" {
-                                align_timestamp(last.timestamp + 32 * 86_400_000, interval_ms, &timeframe)
-                            } else {
-                                last.timestamp + interval_ms
-                            };
-
-                            if last.timestamp == current_bucket_ts || tick_ms < next_candle_ts {
-                                let high = last.high.max(price);
-                                let low = last.low.min(price);
-                                changed = last.close != price || last.high != high || last.low != low;
-                                if changed {
-                                    last.close = price;
-                                    last.high = high;
-                                    last.low = low;
-                                }
-                                inner.live_ticker_candle_ts = Some(last.timestamp);
-                            } else if tick_ms >= next_candle_ts {
-                                let bucket = current_bucket_ts.max(next_candle_ts);
-                                let new_candle = OhlcvCandle {
-                                    timestamp: bucket,
-                                    open: last.close,
-                                    high: last.close.max(price),
-                                    low: last.close.min(price),
-                                    close: price,
-                                    volume: 0.0,
-                                };
-                                inner.candles.push(new_candle);
-                                if inner.candles.len() > MAX_CANDLES {
-                                    inner.candles.remove(0);
-                                }
-                                inner.live_ticker_candle_ts = Some(bucket);
+                            let high = last.high.max(price);
+                            let low = last.low.min(price);
+                            if last.close != price || last.high != high || last.low != low {
+                                last.close = price;
+                                last.high = high;
+                                last.low = low;
                                 changed = true;
                             }
+                            inner.live_ticker_candle_ts = Some(last.timestamp);
                         }
+
                         if changed {
                             inner.version = inner.version.saturating_add(1);
                             inner.last_update_ms = tick_ms;
@@ -693,6 +816,16 @@ mod tests {
         assert!((buf[1].volume - 12.5).abs() < f64::EPSILON);
     }
 
+    /// Current wall-clock time in ms. Tests that go through `CandleFeed`'s
+    /// public API must anchor their timestamps near "now", otherwise the
+    /// clock-driven rollover would (correctly) fill the gap to the present.
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
     #[tokio::test]
     async fn test_drain_loop_live_candle_volume_not_polluted_by_ticker() {
         let (rx_tx, rx) = broadcast::channel(16);
@@ -700,10 +833,15 @@ mod tests {
 
         let feed = CandleFeed::new(rx, Some(tick_rx), Some("1m".to_string()));
 
-        // Historical candle at ts = 60_000
+        // Anchor on the current minute bucket: the previous candle is `t0`,
+        // the forming one is `t1`.
+        let t0 = align_timestamp(now_ms(), 60_000, "1m") - 60_000;
+        let t1 = t0 + 60_000;
+
+        // Historical candle at ts = t0
         rx_tx
             .send(Arc::new(vec![OhlcvCandle {
-                timestamp: 60_000,
+                timestamp: t0,
                 open: 100.0,
                 high: 105.0,
                 low: 95.0,
@@ -714,15 +852,14 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Ticker tick arrives with tick.amount = 0.0 (or even if some 24h volume existed in tick)
-        // at timestamp for the next minute (120_000)
+        // Ticker tick arrives at the start of the next minute (ts = t1)
         let tick = Arc::new(crate::data::tick::UnifiedTick::new(
             "binance",
             "BTC/USDT",
             104.0,
             99999.0, // test that tick.amount is NOT used as candle volume!
             crate::data::tick::TradeSide::Unknown,
-            125_000,
+            t1 + 5_000,
         ));
         tick_tx.send(tick).unwrap();
 
@@ -731,15 +868,15 @@ mod tests {
         let snap = feed.snapshot();
         assert_eq!(snap.len(), 2);
         let live_candle = snap.last().unwrap();
-        assert_eq!(live_candle.timestamp, 120_000);
+        assert_eq!(live_candle.timestamp, t1);
         assert_eq!(live_candle.close, 104.0);
         // Must be 0.0, NOT 99999.0!
         assert_eq!(live_candle.volume, 0.0);
 
-        // Now exchange kline arrives for 120_000 with true volume 3.4
+        // Now exchange kline arrives for t1 with true volume 3.4
         rx_tx
             .send(Arc::new(vec![OhlcvCandle {
-                timestamp: 120_000,
+                timestamp: t1,
                 open: 102.0,
                 high: 104.5,
                 low: 101.5,
@@ -752,7 +889,7 @@ mod tests {
 
         let snap2 = feed.snapshot();
         let live_candle2 = snap2.last().unwrap();
-        assert_eq!(live_candle2.timestamp, 120_000);
+        assert_eq!(live_candle2.timestamp, t1);
         // Live close remains from fast ticker
         assert_eq!(live_candle2.close, 104.0);
         // High is max(104.0, 104.5) = 104.5
@@ -768,10 +905,14 @@ mod tests {
 
         let feed = CandleFeed::new(rx, Some(tick_rx), Some("1m".to_string()));
 
-        // Initial historical candle at ts = 60_000
+        // Anchor on the current minute bucket, two candles back.
+        let t0 = align_timestamp(now_ms(), 60_000, "1m") - 120_000;
+        let t1 = t0 + 60_000;
+
+        // Initial historical candle at ts = t0
         rx_tx
             .send(Arc::new(vec![OhlcvCandle {
-                timestamp: 60_000,
+                timestamp: t0,
                 open: 100.0,
                 high: 105.0,
                 low: 95.0,
@@ -782,46 +923,53 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Ticker tick arrives within current candle duration (ts = 80_000)
+        // Ticker tick arrives within current candle duration (ts = t0 + 20s)
         let tick1 = Arc::new(crate::data::tick::UnifiedTick::new(
             "binance",
             "BTC/USDT",
             105.0,
             0.0,
             crate::data::tick::TradeSide::Unknown,
-            80_000,
+            t0 + 20_000,
         ));
         tick_tx.send(tick1).unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let snap1 = feed.snapshot();
-        assert_eq!(snap1.len(), 1);
-        assert_eq!(snap1[0].timestamp, 60_000);
-        assert_eq!(snap1[0].close, 105.0);
+        // t0 is two buckets behind the wall clock, so the clock rollover has
+        // already backfilled the current bucket alongside it. The ticker price
+        // is applied to the *forming* candle, so t0 keeps its historical close.
+        assert_eq!(snap1.len(), 3);
+        let c0 = snap1.iter().find(|c| c.timestamp == t0).unwrap();
+        assert_eq!(c0.close, 102.0);
+        let live = snap1.last().unwrap();
+        assert_eq!(live.timestamp, align_timestamp(now_ms(), 60_000, "1m"));
+        assert_eq!(live.close, 105.0);
 
-        // Next ticker tick crosses into next 1m period (ts = 125_000 >= 60_000 + 60_000)
+        // Next ticker tick crosses into the next 1m period (ts = t1 + 5s)
         let tick2 = Arc::new(crate::data::tick::UnifiedTick::new(
             "binance",
             "BTC/USDT",
             106.5,
             0.0,
             crate::data::tick::TradeSide::Unknown,
-            125_000,
+            t1 + 5_000,
         ));
         tick_tx.send(tick2).unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let snap2 = feed.snapshot();
-        assert_eq!(snap2.len(), 2);
-        assert_eq!(snap2[0].close, 105.0);
-        assert_eq!(snap2[1].timestamp, 120_000);
-        assert_eq!(snap2[1].open, 105.0);
-        assert_eq!(snap2[1].close, 106.5);
+        // The ticker price always applies to the *forming* (current) candle.
+        let live2 = snap2.last().unwrap();
+        assert_eq!(live2.timestamp, align_timestamp(now_ms(), 60_000, "1m"));
+        assert_eq!(live2.close, 106.5);
 
-        // Delayed exchange kline arrives for 120_000 with a lagging close (104.0)
+        // Delayed exchange kline arrives for the current bucket with a lagging
+        // close (104.0); the live ticker close must win.
+        let cur = live2.timestamp;
         rx_tx
             .send(Arc::new(vec![OhlcvCandle {
-                timestamp: 120_000,
+                timestamp: cur,
                 open: 105.0,
                 high: 107.0,
                 low: 103.0,
@@ -831,13 +979,202 @@ mod tests {
             .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
+        // `snapshot()` may have rolled over to the current bucket by now; the
+        // current candle must still carry the live ticker close, not the lagging kline.
         let snap3 = feed.snapshot();
-        assert_eq!(snap3.len(), 2);
-        // Live close remains synchronized with ticker (106.5), NOT lagging kline (104.0)
-        assert_eq!(snap3[1].close, 106.5);
-        // Bounds and volume merged
-        assert_eq!(snap3[1].high, 107.0);
-        assert_eq!(snap3[1].low, 103.0);
-        assert_eq!(snap3[1].volume, 15.0);
+        let c1 = snap3
+            .iter()
+            .find(|c| c.timestamp == cur)
+            .expect("current candle missing");
+        assert_eq!(c1.close, 106.5);
+        assert_eq!(c1.high, 107.0);
+        assert_eq!(c1.volume, 15.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Clock-driven live candle formation
+    // -----------------------------------------------------------------------
+
+    fn inner_with(candles: Vec<OhlcvCandle>, price: Option<f64>) -> CandleFeedInner {
+        CandleFeedInner {
+            candles,
+            last_update_ms: 0,
+            version: 0,
+            live_ticker_candle_ts: None,
+            latest_ticker_price: price,
+            credit_error: None,
+            fetch_error: None,
+        }
+    }
+
+    #[test]
+    fn check_and_form_does_nothing_before_boundary() {
+        let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(101.0));
+        let changed = check_and_form_live_candle(&mut inner, 60_000, "1m", 119_999);
+        assert!(!changed);
+        assert_eq!(inner.candles.len(), 1);
+        assert_eq!(inner.live_ticker_candle_ts, None);
+    }
+
+    #[test]
+    fn check_and_form_creates_candle_at_boundary() {
+        let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(101.5));
+        let changed = check_and_form_live_candle(&mut inner, 60_000, "1m", 120_000);
+        assert!(changed);
+        assert_eq!(inner.candles.len(), 2);
+        let live = inner.candles.last().unwrap();
+        assert_eq!(live.timestamp, 120_000);
+        assert_eq!(live.open, 100.0);
+        assert_eq!(live.close, 101.5);
+        assert_eq!(live.high, 101.5);
+        assert_eq!(live.low, 100.0);
+        assert_eq!(live.volume, 0.0);
+        assert_eq!(inner.live_ticker_candle_ts, Some(120_000));
+    }
+
+    #[test]
+    fn check_and_form_is_idempotent_within_same_bucket() {
+        let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(101.0));
+        assert!(check_and_form_live_candle(&mut inner, 60_000, "1m", 150_000));
+        assert!(!check_and_form_live_candle(&mut inner, 60_000, "1m", 150_500));
+        assert_eq!(inner.candles.len(), 2);
+    }
+
+    #[test]
+    fn check_and_form_backfills_skipped_periods() {
+        let mut inner = inner_with(vec![candle(60_000, 100.0)], None);
+        // Jump 3 periods ahead: 120k, 180k, 240k should be created.
+        let changed = check_and_form_live_candle(&mut inner, 60_000, "1m", 250_000);
+        assert!(changed);
+        let ts: Vec<i64> = inner.candles.iter().map(|c| c.timestamp).collect();
+        assert_eq!(ts, vec![60_000, 120_000, 180_000, 240_000]);
+        // Without a ticker price, flat candles carry the previous close.
+        for c in &inner.candles[1..] {
+            assert_eq!(c.open, 100.0);
+            assert_eq!(c.close, 100.0);
+        }
+    }
+
+    #[test]
+    fn check_and_form_ignores_empty_buffer_and_bad_interval() {
+        let mut empty = inner_with(Vec::new(), Some(1.0));
+        assert!(!check_and_form_live_candle(&mut empty, 60_000, "1m", i64::MAX));
+
+        let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(1.0));
+        assert!(!check_and_form_live_candle(&mut inner, 0, "1m", i64::MAX));
+        assert_eq!(inner.candles.len(), 1);
+    }
+
+    #[test]
+    fn check_and_form_evicts_to_max_candles() {
+        let mut candles: Vec<OhlcvCandle> = (0..MAX_CANDLES as i64)
+            .map(|i| candle(i * 60_000, 100.0))
+            .collect();
+        let last_ts = candles.last().unwrap().timestamp;
+        let mut inner = inner_with(std::mem::take(&mut candles), Some(100.0));
+        let changed = check_and_form_live_candle(&mut inner, 60_000, "1m", last_ts + 60_000);
+        assert!(changed);
+        assert_eq!(inner.candles.len(), MAX_CANDLES);
+        assert_eq!(inner.candles.last().unwrap().timestamp, last_ts + 60_000);
+    }
+
+    #[test]
+    fn check_and_form_monthly_advances_calendar_month() {
+        let interval_ms = get_interval_ms("1M");
+        // 2026-10-01 00:00:00 UTC
+        let oct_1 = chrono::DateTime::<chrono::Utc>::from_timestamp(
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp(),
+            0,
+        )
+        .unwrap()
+        .timestamp_millis();
+        let mut inner = inner_with(vec![candle(oct_1, 50.0)], Some(55.0));
+
+        // Mid-October: still inside the October candle.
+        assert!(!check_and_form_live_candle(
+            &mut inner,
+            interval_ms,
+            "1M",
+            oct_1 + 10 * 86_400_000
+        ));
+        assert_eq!(inner.candles.len(), 1);
+
+        // November 3rd: the November candle must be formed.
+        let changed =
+            check_and_form_live_candle(&mut inner, interval_ms, "1M", oct_1 + 33 * 86_400_000);
+        assert!(changed);
+        assert_eq!(inner.candles.len(), 2);
+        let live = inner.candles.last().unwrap();
+        assert_eq!(live.timestamp, align_timestamp(oct_1 + 33 * 86_400_000, interval_ms, "1M"));
+        assert_eq!(live.open, 50.0);
+        assert_eq!(live.close, 55.0);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_forms_live_candle_on_clock_rollover() {
+        let (_tx, rx) = broadcast::channel(16);
+        let feed = CandleFeed::new(rx, None, Some("1m".to_string()));
+
+        // Seed a candle that is already several periods in the past so the
+        // wall clock is guaranteed to be past its next boundary.
+        let now = now_ms();
+        let stale_ts = align_timestamp(now, 60_000, "1m") - 5 * 60_000;
+        feed.merge_history(&[OhlcvCandle {
+            timestamp: stale_ts,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 1.0,
+        }]);
+        // `len()` itself performs the clock rollover, so the 5 missing periods
+        // are already backfilled by the time we read it.
+        assert_eq!(feed.len(), 6);
+        let version_before = feed.version();
+
+        // No WebSocket traffic at all — snapshot alone must roll the candle over.
+        let snap = feed.snapshot();
+        assert!(snap.len() >= 2, "expected live candle to be formed");
+        let live = snap.last().unwrap();
+        assert_eq!(live.timestamp, align_timestamp(now_ms(), 60_000, "1m"));
+        assert_eq!(live.open, 100.5);
+        assert_eq!(live.close, 100.5);
+        assert_eq!(live.volume, 0.0);
+        // The rollover already happened during `len()`, so reading the snapshot
+        // again in the same bucket is a no-op and must not bump the version.
+        assert_eq!(feed.version(), version_before);
+
+        // Repeated snapshots in the same bucket must not add more candles.
+        let len_after = feed.snapshot().len();
+        assert_eq!(feed.snapshot().len(), len_after);
+    }
+
+    #[test]
+    fn merge_history_upserts_and_bumps_version() {
+        let (_tx, rx) = broadcast::channel(16);
+        let feed = CandleFeed::new(rx, None, Some("1m".to_string()));
+        assert_eq!(feed.version(), 0);
+
+        // Anchor near "now" so the clock rollover does not add extra candles.
+        let base = align_timestamp(now_ms(), 60_000, "1m");
+        let (t0, t1) = (base - 60_000, base);
+
+        feed.merge_history(&[candle(t0, 10.0), candle(t1, 11.0)]);
+        assert_eq!(feed.len(), 2);
+        assert_eq!(feed.version(), 1);
+
+        // Same values → no version bump.
+        feed.merge_history(&[candle(t0, 10.0), candle(t1, 11.0)]);
+        assert_eq!(feed.version(), 1);
+
+        // Changed close → version bump.
+        feed.merge_history(&[candle(t1, 12.0)]);
+        assert_eq!(feed.version(), 2);
+        assert_eq!(feed.snapshot().last().unwrap().close, 12.0);
     }
 }

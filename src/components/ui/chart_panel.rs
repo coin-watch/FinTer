@@ -122,6 +122,12 @@ pub struct ChartPanel {
     /// Interactive viewport + crosshair state.
     chart_state: ChartState,
     pub on_load_more: Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
+    /// Called shortly after a new live candle appears so the feed can re-fetch
+    /// the just-closed bar from the exchange (final OHLCV + volume).
+    pub on_refresh_latest: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Timestamp of the newest candle seen on the previous frame, used to
+    /// detect a period rollover.
+    last_completed_candle_ts: i64,
     history_completion: Option<std::sync::mpsc::Receiver<()>>,
     history_retry_at: Option<std::time::Instant>,
     oldest_loaded_ts: i64,
@@ -288,6 +294,8 @@ impl ChartPanel {
             pane_width: 800.0,
             pane_height: 500.0,
             on_load_more: None,
+            on_refresh_latest: None,
+            last_completed_candle_ts: 0,
             history_completion: None,
             history_retry_at: None,
             oldest_loaded_ts: 0,
@@ -920,6 +928,25 @@ impl Render for ChartPanel {
                 Some(c)
             })
             .collect();
+
+        // A new candle appeared → the previous one just closed. Ask upstream to
+        // re-fetch after a short delay so the exchange has finalized the bar.
+        let latest_ts = candles.last().map(|c| c.timestamp).unwrap_or(0);
+        if latest_ts > 0 {
+            if self.last_completed_candle_ts > 0 && latest_ts > self.last_completed_candle_ts {
+                if let Some(refresh) = &self.on_refresh_latest {
+                    let refresh = refresh.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            // Wait 1.5s for upstream exchange to finalize the closed bar
+                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                            refresh();
+                        })
+                        .detach();
+                }
+            }
+            self.last_completed_candle_ts = latest_ts;
+        }
 
         // NOTE: The candle series from `self.feed.snapshot_with_version()` is
         // authoritative. `CandleFeed` already subscribes to and maintains the
