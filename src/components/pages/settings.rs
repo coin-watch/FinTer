@@ -741,7 +741,7 @@ impl SettingsPage {
             .description("Configure and manage local exchange API keys. Stored only on this machine with 0600 permissions.")
             .group(
                 SettingGroup::new().item(SettingItem::render(move |_, _, _| {
-                    div().w_full().min_w_0().child(view.clone())
+                    gpui_component::v_flex().w_full().min_w_0().child(view.clone())
                 })),
             )
     }
