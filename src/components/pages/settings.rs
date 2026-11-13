@@ -626,7 +626,7 @@ impl SettingsPage {
         };
 
         Settings::new("app-settings")
-            .sidebar_width(px(220.))
+            .sidebar_width(px(260.))
             .page(self.build_appearance_page(settings.clone(), cloud.clone()))
             .page(self.build_network_page(settings.clone(), cloud.clone()))
             .page(self.build_agent_page(settings.clone()))

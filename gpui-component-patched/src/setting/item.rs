@@ -202,7 +202,11 @@ impl SettingItem {
                                         // wraps normally instead of collapsing
                                         // into a one-character-wide column, but
                                         // let it shrink on compact windows.
-                                        this.flex_1().min_w(px(120.)).max_w_3_5()
+                                        // Do not cap the width: when the field
+                                        // wraps onto its own line the title can
+                                        // then use the full row instead of being
+                                        // squeezed into a narrow left column.
+                                        this.flex_1().min_w(px(120.))
                                     } else {
                                         this.w_full()
                                     }

@@ -365,7 +365,7 @@ impl Render for ApiManagementView {
                                             .flex_wrap()
                                             .child(
                                                 div()
-                                                    .min_w_0()
+                                                    .flex_shrink_0()
                                                     .text_sm()
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(text_primary)
@@ -485,7 +485,7 @@ impl Render for ApiManagementView {
                             .flex_wrap()
                             .child(
                                 div()
-                                    .min_w_0()
+                                    .flex_shrink_0()
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(text_primary)
@@ -528,47 +528,127 @@ impl Render for ApiManagementView {
             .when(self.is_editing, |this| {
                 let is_updating = self.editing_id.is_some();
                 let exchange_select = self.exchange_select.clone();
+                let is_testnet = self.is_testnet;
 
                 this.child(
                     v_flex()
                         .w_full()
-                        .p(px(16.))
+                        .min_w_0()
+                        .p(px(14.))
                         .rounded(px(6.))
                         .bg(card_bg)
                         .border_1()
-                        .border_color(primary_color.opacity(0.5))
-                        .gap(px(14.))
+                        .border_color(border_color)
+                        .gap(px(12.))
+                        // Header — mirrors the Local Credential Vault card
                         .child(
                             h_flex()
                                 .w_full()
                                 .min_w_0()
-                                .justify_between()
                                 .items_center()
-                                .gap(px(8.))
+                                .justify_between()
+                                .gap(px(12.))
                                 .flex_wrap()
                                 .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(text_primary)
-                                        .child(if is_updating {
-                                            "EDIT EXCHANGE CREDENTIAL"
-                                        } else {
-                                            "ADD NEW EXCHANGE CREDENTIAL"
-                                        }),
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(12.))
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .p(px(8.))
+                                                .rounded(px(6.))
+                                                .bg(cx.theme().muted)
+                                                .child(
+                                                    Icon::new(if is_updating {
+                                                        IconName::Settings
+                                                    } else {
+                                                        IconName::Plus
+                                                    })
+                                                    .size(px(20.))
+                                                    .text_color(primary_color),
+                                                ),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap(px(3.))
+                                                .child(
+                                                    h_flex()
+                                                        .min_w_0()
+                                                        .gap(px(8.))
+                                                        .items_center()
+                                                        .flex_wrap()
+                                                        .child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .text_sm()
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(text_primary)
+                                                                .child(if is_updating {
+                                                                    "EDIT EXCHANGE CREDENTIAL"
+                                                                } else {
+                                                                    "ADD NEW EXCHANGE CREDENTIAL"
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_shrink_0()
+                                                                .px(px(6.))
+                                                                .py(px(1.5))
+                                                                .rounded(px(4.))
+                                                                .bg(primary_color.opacity(0.12))
+                                                                .text_xs()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(primary_color)
+                                                                .child("KEYRING ENCRYPTED"),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .text_xs()
+                                                        .text_color(text_muted)
+                                                        .child("Configure exchange API keys and secrets. Credentials never leave this machine."),
+                                                ),
+                                        ),
                                 )
                                 .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_xs()
-                                        .text_color(text_muted)
-                                        .child("Required: Exchange, API Key, API Secret"),
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .px(px(8.))
+                                        .py(px(4.))
+                                        .rounded(px(4.))
+                                        .bg(primary_color.opacity(0.08))
+                                        .border_1()
+                                        .border_color(primary_color.opacity(0.25))
+                                        .child(
+                                            Icon::new(IconName::Check)
+                                                .size(px(12.))
+                                                .flex_shrink_0()
+                                                .text_color(primary_color),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(primary_color)
+                                                .child("AES-256-GCM READY"),
+                                        ),
                                 ),
                         )
+                        // Divider
+                        .child(div().w_full().h_px().bg(border_color.opacity(0.5)))
                         // Form fields
                         .child(
                             v_flex()
                                 .w_full()
+                                .min_w_0()
                                 .gap(px(12.))
                                 // Row 1: Exchange Selector + Label + Environment
                                 .child(
@@ -623,7 +703,7 @@ impl Render for ApiManagementView {
                                                     this.child(Input::new(&inp))
                                                 }),
                                         )
-                                        // Testnet vs Live toggle
+                                        // Testnet vs Live segmented switch
                                         .child(
                                             v_flex()
                                                 .gap(px(4.))
@@ -638,24 +718,64 @@ impl Render for ApiManagementView {
                                                 )
                                                 .child(
                                                     h_flex()
-                                                        .min_w_0()
-                                                        .gap(px(4.))
-                                                        .flex_wrap()
+                                                        .h_8()
+                                                        .p(px(2.))
+                                                        .rounded(px(6.))
+                                                        .bg(cx.theme().muted)
+                                                        .gap(px(2.))
                                                         .child(
-                                                            Button::new("env-live")
-                                                                .label("LIVE")
-                                                                .when(!self.is_testnet, |s| s.primary())
-                                                                .when(self.is_testnet, |s| s.outline())
+                                                            h_flex()
+                                                                .id("env-live-seg")
+                                                                .flex_1()
+                                                                .h_full()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .px(px(10.))
+                                                                .rounded(px(4.))
+                                                                .cursor_pointer()
+                                                                .when(!is_testnet, |s| {
+                                                                    s.bg(cx.theme().background)
+                                                                        .border_1()
+                                                                        .border_color(border_color)
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(primary_color)
+                                                                })
+                                                                .when(is_testnet, |s| {
+                                                                    s.text_color(text_muted)
+                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .hover(|h| h.text_color(text_primary))
+                                                                })
+                                                                .text_xs()
+                                                                .child("LIVE")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                                     this.is_testnet = false;
                                                                     cx.notify();
                                                                 })),
                                                         )
                                                         .child(
-                                                            Button::new("env-testnet")
-                                                                .label("TESTNET")
-                                                                .when(self.is_testnet, |s| s.primary())
-                                                                .when(!self.is_testnet, |s| s.outline())
+                                                            h_flex()
+                                                                .id("env-testnet-seg")
+                                                                .flex_1()
+                                                                .h_full()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .px(px(10.))
+                                                                .rounded(px(4.))
+                                                                .cursor_pointer()
+                                                                .when(is_testnet, |s| {
+                                                                    s.bg(cx.theme().background)
+                                                                        .border_1()
+                                                                        .border_color(border_color)
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(primary_color)
+                                                                })
+                                                                .when(!is_testnet, |s| {
+                                                                    s.text_color(text_muted)
+                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .hover(|h| h.text_color(text_primary))
+                                                                })
+                                                                .text_xs()
+                                                                .child("TESTNET")
                                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                                     this.is_testnet = true;
                                                                     cx.notify();
@@ -726,10 +846,13 @@ impl Render for ApiManagementView {
                                         }),
                                 ),
                         )
+                        // Divider
+                        .child(div().w_full().h_px().bg(border_color.opacity(0.5)))
                         // Form buttons
                         .child(
                             h_flex()
                                 .w_full()
+                                .min_w_0()
                                 .justify_end()
                                 .gap(px(8.))
                                 .flex_wrap()
@@ -744,7 +867,11 @@ impl Render for ApiManagementView {
                                 .child(
                                     Button::new("save-form-btn")
                                         .primary()
-                                        .label("Save & Encrypt Key")
+                                        .label(if is_updating {
+                                            "Save & Update Key"
+                                        } else {
+                                            "Save & Encrypt Key"
+                                        })
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.save_form(cx);
                                         })),
@@ -819,78 +946,172 @@ impl Render for ApiManagementView {
                             v_flex()
                                 .w_full()
                                 .min_w_0()
-                                .p(px(12.))
+                                .p(px(14.))
                                 .rounded(px(6.))
                                 .bg(card_bg)
                                 .border_1()
                                 .border_color(border_color)
-                                .gap(px(10.))
-                                // Card Top Row
+                                .gap(px(12.))
+                                // Card Header — mirrors the Local Credential Vault card
                                 .child(
                                     h_flex()
                                         .w_full()
                                         .min_w_0()
                                         .justify_between()
                                         .items_center()
-                                        .gap(px(8.))
+                                        .gap(px(12.))
                                         .flex_wrap()
                                         .child(
                                             h_flex()
-                                                .min_w_0()
                                                 .flex_1()
-                                                .gap(px(8.))
+                                                .min_w_0()
+                                                .gap(px(12.))
                                                 .items_center()
-                                                .flex_wrap()
                                                 .child(
                                                     div()
                                                         .flex_shrink_0()
-                                                        .px(px(8.))
-                                                        .py(px(2.))
-                                                        .rounded(px(4.))
-                                                        .bg(primary_color.opacity(0.15))
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(primary_color)
-                                                        .child(cred.exchange.to_uppercase()),
+                                                        .p(px(8.))
+                                                        .rounded(px(6.))
+                                                        .bg(cx.theme().muted)
+                                                        .child(
+                                                            Icon::new(IconName::Building2)
+                                                                .size(px(20.))
+                                                                .text_color(primary_color),
+                                                        ),
                                                 )
                                                 .child(
-                                                    div()
+                                                    v_flex()
+                                                        .flex_1()
                                                         .min_w_0()
-                                                        .truncate()
-                                                        .max_w(px(240.))
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(text_primary)
-                                                        .child(cred.label.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_shrink_0()
-                                                        .px(px(6.))
-                                                        .py(px(1.5))
-                                                        .rounded(px(4.))
-                                                        .bg(if cred.is_testnet {
-                                                            cx.theme().warning.opacity(0.15)
-                                                        } else {
-                                                            cx.theme().accent.opacity(0.2)
-                                                        })
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(if cred.is_testnet {
-                                                            cx.theme().warning
-                                                        } else {
-                                                            primary_color
-                                                        })
-                                                        .child(if cred.is_testnet { "TESTNET" } else { "LIVE" }),
+                                                        .gap(px(3.))
+                                                        // Title line: exchange pill + label + env + storage
+                                                        .child(
+                                                            h_flex()
+                                                                .min_w_0()
+                                                                .gap(px(8.))
+                                                                .items_center()
+                                                                .flex_wrap()
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .px(px(6.))
+                                                                        .py(px(1.5))
+                                                                        .rounded(px(4.))
+                                                                        .bg(primary_color.opacity(0.12))
+                                                                        .text_xs()
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(primary_color)
+                                                                        .child(cred.exchange.to_uppercase()),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .min_w_0()
+                                                                        .truncate()
+                                                                        .max_w_full()
+                                                                        .text_sm()
+                                                                        .font_weight(FontWeight::BOLD)
+                                                                        .text_color(text_primary)
+                                                                        .child(if cred.label.trim().is_empty() {
+                                                                            "Default Key".to_string()
+                                                                        } else {
+                                                                            cred.label.clone()
+                                                                        }),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .px(px(6.))
+                                                                        .py(px(1.5))
+                                                                        .rounded(px(4.))
+                                                                        .bg(if cred.is_testnet {
+                                                                            cx.theme().warning.opacity(0.12)
+                                                                        } else {
+                                                                            primary_color.opacity(0.08)
+                                                                        })
+                                                                        .border_1()
+                                                                        .border_color(if cred.is_testnet {
+                                                                            cx.theme().warning.opacity(0.25)
+                                                                        } else {
+                                                                            primary_color.opacity(0.2)
+                                                                        })
+                                                                        .text_xs()
+                                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                                        .text_color(if cred.is_testnet {
+                                                                            cx.theme().warning
+                                                                        } else {
+                                                                            primary_color
+                                                                        })
+                                                                        .child(if cred.is_testnet { "TESTNET" } else { "LIVE" }),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex_shrink_0()
+                                                                        .px(px(6.))
+                                                                        .py(px(1.5))
+                                                                        .rounded(px(4.))
+                                                                        .bg(cx.theme().muted)
+                                                                        .text_xs()
+                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .text_color(text_muted)
+                                                                        .child("LOCAL 0600"),
+                                                                ),
+                                                        )
+                                                        // Security status line
+                                                        .child(
+                                                            h_flex()
+                                                                .min_w_0()
+                                                                .gap_x(px(10.))
+                                                                .gap_y(px(2.))
+                                                                .items_center()
+                                                                .flex_wrap()
+                                                                .text_xs()
+                                                                .text_color(text_muted)
+                                                                .child(
+                                                                    h_flex()
+                                                                        .flex_shrink_0()
+                                                                        .gap(px(4.))
+                                                                        .items_center()
+                                                                        .child(
+                                                                            Icon::new(IconName::Check)
+                                                                                .size(px(12.))
+                                                                                .flex_shrink_0()
+                                                                                .text_color(primary_color),
+                                                                        )
+                                                                        .child("Secret Stored"),
+                                                                )
+                                                                .child(
+                                                                    h_flex()
+                                                                        .flex_shrink_0()
+                                                                        .gap(px(4.))
+                                                                        .items_center()
+                                                                        .child(
+                                                                            Icon::new(if cred.passphrase.trim().is_empty() {
+                                                                                IconName::Dash
+                                                                            } else {
+                                                                                IconName::Check
+                                                                            })
+                                                                            .size(px(12.))
+                                                                            .flex_shrink_0()
+                                                                            .text_color(if cred.passphrase.trim().is_empty() {
+                                                                                text_muted
+                                                                            } else {
+                                                                                primary_color
+                                                                            }),
+                                                                        )
+                                                                        .child(if cred.passphrase.trim().is_empty() {
+                                                                            "No Passphrase"
+                                                                        } else {
+                                                                            "Passphrase Configured"
+                                                                        }),
+                                                                ),
+                                                        ),
                                                 ),
                                         )
                                         .child(
                                             h_flex()
                                                 .flex_shrink_0()
-                                                .min_w_0()
                                                 .gap(px(6.))
                                                 .items_center()
-                                                .flex_wrap()
                                                 .child(
                                                     Button::new(SharedString::from(format!("edit-{}", cred.id)))
                                                         .flex_shrink_0()
@@ -922,16 +1143,13 @@ impl Render for ApiManagementView {
                                                 ),
                                         ),
                                 )
+                                // Divider
+                                .child(div().w_full().h_px().bg(border_color.opacity(0.5)))
                                 // Key Details Row — masked credential pill
                                 .child(
                                     h_flex()
                                         .w_full()
                                         .min_w_0()
-                                        .p(px(8.))
-                                        .rounded(px(4.))
-                                        .bg(cx.theme().background)
-                                        .border_1()
-                                        .border_color(border_color.opacity(0.4))
                                         .justify_between()
                                         .items_center()
                                         .gap(px(8.))
@@ -946,14 +1164,19 @@ impl Render for ApiManagementView {
                                                     div()
                                                         .flex_shrink_0()
                                                         .text_xs()
-                                                        .font_weight(FontWeight::BOLD)
+                                                        .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(text_muted)
                                                         .child("API KEY:"),
                                                 )
                                                 .child(
                                                     div()
                                                         .min_w_0()
-                                                        .flex_1()
+                                                        .px(px(8.))
+                                                        .py(px(3.))
+                                                        .rounded(px(4.))
+                                                        .bg(cx.theme().muted.opacity(0.5))
+                                                        .border_1()
+                                                        .border_color(border_color.opacity(0.4))
                                                         .truncate()
                                                         .text_xs()
                                                         .font_family("monospace")
@@ -970,70 +1193,6 @@ impl Render for ApiManagementView {
                                                     this.copy_key(&id_for_copy, &key_for_copy, cx);
                                                 })),
                                         ),
-                                )
-                                // Status & Metadata Row
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .min_w_0()
-                                        .justify_between()
-                                        .items_center()
-                                        .gap_x(px(10.))
-                                        .gap_y(px(4.))
-                                        .flex_wrap()
-                                        .text_xs()
-                                        .text_color(text_muted)
-                                        .child(
-                                            h_flex()
-                                                .min_w_0()
-                                                .gap_x(px(14.))
-                                                .gap_y(px(4.))
-                                                .flex_wrap()
-                                                .child(
-                                                    h_flex()
-                                                        .flex_shrink_0()
-                                                        .gap(px(4.))
-                                                        .items_center()
-                                                        .child(
-                                                            Icon::new(IconName::Check)
-                                                                .size(px(12.))
-                                                                .flex_shrink_0()
-                                                                .text_color(primary_color),
-                                                        )
-                                                        .child("API Secret Stored"),
-                                                )
-                                                .child(
-                                                    h_flex()
-                                                        .flex_shrink_0()
-                                                        .gap(px(4.))
-                                                        .items_center()
-                                                        .child(
-                                                            Icon::new(if cred.passphrase.trim().is_empty() {
-                                                                IconName::Dash
-                                                            } else {
-                                                                IconName::Check
-                                                            })
-                                                            .size(px(12.))
-                                                            .flex_shrink_0()
-                                                            .text_color(if cred.passphrase.trim().is_empty() {
-                                                                text_muted
-                                                            } else {
-                                                                primary_color
-                                                            }),
-                                                        )
-                                                        .child(if cred.passphrase.trim().is_empty() {
-                                                            "No Passphrase"
-                                                        } else {
-                                                            "Passphrase Configured"
-                                                        }),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .font_family("monospace")
-                                                .child("STORAGE: LOCAL 0600"),
-                                        )
                                 )
                         }))
                 },

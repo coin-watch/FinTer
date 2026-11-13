@@ -42,7 +42,7 @@ impl Settings {
             pages: vec![],
             group_variant: GroupBoxVariant::default(),
             size: Size::default(),
-            sidebar_width: px(250.0),
+            sidebar_width: px(260.0),
             sidebar_style: StyleRefinement::default(),
         }
     }
@@ -274,10 +274,10 @@ impl RenderOnce for Settings {
             .child(
                 resizable_panel()
                     .size(self.sidebar_width)
-                    // Let compact windows shrink the sidebar instead of forcing the
-                    // whole settings view to overflow, but keep it wide enough for
-                    // the search input and truncated page titles.
-                    .size_range(px(160.)..px(360.))
+                    // Keep the sidebar wide enough for the longest page title
+                    // ("Alerts & Notifications") and its submenu caret in the
+                    // monospace UI font. Narrower widths truncate titles.
+                    .size_range(px(260.)..px(360.))
                     .child(self.render_sidebar(&state, &filtered_pages, window, cx)),
             )
             .child(
