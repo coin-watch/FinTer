@@ -42,9 +42,14 @@ impl HomePage {
     pub fn request_module_load(
         &mut self,
         module_json: serde_json::Value,
-        _module_id: String,
+        module_id: String,
         cx: &mut Context<Self>,
     ) {
+        // Stamp the dashboard identity onto the grid so Agent panes created
+        // inside it can default their `ui` directives to this dashboard.
+        self.pane_grid.update(cx, |grid, _| {
+            grid.dashboard_id = Some(module_id.clone());
+        });
         if let Ok(mut tree) = serde_json::from_value::<PaneNode>(module_json.clone()) {
             // Migrate removed Depth panes to the replacement Agent module.
             fn migrate_depth(node: &mut PaneNode) {
@@ -251,6 +256,30 @@ impl HomePage {
 
     pub fn handle_pane_event(&mut self, event: &crate::components::ui::pane_grid::renderer::PaneGridEvent, cx: &mut Context<Self>) {
         self.handle_grid_event(event, cx);
+    }
+
+    /// Applies one Agent-issued pane-grid command and reports the outcome.
+    ///
+    /// This is the single entry point the cross-window registry uses. It routes
+    /// through the same `set_tree` path as the mouse-driven controls, then emits
+    /// [`HomePageEvent::LayoutModified`] so the change is persisted exactly like
+    /// a user edit.
+    pub fn apply_ui_action(
+        &mut self,
+        action: &crate::data::pane_control::UiAction,
+        cx: &mut Context<Self>,
+    ) -> crate::data::pane_control::UiActionResult {
+        let mut result = crate::data::pane_control::UiActionResult::failure(
+            action.action_name(),
+            "The pane grid was unavailable.",
+        );
+        self.pane_grid.update(cx, |grid, cx| {
+            result = crate::components::ui::pane_control::apply_action_to_grid(grid, action, cx);
+        });
+        if result.ok {
+            cx.emit(HomePageEvent::LayoutModified);
+        }
+        result
     }
 
     pub fn apply_settings(&mut self, settings: SettingsData, cx: &mut Context<Self>) {

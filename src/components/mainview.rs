@@ -20,6 +20,7 @@ use crate::data::theme::apply_theme;
 use crate::data::update_manager::UpdateManager;
 use crate::data::version::{UpdateChannel, UpdateState, VersionInfo};
 use gpui::prelude::FluentBuilder;
+use gpui::BorrowAppContext as _;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     Render, StatefulInteractiveElement, StyleRefinement, Styled, Task, Window, WindowControlArea, div, px, rgb,
@@ -718,8 +719,60 @@ impl MainView {
         }));
     }
 
+    /// Publish every open tabbed dashboard to the Agent's cross-window registry.
+    ///
+    /// Detached dashboards register themselves from their own window, so this
+    /// only replaces the tabbed entries and leaves detached ones untouched.
+    fn sync_dashboard_registry(&self, cx: &mut Context<Self>) {
+        let mut entries: Vec<crate::components::ui::pane_control::DashboardTarget> = Vec::new();
+        for (id, home) in &self.dashboard_views {
+            if self.closed_dashboard_tabs.contains(id) {
+                continue;
+            }
+            let name = self
+                .dashboard_modules
+                .iter()
+                .find(|module| module.id.as_ref() == Some(id))
+                .map(|module| module.module_name.clone())
+                .unwrap_or_else(|| "Dashboard".to_string());
+            entries.push(crate::components::ui::pane_control::DashboardTarget {
+                id: id.clone(),
+                name,
+                detached: false,
+                home: home.downgrade(),
+            });
+        }
+        if let (Some(home), Some(active_id)) = (
+            &self.home_page,
+            self.active_module
+                .as_ref()
+                .and_then(|module| module.id.clone()),
+        ) {
+            if !entries.iter().any(|entry| entry.id == active_id) {
+                let name = self
+                    .active_module
+                    .as_ref()
+                    .map(|module| module.module_name.clone())
+                    .unwrap_or_else(|| "Dashboard".to_string());
+                entries.push(crate::components::ui::pane_control::DashboardTarget {
+                    id: active_id,
+                    name,
+                    detached: false,
+                    home: home.downgrade(),
+                });
+            }
+        }
+        if !cx.has_global::<crate::components::ui::pane_control::DashboardRegistry>() {
+            cx.set_global(crate::components::ui::pane_control::DashboardRegistry::default());
+        }
+        cx.update_global::<crate::components::ui::pane_control::DashboardRegistry, _>(
+            |registry, _| registry.sync_main(entries),
+        );
+    }
+
     /// Share a bounded, read-only snapshot of all loaded/open dashboard layouts.
     fn refresh_agent_context(&self, cx: &mut Context<Self>) {
+        self.sync_dashboard_registry(cx);
         let mut homes = self.dashboard_views.clone();
         if let (Some(home), Some(active_id)) = (
             &self.home_page,
@@ -737,10 +790,38 @@ impl MainView {
                     .map(|m| m.module_name.as_str()).unwrap_or("Dashboard");
                 serde_json::json!({"id": id, "name": name, "layout": grid.tree, "market_data": grid.agent_market_snapshot(cx)})
             }).collect();
-        let context = serde_json::json!({"captured_at": chrono::Utc::now().to_rfc3339(), "dashboards": dashboards});
+        // `control` is what the Agent addresses when it emits `ui` directives:
+        // every open dashboard (tabs and detached windows) with per-pane refs.
+        // It is deliberately tiny and kept under its own key so the context
+        // truncator can preserve it while trimming market data.
+        let catalog = crate::components::ui::pane_control::dashboard_catalog(cx);
+        let context = serde_json::json!({
+            "captured_at": chrono::Utc::now().to_rfc3339(),
+            "control": catalog,
+            "dashboards": dashboards,
+        });
         for home in homes.values() {
             let grid = home.read(cx).pane_grid.clone();
             grid.update(cx, |grid, cx| grid.set_agent_context(context.clone(), cx));
+        }
+        // Detached dashboards live in their own windows and are not in
+        // `dashboard_views`, but their Agent panes need the same snapshot so a
+        // conversation there can address every other dashboard too.
+        let detached: Vec<_> = cx
+            .try_global::<crate::components::ui::pane_control::DashboardRegistry>()
+            .map(|registry| {
+                registry
+                    .live()
+                    .into_iter()
+                    .filter(|target| target.detached)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for target in detached {
+            if let Some(home) = target.home.upgrade() {
+                let grid = home.read(cx).pane_grid.clone();
+                grid.update(cx, |grid, cx| grid.set_agent_context(context.clone(), cx));
+            }
         }
     }
 
@@ -973,6 +1054,23 @@ impl MainView {
                         home.request_module_load(module_payload, module_id, cx);
                         home
                     });
+                    // Register this detached dashboard so an Agent pane in any
+                    // window can address it by id or name.
+                    let registry_name = title.clone();
+                    let registry_id = window_module_id.clone();
+                    if !cx.has_global::<crate::components::ui::pane_control::DashboardRegistry>() {
+                        cx.set_global(crate::components::ui::pane_control::DashboardRegistry::default());
+                    }
+                    cx.update_global::<crate::components::ui::pane_control::DashboardRegistry, _>(
+                        |registry, _| {
+                            registry.register(crate::components::ui::pane_control::DashboardTarget {
+                                id: registry_id.clone(),
+                                name: registry_name.clone(),
+                                detached: true,
+                                home: home.downgrade(),
+                            });
+                        },
+                    );
                     let main_for_save = entity.clone();
                     let module_for_save = window_module_id.clone();
                     cx.subscribe(&home, move |home, event: &HomePageEvent, cx| {
@@ -1029,6 +1127,11 @@ impl MainView {
     fn close_dashboard_tab(&mut self, module_id: String, cx: &mut Context<Self>) {
         self.closed_dashboard_tabs.insert(module_id.clone());
         self.dashboard_views.remove(&module_id);
+        if cx.has_global::<crate::components::ui::pane_control::DashboardRegistry>() {
+            cx.update_global::<crate::components::ui::pane_control::DashboardRegistry, _>(
+                |registry, _| registry.remove(&module_id),
+            );
+        }
         if self.active_module.as_ref().and_then(|module| module.id.as_ref()) == Some(&module_id) {
             if let Some(next) = self.dashboard_modules.iter().find(|module| {
                 module.id.as_ref().is_some_and(|id| !self.closed_dashboard_tabs.contains(id))

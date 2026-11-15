@@ -20,6 +20,10 @@ pub struct ChatMessageRecord {
     /// they were executed. Re-parsing or reloading never re-executes a trade.
     #[serde(default)]
     pub trade_receipts: Vec<TradeActionResult>,
+    /// Receipts for the pane-grid (`ui`) directives in `response`, captured the
+    /// single time they were applied. Reloading never re-applies a layout change.
+    #[serde(default)]
+    pub ui_receipts: Vec<crate::data::pane_control::UiActionResult>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -65,8 +69,9 @@ pub fn load_all_conversations() -> Vec<ConversationRecord> {
                                             failed: m.failed,
                                             timestamp: None,
                                             // Legacy history is display-only: never replay
-                                            // past trade directives on migration.
+                                            // past trade or layout directives on migration.
                                             trade_receipts: Vec::new(),
+                                            ui_receipts: Vec::new(),
                                         }).collect(),
                                     });
                                 }
@@ -134,6 +139,10 @@ const MAX_CONTEXT_BYTES: usize = 200_000;
 pub struct LocalConfig {
     pub base_url: String,
     pub api_key: String,
+    /// Model chosen in the Agent panel. Persisted so a restart does not drop the
+    /// user back to "Select model" and silently refuse to send anything.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub fn provider_config() -> LocalConfig {
@@ -142,7 +151,16 @@ pub fn provider_config() -> LocalConfig {
     saved.unwrap_or_else(|| LocalConfig {
         base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()),
         api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default(),
+        model: std::env::var("FINTER_AI_MODEL").ok().filter(|m| !m.trim().is_empty()),
     })
+}
+
+/// Persists the model the user picked in the Agent panel, leaving the endpoint
+/// and key untouched.
+pub fn save_selected_model(model: &str) -> Result<()> {
+    let mut config = provider_config();
+    config.model = Some(model.to_string());
+    save_provider_config(&config)
 }
 
 pub fn save_provider_config(config: &LocalConfig) -> Result<()> {
@@ -248,7 +266,7 @@ pub async fn discover_models() -> Result<Vec<String>> {
     Ok(models)
 }
 
-const SYSTEM_PROMPT: &str = r#"You are FinTer's autonomous trading agent. You analyse the supplied dashboard snapshot, distinguish facts from inference, explicitly identify missing/stale data, and you can execute trades directly on the FinTer trade desk. This is informational, not financial advice.
+const SYSTEM_PROMPT: &str = r##"You are FinTer's autonomous trading agent. You analyse the supplied dashboard snapshot, distinguish facts from inference, explicitly identify missing/stale data, and you can execute trades directly on the FinTer trade desk. This is informational, not financial advice.
 
 ## Executing trades
 
@@ -318,7 +336,139 @@ The application fetches the requested OHLCV data and renders a static chart at t
 - end: optional end of a historical window. Date-only values include the whole day.
 - title: optional short label.
 
-Without start/end, the app fetches the most recent `candles` snapshot. With start/end, it fetches the exact historical window, not just the latest candles. Use a larger timeframe for long ranges; the app rejects windows estimated above 5000 candles. You may place several chart blocks in one reply and continue your analysis before and after each. Never invent candle values; the app supplies the data. When the user does not name a market, reuse the exchange, symbol, and timeframe from the dashboard snapshot if available. Do not wrap the JSON in extra prose or markdown inside the fence."#;
+Without start/end, the app fetches the most recent `candles` snapshot. With start/end, it fetches the exact historical window, not just the latest candles. Use a larger timeframe for long ranges; the app rejects windows estimated above 5000 candles. You may place several chart blocks in one reply and continue your analysis before and after each. Never invent candle values; the app supplies the data. When the user does not name a market, reuse the exchange, symbol, and timeframe from the dashboard snapshot if available. Do not wrap the JSON in extra prose or markdown inside the fence.
+
+## Controlling the dashboard layout
+
+You can rearrange the pane grid of any open dashboard — including dashboards in
+other windows — by emitting a fenced `ui` block. The application applies it
+immediately and shows the user a receipt with the authoritative result.
+
+The snapshot's `control` object lists every open dashboard with its `id`,
+`name`, `detached` flag, and a `panes` array. Each pane has a `ref` (`#1`,
+`#2`, …), an `id`, a `type`, and its `config`. The `dashboards` array carries the
+market data and layouts for analysis. Address panes by `ref`, by `id`, by module type when
+exactly one pane has that type, or by a unique id prefix. Address dashboards by
+`id`, by `name`, with `"active"` (the dashboard this conversation lives in), or
+with `"all"` to apply the same change everywhere. Omitting `dashboard` targets
+the active dashboard.
+
+Every action accepts `dashboard`. Emit one fenced block per action:
+
+```ui
+{"action":"set_module","pane":"#2","module_type":"chart","config":{"exchange":"binance","symbol":"ETH/USDT","timeframe":"15m"}}
+```
+
+```ui
+{"action":"split","pane":"#1","axis":"vertical"}
+```
+
+```ui
+{"action":"split_matrix","pane":"#3","rows":2,"cols":2}
+```
+
+```ui
+{"action":"swap","pane":"#1","with":"#4"}
+```
+
+```ui
+{"action":"close","pane":"#5"}
+```
+
+```ui
+{"action":"maximize","pane":"#2"}
+```
+
+```ui
+{"action":"restore"}
+```
+
+```ui
+{"action":"focus","pane":"#3"}
+```
+
+```ui
+{"action":"resize","split":"#1","ratio":0.3}
+```
+
+```ui
+{"action":"update_config","pane":"#2","config":{"timeframe":"4h","indicators":["ema20","rsi"]}}
+```
+
+```ui
+{"action":"set_layout","dashboard":"all","layout":{"kind":"split","id":"root","axis":"vertical","ratio":0.25,"a":{"kind":"pane","id":"p1","data":{"type":"watchlist","config":{}}},"b":{"kind":"pane","id":"p2","data":{"type":"chart","config":{"symbol":"BTC/USDT"}}}}}
+```
+
+Allowed actions:
+- set_module: replace a pane's module type and config. `module_type` is one of chart, ticker, orderbook, trades, execution, positions, watchlist, marketcap, newsfeed, time, feargreed, agent, empty.
+- update_config: merge keys into a pane's existing config, keeping its module type.
+- split: split one pane in two. `axis` is `vertical` (side by side) or `horizontal` (stacked); default `vertical`.
+- split_matrix: replace one pane with an evenly distributed `rows` × `cols` grid of empty panes.
+- close: remove a pane and collapse its parent split. The last remaining pane cannot be closed.
+- swap: exchange the contents of two panes.
+- maximize / restore: show one pane full-bleed, or return to the full layout.
+- focus: make a pane the active pane.
+- resize: move a split divider. `ratio` is the share given to the first child, 0.05–0.95.
+- set_layout: replace an entire dashboard with a complete pane tree.
+
+Rules:
+- Only emit `ui` blocks when the user asks you to change, arrange, build, or clean up a layout. Never rearrange a dashboard speculatively.
+- Read the snapshot before acting: use the `ref`/`id` values that are actually present. If a reference does not resolve, the receipt names the panes that do exist — correct yourself from that and retry once.
+- Prefer several small actions (`split`, then `set_module` per pane) over one large `set_layout` when editing an existing dashboard. Use `set_layout` when building a dashboard from scratch or when the user asks for a wholesale replacement.
+- After the blocks, say in one or two sentences what changed. The receipts are the authoritative record; never claim a change the receipts do not confirm.
+- A reply may combine `ui`, `trade`, and `chart` blocks.
+"##;
+
+/// Shrinks an oversized dashboard snapshot while preserving the parts the Agent
+/// needs to act: the `control` catalog and each dashboard's layout.
+///
+/// Candle arrays dominate the snapshot, so they are dropped first, then whole
+/// market-data blocks. The control block is never touched — without it the model
+/// cannot address a pane and every `ui` directive would fail.
+fn shrink_context(context: &Value, budget: usize) -> Value {
+    let mut trimmed = context.clone();
+
+    // Pass 1: keep the last few candles per market, which is enough for the
+    // model to describe recent price action.
+    {
+        let Some(root) = trimmed.as_object_mut() else {
+            return trimmed;
+        };
+        if let Some(dashboards) = root.get_mut("dashboards").and_then(Value::as_array_mut) {
+            for dashboard in dashboards.iter_mut() {
+                let Some(markets) = dashboard
+                    .get_mut("market_data")
+                    .and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                for (_, series) in markets.iter_mut() {
+                    if let Some(candles) = series.as_array_mut() {
+                        if candles.len() > 12 {
+                            let keep_from = candles.len() - 12;
+                            candles.drain(..keep_from);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if serde_json::to_string(&trimmed).map(|s| s.len() <= budget).unwrap_or(false) {
+        return trimmed;
+    }
+
+    // Pass 2: drop market data entirely, keeping layout and control.
+    if let Some(root) = trimmed.as_object_mut() {
+        if let Some(dashboards) = root.get_mut("dashboards").and_then(Value::as_array_mut) {
+            for dashboard in dashboards.iter_mut() {
+                if let Some(object) = dashboard.as_object_mut() {
+                    object.remove("market_data");
+                }
+            }
+        }
+    }
+    trimmed
+}
 
 /// Sends read-only dashboard context and user prompt to the selected model.
 pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Result<String> {
@@ -347,6 +497,14 @@ pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Resu
     };
 
     let mut serialized = serde_json::to_string(&context)?;
+    if serialized.len() > MAX_CONTEXT_BYTES {
+        // Trim market data first: the `control` block is what the Agent uses to
+        // address panes, so losing it would silently disable layout commands
+        // while the request still succeeded. Only fall back to a hard cut when
+        // the control block alone cannot fit.
+        let trimmed = shrink_context(&context, MAX_CONTEXT_BYTES);
+        serialized = serde_json::to_string(&trimmed)?;
+    }
     if serialized.len() > MAX_CONTEXT_BYTES {
         let mut end = MAX_CONTEXT_BYTES;
         while !serialized.is_char_boundary(end) { end -= 1; }
@@ -1033,6 +1191,8 @@ pub enum MessageSegment {
 enum DirectiveFence {
     Chart,
     Trade,
+    /// A pane-grid command, applied by the component layer's dashboard registry.
+    Ui,
 }
 
 fn directive_fence(line: &str) -> Option<DirectiveFence> {
@@ -1045,6 +1205,7 @@ fn directive_fence(line: &str) -> Option<DirectiveFence> {
         "trade" | "finter-trade" | "agent-action" | "finter-agent-action" => {
             Some(DirectiveFence::Trade)
         }
+        "ui" | "finter-ui" | "pane" | "finter-pane" => Some(DirectiveFence::Ui),
         _ => None,
     }
 }
@@ -1136,6 +1297,10 @@ fn parse_segments(text: &str, receipts: &[TradeActionResult]) -> Vec<MessageSegm
                         receipt_index += 1;
                         MessageSegment::Trade(action, result)
                     }),
+                    // Layout directives have no inline segment of their own: the
+                    // receipts are rendered from the message's `ui_receipts`, and
+                    // the raw JSON must never leak into the prose.
+                    DirectiveFence::Ui => None,
                 };
                 if let Some(segment) = segment {
                     if !markdown.is_empty() {
@@ -1258,6 +1423,10 @@ fn is_partial_directive_opener(line: &str) -> bool {
         "finter-trade",
         "agent-action",
         "finter-agent-action",
+        "ui",
+        "finter-ui",
+        "pane",
+        "finter-pane",
     ]
     .iter()
     .any(|known| known.starts_with(&language))
@@ -1416,9 +1585,68 @@ fn truncate_candles(candles: &mut Vec<OhlcvCandle>, limit: usize) {
 mod tests {
     use super::*;
 
+    /// The saved model must survive a settings round-trip: `settings.rs` writes
+    /// a `LocalConfig` built from the endpoint/key fields alone, and dropping the
+    /// model there used to send the panel back to "Select model" after every save.
     #[test]
-    fn context_limit_is_bounded() {
+    fn local_config_preserves_the_selected_model() {
+        let encoded = serde_json::json!({
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test-key",
+            "model": "auto/best-coding",
+        });
+        let config: LocalConfig = serde_json::from_value(encoded).expect("valid config");
+        assert_eq!(config.model.as_deref(), Some("auto/best-coding"));
+
+        // Older files predate the field and must still load.
+        let legacy: LocalConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://example.invalid/v1",
+            "api_key": "test-key",
+        }))
+        .expect("legacy config loads");
+        assert!(legacy.model.is_none());
+    }
+
+    #[test]
+    fn max_context_bytes_stays_bounded() {
         assert!(MAX_CONTEXT_BYTES <= 200_000);
+    }
+
+    #[test]
+    fn shrink_context_keeps_control_and_trims_candles() {
+        let candles: Vec<serde_json::Value> = (0..500)
+            .map(|i| serde_json::json!({"t": i, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 10.0}))
+            .collect();
+        let context = serde_json::json!({
+            "control": {"count": 1, "dashboards": [{"id": "d1", "panes": [{"ref": "#1", "id": "p1"}]}]},
+            "dashboards": [{"id": "d1", "layout": {"kind": "pane"}, "market_data": {"BTC/USDT": candles}}],
+        });
+        let trimmed = shrink_context(&context, 4_000);
+        // The control block must survive verbatim: it is how the model addresses panes.
+        assert_eq!(trimmed["control"], context["control"]);
+        assert_eq!(trimmed["dashboards"][0]["layout"], context["dashboards"][0]["layout"]);
+        let kept = trimmed["dashboards"][0]["market_data"]["BTC/USDT"]
+            .as_array()
+            .expect("market data kept");
+        assert!(kept.len() <= 12, "candles trimmed, got {}", kept.len());
+        assert!(serde_json::to_string(&trimmed).unwrap().len() < 4_000);
+    }
+
+    #[test]
+    fn shrink_context_drops_market_data_before_control() {
+        let candles: Vec<serde_json::Value> = (0..2_000)
+            .map(|i| serde_json::json!({"t": i, "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 10.0}))
+            .collect();
+        let context = serde_json::json!({
+            "control": {"count": 1, "dashboards": [{"id": "d1", "panes": [{"ref": "#1", "id": "p1"}]}]},
+            "dashboards": [{"id": "d1", "layout": {"kind": "pane"}, "market_data": {"BTC/USDT": candles}}],
+        });
+        // Small enough that even 12 retained candles cannot fit, so the second
+        // pass must run and drop market data while keeping control and layout.
+        let trimmed = shrink_context(&context, 400);
+        assert_eq!(trimmed["control"], context["control"]);
+        assert!(trimmed["dashboards"][0].get("market_data").is_none());
+        assert_eq!(trimmed["dashboards"][0]["layout"], context["dashboards"][0]["layout"]);
     }
 
     #[test]
@@ -1762,6 +1990,10 @@ mod tests {
             failed: false,
             timestamp: None,
             trade_receipts: vec![TradeActionResult::failure("place_order", "rejected")],
+            ui_receipts: vec![crate::data::pane_control::UiActionResult::success(
+                "split",
+                "Pane split in two.",
+            )],
         };
         let json = serde_json::to_string(&record).expect("serialize");
         let decoded: ChatMessageRecord = serde_json::from_str(&json).expect("deserialize");

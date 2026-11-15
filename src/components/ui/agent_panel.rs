@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::components::ui::agent_chart::AgentChart;
 use crate::data::agent::{ChartRequest, MessageSegment, TradeAction, TradeActionResult};
+use crate::data::pane_control::UiActionResult;
 
 #[derive(Clone)]
 struct ChatMessage {
@@ -22,6 +23,9 @@ struct ChatMessage {
     /// Receipts for the trade directives in `response`, produced exactly once
     /// when the reply arrives and persisted so renders/reloads never re-execute.
     trade_receipts: Vec<TradeActionResult>,
+    /// Receipts for the pane-grid (`ui`) directives in `response`, produced once
+    /// on arrival and persisted so reloading never re-applies a layout change.
+    ui_receipts: Vec<UiActionResult>,
 }
 
 pub struct AgentPanel { 
@@ -47,6 +51,9 @@ pub struct AgentPanel {
     context_bytes: usize,
     /// Inline chart entities keyed by message + segment + market identity.
     chart_views: std::collections::HashMap<String, Entity<AgentChart>>,
+    /// Id of the dashboard this pane lives in. Used as the default target for
+    /// `ui` directives that omit their `dashboard` selector.
+    dashboard_id: Option<String>,
 }
 
 impl AgentPanel {
@@ -76,10 +83,18 @@ impl AgentPanel {
             context: Value::Null,
             input: None,
             models: Vec::new(),
-            selected_model: "Select model".into(),
+            selected_model: crate::data::agent::provider_config()
+                .model
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| "Select model".into()),
             models_loading: false,
             discovery_attempted: false,
-            provider: (std::env::var("FINTER_AI_BASE_URL").unwrap_or_default(), std::env::var("FINTER_AI_API_KEY").unwrap_or_default()),
+            // Seed from the resolved config so the first render does not look
+            // like a provider change and needlessly clear the model list.
+            provider: {
+                let config = crate::data::agent::provider_config();
+                (config.base_url, config.api_key)
+            },
             loading: false,
             error: None,
             width: 300.0,
@@ -88,7 +103,14 @@ impl AgentPanel {
             module_count: 0,
             context_bytes: 0,
             chart_views: std::collections::HashMap::new(),
+            dashboard_id: None,
         }
+    }
+
+    /// Records which dashboard this Agent pane belongs to, so layout directives
+    /// default to the dashboard the user is actually looking at.
+    pub fn set_dashboard_id(&mut self, dashboard_id: Option<String>) {
+        self.dashboard_id = dashboard_id;
     }
 
     pub fn current_conversation_id(&self) -> Option<String> {
@@ -121,6 +143,7 @@ impl AgentPanel {
                 typing: false,
                 timestamp: m.timestamp,
                 trade_receipts: m.trade_receipts,
+                ui_receipts: m.ui_receipts,
             }).collect();
             self.response.clear();
             self.error = None;
@@ -151,6 +174,7 @@ impl AgentPanel {
                 failed: m.failed,
                 timestamp: m.timestamp.clone(),
                 trade_receipts: m.trade_receipts.clone(),
+                ui_receipts: m.ui_receipts.clone(),
             }).collect(),
         };
         if let Err(e) = crate::data::agent::save_conversation(&record) {
@@ -168,6 +192,76 @@ impl AgentPanel {
 
     fn chart_key(message_index: usize, segment_index: usize, request: &ChartRequest) -> String {
         format!("{message_index}:{segment_index}:{}", request.cache_key())
+    }
+
+    /// Renders the receipt for an applied (or rejected) pane-grid directive.
+    fn render_ui_receipt(
+        index: usize,
+        result: &UiActionResult,
+        colors: &gpui_component::theme::ThemeColor,
+        mono_font: &SharedString,
+    ) -> AnyElement {
+        let accent = if result.ok { colors.bullish } else { colors.bearish };
+        let status = if result.ok { "APPLIED" } else { "FAILED" };
+
+        let mut header = h_flex()
+            .w_full()
+            .gap(px(6.0))
+            .items_center()
+            .flex_wrap()
+            .child(
+                div()
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .bg(accent.opacity(0.18))
+                    .text_xs()
+                    .font_family(mono_font.clone())
+                    .text_color(accent)
+                    .child(status),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_family(mono_font.clone())
+                    .text_color(colors.foreground)
+                    .child(result.action.clone()),
+            );
+        if let Some(dashboard) = result.dashboard.as_ref() {
+            header = header.child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted_foreground)
+                    .child(format!("on {dashboard}")),
+            );
+        }
+        if let Some(pane) = result.pane.as_ref() {
+            header = header.child(
+                div()
+                    .text_xs()
+                    .font_family(mono_font.clone())
+                    .text_color(colors.muted_foreground)
+                    .child(format!("pane {pane}")),
+            );
+        }
+
+        v_flex()
+            .id(ElementId::Name(format!("agent-ui-{index}").into()))
+            .w_full()
+            .p(px(8.0))
+            .rounded(px(6.0))
+            .bg(colors.muted.opacity(0.25))
+            .border_1()
+            .border_color(accent.opacity(0.35))
+            .gap(px(4.0))
+            .child(header)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if result.ok { colors.muted_foreground } else { colors.bearish })
+                    .child(result.message.clone()),
+            )
+            .into_any_element()
     }
 
     /// Renders the receipt for an executed (or rejected) trade directive.
@@ -371,6 +465,7 @@ impl AgentPanel {
             typing: true,
             timestamp: Some(chrono::Local::now().format("%b %d, %H:%M").to_string()),
             trade_receipts: Vec::new(),
+            ui_receipts: Vec::new(),
         });
         self.response.clear();
         self.persist_active_conversation();
@@ -387,12 +482,21 @@ impl AgentPanel {
                     // the response arrives. The receipts are stored on the message
                     // and persisted, so renders and reloads only display them.
                     let trade_receipts = crate::data::agent::execute_trades_in_reply(&text);
-                    // Persist the full answer before animating it, so closing the
-                    // pane during the typing effect does not discard the reply.
-                    let _ = this.update(cx, |panel, _| {
+                    // Layout directives are applied here, exactly once, while we
+                    // hold `&mut App` — the same one-shot contract as trades.
+                    let _ = this.update(cx, |panel, cx| {
+                        let ui_receipts =
+                            crate::components::ui::pane_control::execute_ui_actions_in_reply(
+                                &text,
+                                panel.dashboard_id.as_deref(),
+                                cx,
+                            );
+                        // Persist the full answer before animating it, so closing the
+                        // pane during the typing effect does not discard the reply.
                         if let Some(message) = panel.history.get_mut(message_index) {
                             message.response = text.clone();
                             message.trade_receipts = trade_receipts;
+                            message.ui_receipts = ui_receipts;
                         }
                         panel.persist_active_conversation();
                         if let Some(message) = panel.history.get_mut(message_index) {
@@ -446,7 +550,20 @@ impl AgentPanel {
             let result = crate::data::client::tokio_runtime().spawn(crate::data::agent::discover_models()).await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
             let _ = this.update(cx, |panel, cx| {
                 panel.models_loading = false;
-                match result { Ok(models) => { if panel.selected_model == "Select model" { panel.selected_model = models.first().cloned().unwrap_or_else(|| "Select model".into()); } panel.models=models; }, Err(e) => panel.error=Some(e.to_string()) }
+                match result {
+                    Ok(models) => {
+                        // Adopt the first discovered model when the user has no
+                        // saved choice, so a fresh install can send immediately.
+                        if panel.selected_model == "Select model" {
+                            if let Some(first) = models.first().cloned() {
+                                panel.selected_model = first.clone();
+                                let _ = crate::data::agent::save_selected_model(&first);
+                            }
+                        }
+                        panel.models = models;
+                    }
+                    Err(e) => panel.error = Some(e.to_string()),
+                }
                 cx.notify();
             });
         }).detach();
@@ -473,12 +590,21 @@ impl AgentPanel {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_input(window, cx);
-        let current_provider = (std::env::var("FINTER_AI_BASE_URL").unwrap_or_default(), std::env::var("FINTER_AI_API_KEY").unwrap_or_default());
+        // Compare the resolved provider (saved config, then env) rather than the
+        // env vars alone: a provider configured through Settings is written to
+        // `agent_config.json`, so an env-only check never noticed it change and
+        // kept the stale model list.
+        let resolved = crate::data::agent::provider_config();
+        let current_provider = (resolved.base_url.clone(), resolved.api_key.clone());
         if self.provider != current_provider {
             self.provider = current_provider;
             self.discovery_attempted = false;
             self.models.clear();
-            self.selected_model = "Select model".into();
+            // Keep a model the user already chose; only reset when the new
+            // provider has no saved selection.
+            if resolved.model.as_deref().map_or(true, |m| m.trim().is_empty()) {
+                self.selected_model = "Select model".into();
+            }
         }
         if !self.discovery_attempted && !self.models_loading { self.refresh_models(cx); }
         let colors=cx.theme().colors.clone(); let mono_font=cx.theme().mono_font_family.clone(); let input=self.input.as_ref().unwrap().clone();
@@ -615,6 +741,14 @@ impl Render for AgentPanel {
                                                     _ => {}
                                                 }
                                             }
+                                            for (receipt_index, receipt) in msg.ui_receipts.iter().enumerate() {
+                                                content = content.child(Self::render_ui_receipt(
+                                                    idx * 1000 + receipt_index,
+                                                    receipt,
+                                                    &colors,
+                                                    &mono_font,
+                                                ));
+                                            }
                                             content.into_any_element()
                                         }
                                     )
@@ -699,7 +833,18 @@ impl Render for AgentPanel {
                     for model in &models {
                         let value=model.clone(); let checked=value==selected; let owner=owner.clone();
                         menu=menu.item(PopupMenuItem::new(value.clone()).checked(checked).on_click(move |_, _, app| {
-                            let _ = owner.update(app, |panel, cx| { panel.selected_model=value.clone(); panel.error=None; cx.notify(); });
+                            let _ = owner.update(app, |panel, cx| {
+                                panel.selected_model = value.clone();
+                                panel.error = None;
+                                // Persist immediately: the model choice used to
+                                // live only in memory, so every restart forced a
+                                // manual re-selection before the Agent could talk
+                                // to the provider at all.
+                                if let Err(error) = crate::data::agent::save_selected_model(&value) {
+                                    panel.error = Some(format!("Could not save the selected model: {error}"));
+                                }
+                                cx.notify();
+                            });
                         }));
                     }
                     menu.scrollable(true).max_h(px(420.0)) }))

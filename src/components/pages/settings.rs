@@ -717,6 +717,9 @@ impl SettingsPage {
                             let config = crate::data::agent::LocalConfig {
                                 base_url: values.agent_base_url.to_string(),
                                 api_key: values.agent_api_key.to_string(),
+                                // Preserve the model chosen in the Agent panel;
+                                // this page only edits the endpoint and key.
+                                model: crate::data::agent::provider_config().model,
                             };
                             if let Err(error) = crate::data::agent::save_provider_config(&config) {
                                 tracing::error!(?error, "Failed to save local Agent settings");

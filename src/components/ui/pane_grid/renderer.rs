@@ -98,6 +98,9 @@ pub struct PaneGridRenderer {
     pub fear_greed_views: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, FearGreedViewState>>>,
     /// Latest cross-dashboard snapshot, retained so Agent panes created after refresh receive it.
     agent_context: Option<serde_json::Value>,
+    /// Id of the dashboard this grid renders, so Agent panes know their default
+    /// target for `ui` directives.
+    pub dashboard_id: Option<String>,
     pub timezone: String,
     /// Global setting; individual panels cannot bypass it.
     pub sound_alerts_enabled: bool,
@@ -682,6 +685,7 @@ impl PaneGridRenderer {
             clock_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             fear_greed_views: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             agent_context: None,
+            dashboard_id: None,
             timezone: "UTC".into(),
             sound_alerts_enabled: true,
         }
@@ -2196,9 +2200,13 @@ impl PaneGridRenderer {
                                     let mut agent_map = self.agent_views.borrow_mut();
                                     if !agent_map.contains_key(&pane_id) {
                                         let panel = cx.new(|cx| crate::components::ui::agent_panel::AgentPanel::new(cx));
-                                        if let Some(context) = self.agent_context.clone() {
-                                            panel.update(cx, |agent, _| agent.set_context(context));
-                                        }
+                                        let dashboard_id = self.dashboard_id.clone();
+                                        panel.update(cx, |agent, _| {
+                                            agent.set_dashboard_id(dashboard_id);
+                                            if let Some(context) = self.agent_context.clone() {
+                                                agent.set_context(context);
+                                            }
+                                        });
                                         agent_map.insert(pane_id.clone(), AgentViewState { entity: panel });
                                     }
                                     let ent = agent_map.get(&pane_id).unwrap().entity.clone();

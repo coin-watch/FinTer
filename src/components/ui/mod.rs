@@ -12,6 +12,7 @@ pub mod fear_greed_panel;
 pub mod market_cap_panel;
 pub mod newsfeed_panel;
 pub mod orderbook_panel;
+pub mod pane_control;
 pub mod pane_grid;
 pub mod positions_panel;
 pub mod sidebar;
