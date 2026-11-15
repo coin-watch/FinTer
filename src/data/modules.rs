@@ -1,6 +1,6 @@
-use crate::data::client::{ApiClient, parse_api_response, tokio_runtime};
+use crate::data::client::ApiClient;
 use crate::data::error::Result;
-use crate::data::models::{CreateModuleRequest, Module, UpdateModuleRequest};
+use crate::data::models::Module;
 
 use serde::{Deserialize, Serialize};
 
@@ -71,73 +71,28 @@ pub fn create_single_pane_module_json(
 }
 
 impl ApiClient {
-    /// List all modules (workspace layouts) for the current user.
-    /// GET /api/modules?user_id=... (Bearer auth required)
+    /// List all dashboards for the current user.
+    ///
+    /// Dashboards are stored as files on disk (`data::dashboard_files`), not in
+    /// the `modules` table. This method is retained so existing call sites keep
+    /// working; it no longer performs a network request and does not require
+    /// authentication, which is what makes local-first guest mode work.
     ///
     /// Blocking — run from a background thread.
     pub fn list_modules(&self) -> Result<Vec<Module>> {
-        let user_id = self
-            .user_id()
-            .ok_or_else(|| crate::data::error::CoinWatchError::Auth("Not logged in".into()))?;
-
-        let rt = tokio_runtime();
-        let req = self.auth_get(&format!("/api/modules?user_id={}", user_id));
-
-        rt.block_on(async {
-            let resp = req.send().await?;
-            let status = resp.status();
-            // Server returns raw array (not wrapped in { success, data })
-            let body = resp.text().await?;
-
-            if !status.is_success() {
-                return Err(crate::data::error::CoinWatchError::Api {
-                    status: status.as_u16(),
-                    message: body,
-                });
-            }
-
-            // Empty body means no modules yet — treat as empty list
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                return Ok(vec![]);
-            }
-
-            serde_json::from_str(trimmed).map_err(|e| {
-                tracing::error!(
-                    "✗ list_modules: deserialization failed. status={}, body={:?}, err={}",
-                    status,
-                    &trimmed[..trimmed.len().min(200)],
-                    e
-                );
-                crate::data::error::CoinWatchError::Deserialization(e.to_string())
-            })
-        })
+        crate::data::dashboard_files::list_modules()
     }
 
-    /// Create a new module (workspace layout).
-    /// POST /api/modules (Bearer auth required)
+    /// Create a new dashboard.
     ///
-    /// Blocking — run from a background thread.
+    /// Writes a file to the dashboards directory. Blocking — run from a
+    /// background thread.
     pub fn create_module(&self, module_name: &str, module: serde_json::Value) -> Result<Module> {
-        let user_id = self
-            .user_id()
-            .ok_or_else(|| crate::data::error::CoinWatchError::Auth("Not logged in".into()))?;
-
-        let rt = tokio_runtime();
-        let req = self.auth_post("/api/modules").json(&CreateModuleRequest {
-            user_id,
-            module_name: module_name.to_string(),
-            module,
-        });
-
-        rt.block_on(async {
-            let resp = req.send().await?;
-            parse_api_response(resp).await
-        })
+        let dashboard = crate::data::dashboard_files::create(module_name, module)?;
+        Ok(dashboard.to_module())
     }
 
-    /// Update an existing module.
-    /// PATCH /api/modules/{id} (Bearer auth required)
+    /// Update an existing dashboard's name and/or tree.
     ///
     /// Blocking — run from a background thread.
     pub fn update_module(
@@ -146,71 +101,15 @@ impl ApiClient {
         module_name: Option<&str>,
         module: Option<serde_json::Value>,
     ) -> Result<Module> {
-        tracing::info!(
-            "→ API: update_module called for ID: {}, has_name: {}, has_module: {}",
-            module_id,
-            module_name.is_some(),
-            module.is_some()
-        );
-
-        if let Some(ref json) = module {
-            let json_str = serde_json::to_string(json).unwrap_or_default();
-            tracing::info!("  Module JSON size: {} bytes", json_str.len());
-            tracing::debug!(
-                "  Module JSON preview: {}",
-                &json_str[..json_str.len().min(200)]
-            );
-        }
-
-        let path = format!("/api/modules/{}", module_id);
-        let rt = tokio_runtime();
-        let req = self.auth_patch(&path).json(&UpdateModuleRequest {
-            module_name: module_name.map(|s| s.to_string()),
-            module,
-        });
-
-        rt.block_on(async {
-            tracing::info!("  Sending PATCH request to: {}", path);
-            let resp = req.send().await?;
-            let status = resp.status();
-            tracing::info!("  Response status: {}", status);
-
-            let result: Result<Module> = parse_api_response(resp).await;
-            match &result {
-                Ok(module) => {
-                    tracing::info!("✓ API: Module updated successfully: {}", module.module_name);
-                }
-                Err(e) => {
-                    tracing::error!("✗ API: Module update failed: {:?}", e);
-                }
-            }
-            result
-        })
+        let dashboard = crate::data::dashboard_files::update(module_id, module_name, module)?;
+        Ok(dashboard.to_module())
     }
 
-    /// Delete a module.
-    /// DELETE /api/modules/{id} (Bearer auth required)
+    /// Delete a dashboard.
     ///
     /// Blocking — run from a background thread.
     pub fn delete_module(&self, module_id: &str) -> Result<()> {
-        // Coinwatch API is the only persistence path.
-        let path = format!("/api/modules/{}", module_id);
-        let rt = tokio_runtime();
-        let req = self.auth_delete(&path);
-
-        rt.block_on(async {
-            let resp = req.send().await?;
-            let status = resp.status().as_u16();
-            if (200..300).contains(&status) {
-                Ok(())
-            } else {
-                let body = resp.text().await.unwrap_or_default();
-                Err(crate::data::error::CoinWatchError::Api {
-                    status,
-                    message: body,
-                })
-            }
-        })
+        crate::data::dashboard_files::delete(module_id)
     }
 
     /// Create a default module for new users.

@@ -8,6 +8,8 @@ pub mod candle_feed;
 pub mod client;
 pub mod credential_crypto;
 pub mod credits;
+pub mod dashboard_files;
+pub mod dashboard_migration;
 pub mod dashboard_store;
 pub mod error;
 pub mod exchange_balance;

@@ -232,31 +232,13 @@ impl MainView {
         }
     }
 
-    /// Get the path to the guest/offline layout cache file
+    /// Legacy single-layout file, read once when seeding the dashboard store.
     fn guest_layout_path() -> Option<std::path::PathBuf> {
         dirs::config_dir().map(|mut p| {
             p.push("finter");
             p.push("guest_layout.json");
             p
         })
-    }
-
-    /// Get the path to the authenticated cloud layout cache file
-    fn cloud_layout_path() -> Option<std::path::PathBuf> {
-        dirs::config_dir().map(|mut p| {
-            p.push("finter");
-            p.push("cloud_layout.json");
-            p
-        })
-    }
-
-    /// Active layout file based on authentication state
-    fn active_layout_path(&self) -> Option<std::path::PathBuf> {
-        if self.is_authenticated {
-            Self::cloud_layout_path()
-        } else {
-            Self::guest_layout_path()
-        }
     }
 
     /// Local tab preferences are kept per guest/cloud profile.
@@ -388,57 +370,96 @@ impl MainView {
             }
         }
 
-        let tree = if let Some(path) = Self::guest_layout_path() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                serde_json::from_str::<PaneNode>(&content).ok()
-            } else {
-                None
+        // Dashboards come from the dashboard file store. If nothing is on disk
+        // yet, seed one from the legacy single-layout file so an existing
+        // install keeps its workspace, and fall back to the starter layout.
+        let modules = match crate::data::dashboard_files::list_modules() {
+            Ok(list) if !list.is_empty() => list,
+            Ok(_) => {
+                let legacy_tree = Self::guest_layout_path()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .and_then(|content| serde_json::from_str::<PaneNode>(&content).ok());
+
+                let tree = legacy_tree.unwrap_or_else(crate::data::modules::default_workspace);
+                let tree_value = serde_json::to_value(&tree).unwrap_or_default();
+
+                match crate::data::dashboard_files::create("Local Workspace", tree_value) {
+                    Ok(dashboard) => vec![dashboard.to_module()],
+                    Err(error) => {
+                        tracing::error!(?error, "Failed to seed local dashboard");
+                        Vec::new()
+                    }
+                }
             }
-        } else {
-            None
+            Err(error) => {
+                tracing::error!(?error, "Failed to list local dashboards");
+                Vec::new()
+            }
         };
 
-        let tree = tree.unwrap_or_else(crate::data::modules::default_workspace);
-
-        if let Ok(tree_value) = serde_json::to_value(&tree) {
-            let module = Module {
-                id: Some("local-default".to_string()),
-                module_name: "Local Workspace".to_string(),
-                user_id: None,
-                module: tree_value.clone(),
-                created_at: None,
-                updated_at: None,
-            };
-            self.dashboard_modules = vec![module.clone()];
-            let open_ids = self.apply_startup_tab_preferences();
-            let start_empty = open_ids.is_empty();
-            if start_empty {
-                self.active_module = None;
-                self.home_page = None;
-                self.pending_module_load = None;
-                self.dashboard_views.clear();
-            } else {
-                self.active_module = Some(module.clone());
-            }
-            if let Some(dm) = &self.dashboard_manager {
-                dm.update(cx, |manager, cx| {
-                    manager.update_modules(vec![module.clone()], cx);
-                    if start_empty {
-                        manager.clear_active_module(cx);
-                    } else {
-                        manager.set_active_module("local-default".to_string(), cx);
-                    }
-                });
-            }
+        if modules.is_empty() {
+            tracing::warn!("no dashboards available; starting with an empty workspace");
+            self.dashboard_modules = Vec::new();
+            self.active_module = None;
+            self.home_page = None;
+            self.pending_module_load = None;
+            self.dashboard_views.clear();
             self.sync_settings_dashboards(cx);
-            if !start_empty {
+            return;
+        }
+
+        self.dashboard_modules = modules.clone();
+        let open_ids = self.apply_startup_tab_preferences();
+        let start_empty = open_ids.is_empty();
+
+        // Pick the dashboard to show: the first one the user's startup
+        // preferences allow, else the most recently updated.
+        let target = modules
+            .iter()
+            .find(|m| {
+                m.id
+                    .as_ref()
+                    .map(|id| open_ids.contains(id))
+                    .unwrap_or(false)
+            })
+            .or_else(|| modules.first())
+            .cloned();
+
+        if start_empty {
+            self.active_module = None;
+            self.home_page = None;
+            self.pending_module_load = None;
+            self.dashboard_views.clear();
+        } else {
+            self.active_module = target.clone();
+        }
+
+        if let Some(dm) = &self.dashboard_manager {
+            dm.update(cx, |manager, cx| {
+                manager.update_modules(modules.clone(), cx);
+                match (&target, start_empty) {
+                    (Some(module), false) => {
+                        if let Some(id) = &module.id {
+                            manager.set_active_module(id.clone(), cx);
+                        }
+                    }
+                    _ => manager.clear_active_module(cx),
+                }
+            });
+        }
+        self.sync_settings_dashboards(cx);
+
+        if !start_empty {
+            if let Some(module) = target {
+                let id = module.id.clone().unwrap_or_default();
+                let tree_value = module.module.clone();
                 if let Some(home) = &self.home_page {
                     home.update(cx, |page, cx| {
-                        page.request_module_load(tree_value, "local-default".to_string(), cx);
+                        page.request_module_load(tree_value, id, cx);
                     });
                 } else {
                     self.pending_module_load = Some(PendingModuleLoad {
-                        module_id: "local-default".to_string(),
+                        module_id: id,
                         module,
                     });
                 }
@@ -1298,22 +1319,26 @@ impl MainView {
     /// Create a new dashboard with the given name
     fn create_new_dashboard(&mut self, name: String, cx: &mut Context<Self>) {
         if !self.is_authenticated {
-            let new_id = uuid::Uuid::new_v4().to_string();
-            let new_module = Module {
-                id: Some(new_id.clone()),
-                module_name: name.clone(),
-                user_id: None,
-                module: serde_json::json!({
-                    "kind": "pane",
-                    "id": PaneNode::generate_id(),
-                    "data": {
-                        "type": "Empty",
-                        "config": {}
-                    }
-                }),
-                created_at: None,
-                updated_at: None,
+            // Guest dashboards are files too — write through the store so the
+            // new dashboard survives a restart like every other one.
+            let empty_tree = serde_json::json!({
+                "kind": "pane",
+                "id": PaneNode::generate_id(),
+                "data": {
+                    "type": "Empty",
+                    "config": {}
+                }
+            });
+
+            let new_module = match crate::data::dashboard_files::create(&name, empty_tree) {
+                Ok(dashboard) => dashboard.to_module(),
+                Err(error) => {
+                    tracing::error!(?error, "Failed to create dashboard {name}");
+                    return;
+                }
             };
+
+            let new_id = new_module.id.clone().unwrap_or_default();
             self.dashboard_modules.push(new_module.clone());
             if let Some(dm) = &self.dashboard_manager {
                 let modules = self.dashboard_modules.clone();
@@ -1383,6 +1408,10 @@ impl MainView {
         self.dashboard_views.remove(&module_id);
         self.closed_dashboard_tabs.remove(&module_id);
         if !self.is_authenticated {
+            // Remove the file too, otherwise the dashboard reappears on restart.
+            if let Err(error) = crate::data::dashboard_files::delete(&module_id) {
+                tracing::error!(?error, "Failed to delete dashboard file {module_id}");
+            }
             let is_active = self.active_module.as_ref().and_then(|m| m.id.as_ref()) == Some(&module_id);
             self.dashboard_modules.retain(|m| m.id.as_ref() != Some(&module_id));
             if let Some(dm) = &self.dashboard_manager {
@@ -1772,19 +1801,12 @@ impl MainView {
 
         if !self.is_authenticated {
             // Keep detached guest edits on disk as well as in the in-memory list.
-            if let Some(mut path) = Self::guest_layout_path() {
-                path.pop();
-                path.push("dashboards");
-                if let Err(error) = std::fs::create_dir_all(&path) {
-                    tracing::error!(?error, "Failed to create guest dashboard cache");
-                } else {
-                    path.push(format!("{module_id}.json"));
-                    if let Ok(json) = serde_json::to_string_pretty(&tree) {
-                        if let Err(error) = std::fs::write(path, json) {
-                            tracing::error!(?error, "Failed to save detached guest dashboard");
-                        }
-                    }
-                }
+            if let Err(error) = crate::data::dashboard_files::save_tree(
+                Some(&module_id),
+                &module_id,
+                layout_json.clone(),
+            ) {
+                tracing::error!(?error, "Failed to save detached guest dashboard {module_id}");
             }
             return;
         }
@@ -2179,13 +2201,22 @@ impl MainView {
         if let Some(home) = &self.home_page {
             let tree_opt = home.read(cx).pane_grid.read(cx).tree.clone();
             if let Some(tree) = tree_opt {
-                // 1. Save to the active local layout file (guest_layout.json or cloud_layout.json)
-                if let Some(path) = self.active_layout_path() {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Ok(json_str) = serde_json::to_string_pretty(&tree) {
-                        let _ = std::fs::write(&path, json_str);
+                // Persist into the dashboard file store, which is now the
+                // source of truth for both guest and signed-in layouts.
+                if let Some(module_id) = self.active_module.as_ref().and_then(|m| m.id.clone()) {
+                    if let Ok(layout_json) = serde_json::to_value(&tree) {
+                        let name = self
+                            .active_module
+                            .as_ref()
+                            .map(|m| m.module_name.clone())
+                            .unwrap_or_else(|| module_id.clone());
+                        if let Err(error) = crate::data::dashboard_files::save_tree(
+                            Some(&module_id),
+                            &name,
+                            layout_json.clone(),
+                        ) {
+                            tracing::error!(?error, "Failed to save dashboard {module_id}");
+                        }
                     }
                 }
 
