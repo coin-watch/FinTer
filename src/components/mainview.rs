@@ -1403,6 +1403,67 @@ impl MainView {
         .detach();
     }
 
+    /// Sync local dashboards with the cloud, then reload the list.
+    ///
+    /// Runs off the UI thread: a dashboard edit must never wait on the network,
+    /// and a failed sync must not block anything the user is doing.
+    fn sync_dashboards(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated {
+            tracing::info!("Skipping dashboard sync: not signed in");
+            return;
+        }
+
+        let client = self.api_client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::data::dashboard_sync::sync_all(&client) })
+                .await;
+
+            this.update(cx, |view, cx| {
+                match result {
+                    Ok(report) => {
+                        tracing::info!(
+                            pulled = report.pulled,
+                            pushed = report.pushed,
+                            local_wins = report.local_wins,
+                            remote_wins = report.remote_wins,
+                            errors = report.errors.len(),
+                            "Dashboard sync finished"
+                        );
+                        for error in &report.errors {
+                            tracing::warn!("Dashboard sync: {error}");
+                        }
+                        view.reload_dashboards_from_store(cx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(?error, "Dashboard sync failed");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reload the dashboard list from the local file store.
+    fn reload_dashboards_from_store(&mut self, cx: &mut Context<Self>) {
+        match crate::data::dashboard_files::list_modules() {
+            Ok(modules) => {
+                self.dashboard_modules = modules;
+                if let Some(dm) = &self.dashboard_manager {
+                    let modules = self.dashboard_modules.clone();
+                    dm.update(cx, |manager, cx| {
+                        manager.update_modules(modules, cx);
+                    });
+                }
+                self.sync_settings_dashboards(cx);
+            }
+            Err(error) => tracing::error!(?error, "Failed to reload dashboards"),
+        }
+    }
+
     /// Delete a layout by module ID
     fn delete_dashboard(&mut self, module_id: String, cx: &mut Context<Self>) {
         self.dashboard_views.remove(&module_id);
@@ -2824,6 +2885,9 @@ impl Render for MainView {
                         }
                         crate::components::ui::dashboard_manager::DashboardManagerEvent::DetachDashboard(module_id) => {
                             this.detach_dashboard(module_id.clone(), cx);
+                        }
+                        crate::components::ui::dashboard_manager::DashboardManagerEvent::SyncDashboards => {
+                            this.sync_dashboards(cx);
                         }
                     }
                 },

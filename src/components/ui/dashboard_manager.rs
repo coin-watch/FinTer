@@ -25,6 +25,8 @@ pub enum DashboardManagerEvent {
     DeletePreset(String),
     CloseDashboard(String),
     DetachDashboard(String),
+    /// Push local dashboards to the server and pull remote ones down.
+    SyncDashboards,
 }
 
 pub struct DashboardManager {
@@ -383,6 +385,16 @@ impl Render for DashboardManager {
                                     .ghost()
                                     .on_click(cx.listener(|_this, _event, _window, cx| {
                                         cx.emit(DashboardManagerEvent::ExportDashboard);
+                                    })),
+                            )
+                            .child(
+                                Button::new("toolbar-sync")
+                                    .icon(Icon::default().path("icons/refresh-cw.svg"))
+                                    .xsmall()
+                                    .ghost()
+                                    .tooltip("Sync dashboards with the cloud")
+                                    .on_click(cx.listener(|_this, _event, _window, cx| {
+                                        cx.emit(DashboardManagerEvent::SyncDashboards);
                                     })),
                             ),
                     ),

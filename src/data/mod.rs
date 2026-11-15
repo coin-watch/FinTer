@@ -9,6 +9,7 @@ pub mod client;
 pub mod credential_crypto;
 pub mod credits;
 pub mod dashboard_files;
+pub mod dashboard_sync;
 pub mod dashboard_migration;
 pub mod dashboard_store;
 pub mod error;
