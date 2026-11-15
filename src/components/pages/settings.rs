@@ -366,7 +366,7 @@ fn dashboard_multi_select(
     };
 
     let trigger = Button::new("tabs-dashboard-multiselect")
-        .when(options.layout == Axis::Vertical, |this| this.w_full())
+        .w_full()
         .label(label)
         .dropdown_caret(true)
         .outline()

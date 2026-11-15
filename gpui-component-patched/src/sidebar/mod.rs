@@ -210,11 +210,13 @@ impl<E: Collapsible + IntoElement> RenderOnce for Sidebar<E> {
                 this.child(
                     h_flex()
                         .id("header")
+                        .w_full()
+                        .min_w_0()
                         .pt_3()
                         .px_3()
                         .gap_2()
                         .when(self.collapsed, |this| this.pt_2().px_2())
-                        .child(header),
+                        .child(div().flex_1().min_w_0().child(header)),
                 )
             })
             .child(

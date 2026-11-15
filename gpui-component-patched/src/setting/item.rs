@@ -236,7 +236,9 @@ impl SettingItem {
                                     // narrow windows never push horizontal scroll.
                                     this.w(px(256.)).min_w(px(140.)).max_w_full().flex_1()
                                 })
-                                .when(layout.is_horizontal() && is_element, |this| this.flex_1())
+                                .when(layout.is_horizontal() && is_element, |this| {
+                                    this.flex_1().min_w_0().max_w_full()
+                                })
                                 .child(Self::render_field(
                                     field,
                                     RenderOptions { layout, ..*options },
@@ -246,9 +248,12 @@ impl SettingItem {
                         )
                         .into_any_element()
                 }
-                SettingItem::Element { render } => {
-                    (render)(&options, window, cx).into_any_element()
-                }
+                SettingItem::Element { render } => div()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child((render)(&options, window, cx))
+                    .into_any_element(),
             })
     }
 }

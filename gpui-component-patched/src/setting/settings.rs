@@ -153,7 +153,8 @@ impl Settings {
                 div()
                     .w_full()
                     .min_w_0()
-                    .child(Input::new(&search_input).prefix(IconName::Search)),
+                    .h(px(30.))
+                    .child(Input::new(&search_input).w_full().prefix(IconName::Search)),
             )
             .child(
                 SidebarMenu::new()

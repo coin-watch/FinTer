@@ -125,14 +125,18 @@ impl SettingPage {
         v_flex()
             .id(ix)
             .size_full()
+            .min_w_0()
             .child(
                 v_flex()
+                    .w_full()
+                    .min_w_0()
                     .p_4()
                     .gap_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .w_full()
                             .min_w_0()
                             .justify_between()
                             .gap_2()
@@ -162,9 +166,11 @@ impl SettingPage {
                     )
                     .when_some(self.description.clone(), |this, description| {
                         this.child(
-                            Label::new(description)
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground),
+                            div().w_full().min_w_0().child(
+                                Label::new(description)
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
                         )
                     }),
             )
@@ -174,6 +180,8 @@ impl SettingPage {
                     .relative()
                     .flex_1()
                     .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .child(
                         list(list_state.clone(), {
                             let query = query.clone();
