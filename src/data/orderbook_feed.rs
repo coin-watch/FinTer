@@ -134,10 +134,16 @@ mod tests {
         tx.send(make_book(67_000.0, 67_010.0)).unwrap();
         tx.send(make_book(68_000.0, 68_010.0)).unwrap();
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
-        let snap = feed.snapshot().unwrap();
-        // Should be the second (latest) book.
+        // Poll instead of sleeping a fixed 20ms: the drain task is scheduled by
+        // the runtime, so a fixed sleep is a race under a loaded test binary
+        // (it failed intermittently when the whole lib suite ran in parallel).
+        let snap = wait_for_book(&feed, |b| {
+            b.best_bid()
+                .map(|p| (p - 68_000.0).abs() < f64::EPSILON)
+                .unwrap_or(false)
+        })
+        .await
+        .expect("feed never received the latest book");
         assert!((snap.best_bid().unwrap() - 68_000.0).abs() < f64::EPSILON);
     }
 
@@ -152,9 +158,29 @@ mod tests {
             let _ = tx.send(make_book(i as f64, i as f64 + 10.0));
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        // The receiver must still recover the newest book it could read after a
+        // Lagged error. Waiting on the condition (not a fixed 30ms) keeps this
+        // deterministic regardless of runtime scheduling.
+        let snap = wait_for_book(&feed, |_| true).await;
+        assert!(snap.is_some(), "feed did not recover after lagging");
+    }
 
-        // Feed must still return a snapshot (the latest it could recover).
-        assert!(!feed.is_empty());
+    /// Poll `feed` until a book satisfies `pred`, or time out.
+    async fn wait_for_book(
+        feed: &OrderBookFeed,
+        pred: impl Fn(&OrderBook) -> bool,
+    ) -> Option<Arc<OrderBook>> {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            if let Some(book) = feed.snapshot() {
+                if pred(&book) {
+                    return Some(book);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
     }
 }

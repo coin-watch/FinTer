@@ -270,11 +270,13 @@ impl TradeStore {
         if key.is_empty() {
             return;
         }
-        let prev = self
-            .mark_prices
-            .iter()
-            .find(|(s, _)| normalize_symbol(s) == key)
-            .map(|(_, p)| *p);
+        // `key` is already the canonical stored form, so a plain insert
+        // overwrites it and the single-entry invariant still holds. This runs on
+        // every tick, so it must not scan the map: the previous
+        // `iter().find()` + `retain()` pair allocated one String per stored
+        // symbol per trade (~30 µs/trade at 128 symbols), which throttled the
+        // tape on busy pairs.
+        let prev = self.mark_prices.get(&key).copied();
         // This symbol is driven by a real feed; refresh the heartbeat even when the
         // price is unchanged so charts never take over mid-session.
         self.feed_mark_at
@@ -282,9 +284,12 @@ impl TradeStore {
         if prev.map(|p| (p - price).abs() <= f64::EPSILON).unwrap_or(false) {
             return;
         }
-        // Drop any stale duplicate keys for this logical symbol.
-        self.mark_prices
-            .retain(|s, _| normalize_symbol(s) != key);
+        // First time this logical symbol is seen under this spelling: drop any
+        // stale duplicate keys so only one canonical entry survives.
+        if prev.is_none() {
+            self.mark_prices
+                .retain(|s, _| normalize_symbol(s) != key);
+        }
         self.mark_prices.insert(key, price);
         self.check_open_orders(symbol, price);
         self.version = self.version.wrapping_add(1);

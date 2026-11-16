@@ -1095,6 +1095,11 @@ fn handle_message(
                 Vec::new()
             };
 
+            // Build the batch first, then take the global TradeStore lock once.
+            // Locking per trade serialised the whole tape behind the store
+            // mutex; on a busy pair that is the difference between a live tape
+            // and one that visibly lags the exchange.
+            let mut ticks = Vec::with_capacity(trades_list.len());
             for trade in trades_list {
                 if trade.price <= 0.0 || trade.amount <= 0.0 {
                     continue;
@@ -1111,18 +1116,25 @@ fn handle_message(
                 let raw_ts = trade.timestamp;
                 let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
 
-                let tick = Arc::new(UnifiedTick::new(
+                ticks.push(Arc::new(UnifiedTick::new(
                     msg.exchange.as_deref().unwrap_or(&config.exchange),
                     msg.symbol.as_deref().unwrap_or(&config.symbol),
                     trade.price,
                     trade.amount,
                     side,
                     ts,
-                ));
+                )));
+            }
+
+            if !ticks.is_empty() {
                 if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
-                    store.set_mark_price(&tick.symbol, tick.price);
+                    for tick in &ticks {
+                        store.set_mark_price(&tick.symbol, tick.price);
+                    }
                 }
-                let _ = trade_tx.send(tick);
+                for tick in ticks {
+                    let _ = trade_tx.send(tick);
+                }
             }
         }
 
