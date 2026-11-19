@@ -98,8 +98,8 @@ FINTER_API_URL="http://localhost:5173" cargo run
 To use the realtime-ondemand market-data stack, set its REST/WS gateways plus the shared API key:
 
 ```sh
-FINTER_REST_URL="http://140.238.219.84:8081" \
-FINTER_WS_URL="ws://140.238.219.84:8080/legacy/ws" \
+FINTER_REST_URL="https://demand.coinwat.ch" \
+FINTER_WS_URL="wss://demand.coinwat.ch/ws?legacy=1" \
 FINTER_REALTIME_API_KEY="$API_KEY" \
 cargo run
 ```
@@ -110,7 +110,7 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | --- | --- |
 | `FINTER_API_URL` | Backend API origin for account features and defaults. |
 | `FINTER_REST_URL` | REST market gateway; defaults to the API origin. |
-| `FINTER_WS_URL` | WebSocket market stream gateway (use the `/legacy/ws` path for realtime-ondemand). |
+| `FINTER_WS_URL` | WebSocket market stream gateway (use `/ws?legacy=1` for realtime-ondemand behind a proxy). |
 | `FINTER_REALTIME_API_KEY` | Shared `x-api-key` for realtime-ondemand REST and WS; falls back to `RTOD_API_KEY` or `API_KEY`. |
 | `FINTER_NEWS_API_URL` | News article API. |
 | `FINTER_NEWS_WS_URL` | News WebSocket stream. |
