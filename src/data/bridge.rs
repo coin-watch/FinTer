@@ -108,6 +108,7 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
+        req = crate::data::client::with_realtime_api_key(req);
 
         let fetch_res = match req.send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -702,6 +703,7 @@ async fn connect_and_stream(
                 let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
                 let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
                 if let Some(t) = token { req = req.bearer_auth(t); }
+                req = crate::data::client::with_realtime_api_key(req);
                 if let Ok(resp) = req.send().await {
                     let status = resp.status();
                     if let Ok(val) = resp.json::<serde_json::Value>().await {
@@ -762,6 +764,7 @@ async fn connect_and_stream(
                 let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
                 let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
                 if let Some(t) = token { req = req.bearer_auth(t); }
+                req = crate::data::client::with_realtime_api_key(req);
                 if let Ok(resp) = req.send().await {
                     let status = resp.status();
                     if let Ok(val) = resp.json::<serde_json::Value>().await {
@@ -803,7 +806,7 @@ async fn connect_and_stream(
             }
         }
     }
-    let url = config.ws_url();
+    let url = crate::data::client::with_realtime_ws_key(&config.ws_url());
     if url.trim().is_empty() {
         anyhow::bail!("No API service URL configured");
     }
@@ -1338,6 +1341,7 @@ async fn send_ohlcv_request(
     if let Some(token) = token {
         req = req.bearer_auth(token);
     }
+    req = crate::data::client::with_realtime_api_key(req);
     Ok(req.timeout(Duration::from_secs(30)).send().await?)
 }
 
@@ -1947,5 +1951,30 @@ mod tests {
         // Only 1 outbound HTTP request was made because in-flight coalescing deduplicated them
         assert_eq!(REQ_COUNT.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "hits a live realtime-ondemand API/gateway"]
+    async fn live_legacy_facade_streams_ticker_and_ohlcv() {
+        if std::env::var("FINTER_REST_URL").is_err() || std::env::var("FINTER_WS_URL").is_err() {
+            panic!("set FINTER_REST_URL, FINTER_WS_URL and FINTER_REALTIME_API_KEY");
+        }
+
+        let cfg = BridgeConfig::default_dev("binance", "BTC/USDT");
+        let bridge = Bridge::start(cfg).expect("bridge start");
+        let mut tick_rx = bridge.subscribe();
+        let mut ohlcv_rx = bridge.subscribe_ohlcv();
+
+        let tick = tokio::time::timeout(Duration::from_secs(30), tick_rx.recv())
+            .await
+            .expect("ticker within 30s")
+            .expect("ticker channel open");
+        assert!(tick.price > 0.0, "ticker price should be positive");
+
+        let candles = tokio::time::timeout(Duration::from_secs(30), ohlcv_rx.recv())
+            .await
+            .expect("candle history within 30s")
+            .expect("ohlcv channel open");
+        assert!(!candles.is_empty(), "history should contain candles");
     }
 }

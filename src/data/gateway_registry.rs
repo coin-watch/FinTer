@@ -346,6 +346,7 @@ async fn fetch_exchanges(inner: Arc<Mutex<RegistryInner>>, token: Option<&str>) 
     } else if let Ok(Some(session)) = session_store::load_session() {
         req = req.bearer_auth(session.access_token);
     }
+    req = crate::data::client::with_realtime_api_key(req);
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
@@ -420,6 +421,7 @@ async fn fetch_symbols(inner: Arc<Mutex<RegistryInner>>, exchange: &str, token: 
     } else if let Ok(Some(session)) = session_store::load_session() {
         req = req.bearer_auth(session.access_token);
     }
+    req = crate::data::client::with_realtime_api_key(req);
 
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
