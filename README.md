@@ -101,7 +101,7 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | --- | --- |
 | `FINTER_API_URL` | Backend API origin for account features and defaults. |
 | `FINTER_REST_URL` | REST market gateway; defaults to the API origin. |
-| `FINTER_WS_URL` | WebSocket market stream gateway. |
+| `FINTER_WS_URL` | Optional WebSocket override; defaults to `wss://<api-origin>/ws`. |
 | `FINTER_NEWS_API_URL` | News article API. |
 | `FINTER_NEWS_WS_URL` | News WebSocket stream. |
 | `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel, and users can switch channels in Settings → Updates. |
