@@ -607,9 +607,15 @@ impl<'de> serde::Deserialize<'de> for GatewayMessage {
 /// A single trade entry in a `trades` data push.
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct GatewayTrade {
-    #[serde(default, alias = "id", alias = "a")]
+    #[serde(default, alias = "id", alias = "trade_id", alias = "a")]
     pub id: Option<String>,
-    #[serde(default, alias = "t", alias = "T", alias = "time")]
+    #[serde(
+        default,
+        alias = "exchange_ts",
+        alias = "t",
+        alias = "T",
+        alias = "time"
+    )]
     pub timestamp: i64,
     #[serde(default, alias = "s", alias = "S")]
     pub side: String,
@@ -624,6 +630,7 @@ pub struct GatewayTrade {
 struct GatewayOrderBook {
     bids: Vec<[f64; 2]>,
     asks: Vec<[f64; 2]>,
+    #[serde(default, alias = "exchange_ts")]
     timestamp: Option<i64>,
 }
 
@@ -1012,6 +1019,7 @@ fn handle_message(
             if let Some(price) = price_opt {
                 let raw_ts = target
                     .get("timestamp")
+                    .or_else(|| target.get("exchange_ts"))
                     .or_else(|| target.get("t"))
                     .or_else(|| target.get("time"))
                     .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
@@ -1784,6 +1792,23 @@ mod tests {
         assert_eq!(trades.len(), 1);
         assert!((trades[0].price - 67_000.5).abs() < f64::EPSILON);
         assert_eq!(trades[0].side, "buy");
+    }
+
+    #[test]
+    fn gateway_message_trades_accepts_realtime_fields() {
+        let json = r#"{
+            "channel":"trades","exchange":"binance","symbol":"BTC/USDT",
+            "data":[{
+                "event_id":"evt-1","trade_id":"6880359509","exchange_ts":1795095253528,
+                "side":"sell","price":63724.01,"amount":0.00016
+            }]
+        }"#;
+        let msg: GatewayMessage = serde_json::from_str(json).expect("parse");
+        let trades: Vec<GatewayTrade> =
+            serde_json::from_value(msg.data.unwrap()).expect("parse data");
+        assert_eq!(trades[0].timestamp, 1_795_095_253_528);
+        assert_eq!(trades[0].id.as_deref(), Some("6880359509"));
+        assert_eq!(trades[0].side, "sell");
     }
 
     #[test]
