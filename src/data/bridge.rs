@@ -630,8 +630,13 @@ pub struct GatewayTrade {
 struct GatewayOrderBook {
     bids: Vec<[f64; 2]>,
     asks: Vec<[f64; 2]>,
-    #[serde(default, alias = "exchange_ts")]
+    #[serde(default)]
     timestamp: Option<i64>,
+    /// Some producers send the exchange time under this name instead of
+    /// `timestamp`. Keep both as plain optional fields so a frame that carries
+    /// both cannot trigger a duplicate-field error.
+    #[serde(default)]
+    exchange_ts: Option<i64>,
 }
 
 async fn connect_and_stream(
@@ -1158,7 +1163,7 @@ fn handle_message(
                         .into_iter()
                         .map(|[p, q]| PriceLevel::new(p, q))
                         .collect();
-                    let ts = raw.timestamp.unwrap_or_else(|| {
+                    let ts = raw.timestamp.or(raw.exchange_ts).unwrap_or_else(|| {
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
@@ -1822,6 +1827,19 @@ mod tests {
         assert_eq!(ob.bids.len(), 1);
         assert!((ob.bids[0][0] - 67_000.0).abs() < f64::EPSILON);
         assert_eq!(ob.timestamp, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn gateway_message_orderbook_accepts_both_time_fields() {
+        let json = r#"{
+            "channel":"orderbook","exchange":"binance","symbol":"BTC/USDT",
+            "data":{"bids":[[67000.0,1.5]],"asks":[[67010.0,1.0]],
+                    "timestamp":1700000000000,"exchange_ts":1699999999000}
+        }"#;
+        let msg: GatewayMessage = serde_json::from_str(json).expect("parse");
+        let ob: GatewayOrderBook = serde_json::from_value(msg.data.unwrap()).expect("parse data");
+        assert_eq!(ob.timestamp, Some(1_700_000_000_000));
+        assert_eq!(ob.exchange_ts, Some(1_699_999_999_000));
     }
 
     #[test]
