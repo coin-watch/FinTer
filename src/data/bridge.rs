@@ -1,6 +1,7 @@
 /// CoinWatch WebSocket gateway client.
 ///
-/// Connects to `wss://ws.coinwat.ch/ws` and subscribes to market channels:
+/// Connects to the CoinWatch WebSocket facade (`wss://<api-origin>/ws`) and
+/// subscribes to market channels:
 ///
 /// - `ticker`    → [`UnifiedTick`] stream (real-time price updates)
 /// - `trades`    → [`UnifiedTick`] stream
@@ -237,8 +238,6 @@ impl BridgeConfig {
             let base = self.rest_base_url.trim_end_matches('/');
             if base.is_empty() {
                 String::new()
-            } else if base.contains("coinwat.ch") {
-                "wss://ws.coinwat.ch/ws".to_string()
             } else if let Some(origin) = base.strip_prefix("https://") {
                 format!("wss://{origin}/ws")
             } else if let Some(origin) = base.strip_prefix("http://") {
@@ -1606,7 +1605,14 @@ mod tests {
 
     #[test]
     fn ws_url_derives_from_rest_base() {
-        assert_eq!(base_cfg().ws_url(), "wss://ws.coinwat.ch/ws");
+        assert_eq!(base_cfg().ws_url(), "wss://coinwat.ch/ws");
+    }
+
+    #[test]
+    fn ws_url_uses_the_coinwatch_staging_origin() {
+        let mut cfg = base_cfg();
+        cfg.rest_base_url = "https://staging.coinwat.ch".to_string();
+        assert_eq!(cfg.ws_url(), "wss://staging.coinwat.ch/ws");
     }
 
     #[test]
