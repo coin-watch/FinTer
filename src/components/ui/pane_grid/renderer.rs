@@ -1603,14 +1603,7 @@ impl PaneGridRenderer {
                                                 )
                                                 .ghost()
                                                 .xsmall()
-                                                .text_color(title_fg)
-                                                .hover(|s| {
-                                                    if is_active {
-                                                        s.text_color(title_fg).bg(theme.colors.background.opacity(0.15))
-                                                    } else {
-                                                        s.text_color(theme.colors.foreground).bg(theme.colors.muted.opacity(0.4))
-                                                    }
-                                                })
+                                                .text_color(if is_active { title_fg } else { theme.colors.foreground })
                                             )
                                             .content({
                                                 let pane_id_h = split_h_id.clone();
@@ -1720,14 +1713,7 @@ impl PaneGridRenderer {
                                             .icon(gpui_component::Icon::default().path("icons/settings.svg"))
                                             .ghost()
                                             .xsmall()
-                                            .text_color(title_fg)
-                                            .hover(|s| {
-                                                if is_active {
-                                                    s.text_color(title_fg).bg(theme.colors.background.opacity(0.15))
-                                                } else {
-                                                    s.text_color(theme.colors.foreground).bg(theme.colors.muted.opacity(0.4))
-                                                }
-                                            })
+                                            .text_color(if is_active { title_fg } else { theme.colors.foreground })
                                             .group_list_popup_with_anchor(gpui::Corner::TopRight, {
                                                 let pane_id_cfg = split_v_id.clone();
                                                 let current_type = module_type.to_lowercase();
@@ -1927,14 +1913,7 @@ impl PaneGridRenderer {
                                         )
                                         .ghost()
                                         .xsmall()
-                                        .text_color(title_fg)
-                                        .hover(|s| {
-                                            if is_active {
-                                                s.text_color(title_fg).bg(theme.colors.background.opacity(0.15))
-                                            } else {
-                                                s.text_color(theme.colors.foreground).bg(theme.colors.muted.opacity(0.4))
-                                            }
-                                        })
+                                        .text_color(if is_active { title_fg } else { theme.colors.foreground })
                                         .on_click({
                                             let p_id = pane_id.clone();
                                             move |_event, _window, cx| {
@@ -1961,7 +1940,6 @@ impl PaneGridRenderer {
                                         .ghost()
                                         .xsmall()
                                         .text_color(title_fg)
-                                        .hover(|s| s.text_color(theme.colors.bearish).bg(theme.colors.bearish.opacity(0.15)))
                                         .on_click(
                                             cx.listener(move |_this, _event, _win, cx| {
                                                 cx.emit(PaneGridEvent::ClosePane {
