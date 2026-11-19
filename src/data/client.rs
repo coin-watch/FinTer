@@ -120,43 +120,6 @@ pub fn is_api_url_configured() -> bool {
     !service_base_url().trim().is_empty()
 }
 
-/// Shared API key for the realtime-ondemand service.
-///
-/// `FINTER_REALTIME_API_KEY` is the native-client setting; the other names let
-/// local development reuse the key already exported for the server processes.
-pub fn realtime_api_key() -> Option<String> {
-    for var in ["FINTER_REALTIME_API_KEY", "RTOD_API_KEY", "API_KEY"] {
-        if let Ok(value) = std::env::var(var) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Attach the shared realtime API key to an outgoing REST request.
-pub fn with_realtime_api_key(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match realtime_api_key() {
-        Some(key) => builder.header("x-api-key", key),
-        None => builder,
-    }
-}
-
-/// Add `api_key` to a WebSocket URL when the shared key is configured and the
-/// URL does not already carry one.
-pub fn with_realtime_ws_key(url: &str) -> String {
-    let Some(key) = realtime_api_key() else {
-        return url.to_string();
-    };
-    if url.contains("api_key=") {
-        return url.to_string();
-    }
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}api_key={}", urlencoding::encode(&key))
-}
-
 #[cfg(test)]
 mod endpoint_tests {
     use super::*;
@@ -261,15 +224,8 @@ impl ApiClient {
     /// Create a client with an explicit session state. Tests use this to avoid
     /// depending on whatever session happens to be in the developer's keyring.
     fn with_base_url_and_session(base_url: &str, initial_session: Option<AuthSession>) -> Self {
-        let mut default_headers = reqwest::header::HeaderMap::new();
-        if let Some(key) = realtime_api_key() {
-            if let Ok(value) = reqwest::header::HeaderValue::from_str(&key) {
-                default_headers.insert("x-api-key", value);
-            }
-        }
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .default_headers(default_headers)
             .build()
             .expect("failed to build HTTP client");
 
