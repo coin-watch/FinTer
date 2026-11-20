@@ -450,6 +450,7 @@ impl AgentPanel {
         if prompt.is_empty() || self.loading { return; }
         let model = self.selected_model.clone();
         if self.selected_model == "Select model" { self.error = Some("Select a model first; use Refresh models to discover provider models.".into()); cx.notify(); return; }
+        let fallbacks = crate::data::agent::fallback_models(&self.models, &model);
         if self.conversation_id.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
             self.conversation_id = Some(id);
@@ -482,10 +483,58 @@ impl AgentPanel {
 
         let _prompt_clone = prompt.clone();
         cx.spawn(async move |this, cx| {
-            let result = crate::data::client::tokio_runtime().spawn(async move { crate::data::agent::analyze(&prompt, context, &model).await }).await.unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let mut used_model = model.clone();
+            let mut result = crate::data::client::tokio_runtime()
+                .spawn({
+                    let prompt = prompt.clone();
+                    let context = context.clone();
+                    let model = model.clone();
+                    async move { crate::data::agent::analyze(&prompt, context, &model).await }
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+
+            // A router may leave one upstream connection out of credits while
+            // its auto/* aliases still work. Retry on the same key instead of
+            // dead-ending the conversation.
+            if let Err(error) = &result {
+                if crate::data::agent::is_credit_error_message(&error.to_string()) {
+                    for candidate in fallbacks {
+                        let attempt = crate::data::client::tokio_runtime()
+                            .spawn({
+                                let prompt = prompt.clone();
+                                let context = context.clone();
+                                let candidate = candidate.clone();
+                                async move { crate::data::agent::analyze(&prompt, context, &candidate).await }
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+                        if let Ok(text) = attempt {
+                            result = Ok(text);
+                            used_model = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if used_model != model {
+                let switched = used_model.clone();
+                let _ = this.update(cx, |panel, cx| {
+                    panel.selected_model = switched.clone();
+                    let _ = crate::data::agent::save_selected_model(&switched);
+                    panel.error = None;
+                    cx.notify();
+                });
+            }
 
             match result {
-                Ok(text) => {
+                Ok(mut text) => {
+                    if used_model != model {
+                        text.push_str(&format!(
+                            "\n\n_Model switched to `{used_model}` after the previous model reported exhausted credits._"
+                        ));
+                    }
                     // Execute the reply's trade directives exactly once, here, as
                     // the response arrives. The receipts are stored on the message
                     // and persisted, so renders and reloads only display them.

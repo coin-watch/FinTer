@@ -479,6 +479,60 @@ fn shrink_context(context: &Value, budget: usize) -> Value {
     trimmed
 }
 
+/// True when a provider error means switching models/providers is the fix.
+pub fn is_credit_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.contains("402")
+        || lower.contains("payment required")
+        || lower.contains("credits exhausted")
+        || lower.contains("insufficient credit")
+        || lower.contains("insufficient_quota")
+        || lower.contains("quota exhausted")
+        || (lower.contains("quota") && lower.contains("exceed"))
+}
+
+/// Candidate models to retry after a credit/quota failure.
+///
+/// Routers expose `auto/*` aliases that choose a healthy upstream connection;
+/// prefer the cheap/fast ones. Only fall back to them when the provider
+/// actually advertises an `auto/*` model (or discovery returned nothing).
+pub fn fallback_models(available: &[String], selected: &str) -> Vec<String> {
+    const PREFERRED: [&str; 6] = [
+        "auto/best-fast",
+        "auto/best-coding",
+        "auto/best-free",
+        "auto/best-chat",
+        "auto/deepseek",
+        "auto/best-reasoning",
+    ];
+
+    fn push_model(out: &mut Vec<String>, selected: &str, model: &str) {
+        if model != selected && !out.iter().any(|existing| existing == model) {
+            out.push(model.to_string());
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for model in PREFERRED {
+        if available.iter().any(|candidate| candidate == model) {
+            push_model(&mut out, selected, model);
+        }
+    }
+    for model in available {
+        if model.starts_with("auto/") {
+            push_model(&mut out, selected, model);
+        }
+    }
+
+    if out.is_empty() && available.is_empty() {
+        push_model(&mut out, selected, "auto/best-fast");
+        push_model(&mut out, selected, "auto/best-coding");
+    }
+
+    out.truncate(4);
+    out
+}
+
 /// Sends read-only dashboard context and user prompt to the selected model.
 pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Result<String> {
     let cfg = provider_config();
@@ -570,6 +624,12 @@ pub async fn analyze(prompt: &str, context: Value, selected_model: &str) -> Resu
                 0,
                 None,
             );
+            return Err(anyhow!(
+                "AI request failed ({status}): {err_text}\n\n\
+                 The provider reports exhausted credits or quota. Select another model \
+                 (on a router, an auto/* model usually picks a healthy connection), or \
+                 reconnect/top up the provider in its dashboard, then retry."
+            ));
         }
         return Err(anyhow!("AI request failed ({status}): {err_text}"));
     }
@@ -1656,6 +1716,40 @@ mod tests {
         assert_eq!(trimmed["control"], context["control"]);
         assert!(trimmed["dashboards"][0].get("market_data").is_none());
         assert_eq!(trimmed["dashboards"][0]["layout"], context["dashboards"][0]["layout"]);
+    }
+
+    #[test]
+    fn detects_credit_and_quota_errors() {
+        assert!(is_credit_error_message(
+            "AI request failed (402 Payment Required): credits exhausted"
+        ));
+        assert!(is_credit_error_message("insufficient_quota"));
+        assert!(!is_credit_error_message("request timed out"));
+    }
+
+    #[test]
+    fn fallback_prefers_healthy_auto_models() {
+        let available: Vec<String> = [
+            "omni",
+            "auto/best-coding",
+            "auto/best-fast",
+            "auto/best-free",
+            "dva/claude-opus-5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let out = fallback_models(&available, "omni");
+        assert_eq!(
+            out,
+            vec![
+                "auto/best-fast".to_string(),
+                "auto/best-coding".to_string(),
+                "auto/best-free".to_string()
+            ]
+        );
+        assert!(!out.contains(&"omni".to_string()));
+        assert!(!out.iter().any(|model| model.starts_with("dva/")));
     }
 
     #[test]
