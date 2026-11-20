@@ -41,6 +41,12 @@ pub enum UiAction {
         pane: String,
         #[serde(default)]
         axis: Option<String>,
+        /// Optional module for the newly created peer pane, so one action can
+        /// produce a usable split instead of an empty placeholder.
+        #[serde(default, alias = "type", alias = "module")]
+        module_type: Option<String>,
+        #[serde(default)]
+        config: serde_json::Value,
     },
     /// Replace a pane with an evenly distributed rows × cols matrix.
     SplitMatrix {
@@ -95,6 +101,15 @@ pub enum UiAction {
         dashboard: Option<String>,
         layout: serde_json::Value,
     },
+    /// Build a known-good terminal preset. Safer than asking the model to
+    /// produce a full binary tree by hand.
+    ApplyPreset {
+        #[serde(default)]
+        dashboard: Option<String>,
+        preset: String,
+        #[serde(default)]
+        config: serde_json::Value,
+    },
 }
 
 impl UiAction {
@@ -112,6 +127,7 @@ impl UiAction {
             UiAction::Focus { .. } => "focus",
             UiAction::Resize { .. } => "resize",
             UiAction::SetLayout { .. } => "set_layout",
+            UiAction::ApplyPreset { .. } => "apply_preset",
         }
     }
 
@@ -128,7 +144,8 @@ impl UiAction {
             | UiAction::Restore { dashboard }
             | UiAction::Focus { dashboard, .. }
             | UiAction::Resize { dashboard, .. }
-            | UiAction::SetLayout { dashboard, .. } => dashboard.as_deref(),
+            | UiAction::SetLayout { dashboard, .. }
+            | UiAction::ApplyPreset { dashboard, .. } => dashboard.as_deref(),
         }
     }
 
@@ -144,7 +161,9 @@ impl UiAction {
             | UiAction::Maximize { pane, .. }
             | UiAction::Focus { pane, .. } => Some(pane),
             UiAction::Resize { split, .. } => Some(split),
-            UiAction::Restore { .. } | UiAction::SetLayout { .. } => None,
+            UiAction::Restore { .. }
+            | UiAction::SetLayout { .. }
+            | UiAction::ApplyPreset { .. } => None,
         }
     }
 }
@@ -303,6 +322,21 @@ mod tests {
     fn ignores_unclosed_fences() {
         let text = "```ui\n{\"action\":\"close\",\"pane\":\"p1\"}";
         assert!(parse_ui_actions_in_text(text).is_empty());
+    }
+
+    #[test]
+    fn parses_apply_preset_with_market_overrides() {
+        let text = "```ui\n{\"action\":\"apply_preset\",\"preset\":\"trading\",\"config\":{\"exchange\":\"bybit\",\"symbol\":\"ETH/USDT\",\"timeframe\":\"15m\"}}\n```";
+        let parsed = parse_ui_actions_in_text(text);
+        assert_eq!(parsed.len(), 1);
+        match &parsed[0] {
+            ParsedUiAction::Action(UiAction::ApplyPreset { preset, config, .. }) => {
+                assert_eq!(preset, "trading");
+                assert_eq!(config["exchange"], "bybit");
+                assert_eq!(config["timeframe"], "15m");
+            }
+            other => panic!("expected apply_preset, got {other:?}"),
+        }
     }
 
     #[test]

@@ -12,8 +12,10 @@
 use gpui::{App, Global, WeakEntity};
 
 use crate::components::pages::home::HomePage;
-use crate::data::pane_control::{
-    parse_axis, ParsedUiAction, UiAction, UiActionResult,
+use crate::data::pane_control::{ParsedUiAction, UiAction, UiActionResult, parse_axis};
+use crate::data::pane_layout::{
+    build_preset, config_for, ensure_agent_pane, find_agent_pane, find_pane, infer_base_config,
+    is_agent_type, normalize_layout, normalize_module_type, MAX_PANES, MAX_RATIO, MIN_RATIO,
 };
 use crate::data::pane_tree::{Axis, ModuleData, PaneNode};
 
@@ -90,9 +92,7 @@ impl DashboardRegistry {
             }
             Some(wanted) => live
                 .into_iter()
-                .filter(|target| {
-                    target.id == wanted || target.name.eq_ignore_ascii_case(wanted)
-                })
+                .filter(|target| target.id == wanted || target.name.eq_ignore_ascii_case(wanted))
                 .collect(),
         }
     }
@@ -108,7 +108,13 @@ pub fn dashboard_catalog(cx: &App) -> serde_json::Value {
         .iter()
         .filter_map(|target| {
             let home = target.home.upgrade()?;
-            let panes = home.read(cx).pane_grid.read(cx).tree.as_ref()?.describe_panes();
+            let panes = home
+                .read(cx)
+                .pane_grid
+                .read(cx)
+                .tree
+                .as_ref()?
+                .describe_panes();
             let panes: Vec<serde_json::Value> = panes
                 .into_iter()
                 .map(|pane| {
@@ -116,6 +122,8 @@ pub fn dashboard_catalog(cx: &App) -> serde_json::Value {
                         "ref": format!("#{}", pane.index),
                         "id": pane.id,
                         "type": pane.module_type,
+                        "path": pane.path,
+                        "agent": is_agent_type(&pane.module_type),
                         "config": pane.config,
                     })
                 })
@@ -130,6 +138,9 @@ pub fn dashboard_catalog(cx: &App) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "count": dashboards.len(),
+        "module_types": crate::data::pane_layout::MODULE_TYPES,
+        "presets": crate::data::pane_layout::PRESETS,
+        "max_panes": crate::data::pane_layout::MAX_PANES,
         "dashboards": dashboards,
     })
 }
@@ -168,6 +179,7 @@ pub fn active_dashboard_id(cx: &App) -> Option<String> {
 pub fn execute_ui_actions_in_reply(
     text: &str,
     active: Option<&str>,
+    caller_pane: Option<&str>,
     cx: &mut App,
 ) -> Vec<UiActionResult> {
     let resolved_active = active
@@ -178,7 +190,7 @@ pub fn execute_ui_actions_in_reply(
     for parsed in crate::data::pane_control::parse_ui_actions_in_text(text) {
         match parsed {
             ParsedUiAction::Action(action) => {
-                results.extend(execute_ui_action(&action, active, cx));
+                results.extend(execute_ui_action(&action, active, caller_pane, cx));
             }
             ParsedUiAction::Invalid(message) => {
                 results.push(UiActionResult::failure("ui", message));
@@ -192,6 +204,7 @@ pub fn execute_ui_actions_in_reply(
 pub fn execute_ui_action(
     action: &UiAction,
     active: Option<&str>,
+    caller_pane: Option<&str>,
     cx: &mut App,
 ) -> Vec<UiActionResult> {
     let targets = cx
@@ -224,7 +237,7 @@ pub fn execute_ui_action(
         let dashboard_id = target.id.clone();
         let result = target
             .home
-            .update(cx, |page, cx| page.apply_ui_action(action, cx))
+            .update(cx, |page, cx| page.apply_ui_action(action, caller_pane, cx))
             .unwrap_or_else(|_| {
                 UiActionResult::failure(action.action_name(), "Dashboard was closed.")
             });
@@ -245,6 +258,7 @@ pub fn execute_ui_action(
 pub fn apply_action_to_grid(
     grid: &mut crate::components::ui::pane_grid::renderer::PaneGridRenderer,
     action: &UiAction,
+    caller_pane: Option<&str>,
     cx: &mut gpui::Context<crate::components::ui::pane_grid::renderer::PaneGridRenderer>,
 ) -> UiActionResult {
     let name = action.action_name();
@@ -252,17 +266,34 @@ pub fn apply_action_to_grid(
         return UiActionResult::failure(name, "This dashboard has no layout loaded yet.");
     };
 
+    let base = infer_base_config(&tree);
+    let agent_count = tree
+        .describe_panes()
+        .iter()
+        .filter(|pane| is_agent_type(&pane.module_type))
+        .count();
+    let is_agent_pane = |pane_id: &str| {
+        find_pane(&tree, pane_id)
+            .and_then(|data| data.module_type)
+            .map(|module_type| is_agent_type(&module_type))
+            .unwrap_or(false)
+    };
+    // The pane hosting this conversation must survive every action. With more
+    // than one agent pane, only the caller's pane is protected.
+    let protected_agent = |pane_id: &str| {
+        is_agent_pane(pane_id) && (caller_pane == Some(pane_id) || agent_count <= 1)
+    };
+
     // Resolve the pane reference once; every pane-scoped action needs it.
     let resolved_pane = action.pane().and_then(|reference| {
-        tree.resolve_pane_reference(reference)
-            .or_else(|| {
-                // `resize` targets a split, so fall through to split resolution.
-                if matches!(action, UiAction::Resize { .. }) {
-                    tree.resolve_split_reference(reference)
-                } else {
-                    None
-                }
-            })
+        tree.resolve_pane_reference(reference).or_else(|| {
+            // `resize` targets a split, so fall through to split resolution.
+            if matches!(action, UiAction::Resize { .. }) {
+                tree.resolve_split_reference(reference)
+            } else {
+                None
+            }
+        })
     });
 
     if let Some(reference) = action.pane() {
@@ -287,23 +318,41 @@ pub fn apply_action_to_grid(
             ..
         } => {
             let pane_id = resolved_pane.clone().unwrap_or_default();
+            let module_type = normalize_module_type(module_type);
+            if protected_agent(&pane_id) && !is_agent_type(&module_type) {
+                return UiActionResult::failure(
+                    name,
+                    "The agent pane cannot be replaced while it is the only agent pane.",
+                );
+            }
+            let requested_empty = config.is_null()
+                || config
+                    .as_object()
+                    .map(|object| object.is_empty())
+                    .unwrap_or(false);
+            let effective = if requested_empty {
+                find_pane(&tree, &pane_id)
+                    .map(|data| data.config)
+                    .filter(|value| value.is_object())
+                    .unwrap_or_else(|| config.clone())
+            } else {
+                config.clone()
+            };
+            let config = config_for(&module_type, &base, &effective);
             let mut updated = tree.clone();
-            let module_type = module_type.trim().to_ascii_lowercase();
-            let config = config.clone();
             let mut applied = false;
             updated.modify_node(&pane_id, &mut |node| {
                 if let PaneNode::Pane { data, .. } = node {
                     data.module_type = Some(module_type.clone());
-                    data.config = if config.is_null() {
-                        serde_json::json!({})
-                    } else {
-                        config.clone()
-                    };
+                    data.config = config.clone();
                     applied = true;
                 }
             });
             if !applied {
-                return UiActionResult::failure(name, "Pane disappeared before it could be updated.");
+                return UiActionResult::failure(
+                    name,
+                    "Pane disappeared before it could be updated.",
+                );
             }
             grid.set_tree(updated, cx);
             UiActionResult::success(name, format!("Pane is now a {module_type} module."))
@@ -326,14 +375,35 @@ pub fn apply_action_to_grid(
                 }
             });
             if !applied {
-                return UiActionResult::failure(name, "Pane disappeared before it could be updated.");
+                return UiActionResult::failure(
+                    name,
+                    "Pane disappeared before it could be updated.",
+                );
             }
             grid.set_tree(updated, cx);
             UiActionResult::success(name, "Pane config updated.")
         }
-        UiAction::Split { axis, .. } => {
+        UiAction::Split {
+            axis,
+            module_type,
+            config,
+            ..
+        } => {
             let pane_id = resolved_pane.clone().unwrap_or_default();
             let axis = parse_axis(axis.as_deref()).unwrap_or(Axis::Vertical);
+            let right_data = match module_type.as_deref() {
+                Some(raw) if !raw.trim().is_empty() => {
+                    let kind = normalize_module_type(raw);
+                    ModuleData {
+                        module_type: Some(kind.clone()),
+                        config: config_for(&kind, &base, config),
+                    }
+                }
+                _ => ModuleData {
+                    module_type: Some("empty".into()),
+                    config: serde_json::json!({}),
+                },
+            };
             let mut updated = tree.clone();
             let mut applied = false;
             updated.modify_node(&pane_id, &mut |node| {
@@ -344,7 +414,7 @@ pub fn apply_action_to_grid(
                     };
                     let right = PaneNode::Pane {
                         id: PaneNode::generate_id(),
-                        data: ModuleData::default(),
+                        data: right_data.clone(),
                     };
                     *node = PaneNode::Split {
                         id: PaneNode::generate_id(),
@@ -364,16 +434,44 @@ pub fn apply_action_to_grid(
         }
         UiAction::SplitMatrix { rows, cols, .. } => {
             let pane_id = resolved_pane.clone().unwrap_or_default();
-            if *rows <= 1 && *cols <= 1 {
+            if *rows == 0 || *cols == 0 || (*rows <= 1 && *cols <= 1) {
                 return UiActionResult::failure(name, "A matrix needs at least two cells.");
             }
+            if *rows > 6 || *cols > 6 {
+                return UiActionResult::failure(
+                    name,
+                    "A matrix is limited to 6 rows and 6 columns.",
+                );
+            }
+            let current_panes = tree.describe_panes().len();
+            let additional = rows.saturating_mul(*cols).saturating_sub(1);
+            if current_panes + additional > MAX_PANES {
+                return UiActionResult::failure(
+                    name,
+                    format!(
+                        "That matrix would create {} panes; the maximum is {MAX_PANES}.",
+                        current_panes + additional
+                    ),
+                );
+            }
             let mut updated = tree.clone();
-            updated.split_matrix(&pane_id, *rows, *cols);
+            if !updated.split_matrix(&pane_id, *rows, *cols) {
+                return UiActionResult::failure(name, "Pane disappeared before it could be split.");
+            }
+            if let Err(error) = normalize_layout(&mut updated, &base) {
+                return UiActionResult::failure(name, error);
+            }
             grid.set_tree(updated, cx);
             UiActionResult::success(name, format!("Pane replaced with a {rows}×{cols} grid."))
         }
         UiAction::Close { .. } => {
             let pane_id = resolved_pane.clone().unwrap_or_default();
+            if protected_agent(&pane_id) {
+                return UiActionResult::failure(
+                    name,
+                    "The agent pane cannot close itself. Open another agent pane first.",
+                );
+            }
             match tree.clone().remove_node(&pane_id) {
                 Some(updated) => {
                     grid.set_tree(updated, cx);
@@ -388,13 +486,16 @@ pub fn apply_action_to_grid(
         UiAction::Swap { with_pane, .. } => {
             let pane_id = resolved_pane.clone().unwrap_or_default();
             let Some(other) = tree.resolve_pane_reference(with_pane) else {
-                return UiActionResult::failure(
-                    name,
-                    format!("No pane matches '{with_pane}'."),
-                );
+                return UiActionResult::failure(name, format!("No pane matches '{with_pane}'."));
             };
             if other == pane_id {
                 return UiActionResult::failure(name, "A pane cannot be swapped with itself.");
+            }
+            if is_agent_pane(&pane_id) || is_agent_pane(&other) {
+                return UiActionResult::failure(
+                    name,
+                    "Agent panes cannot be swapped; use set_module or update_config instead.",
+                );
             }
             let mut updated = tree.clone();
             if updated.swap_panes(&pane_id, &other) {
@@ -423,7 +524,7 @@ pub fn apply_action_to_grid(
         }
         UiAction::Resize { ratio, .. } => {
             let split_id = resolved_pane.clone().unwrap_or_default();
-            let ratio = ratio.clamp(0.05, 0.95);
+            let ratio = ratio.clamp(MIN_RATIO, MAX_RATIO);
             let mut updated = tree.clone();
             let mut applied = false;
             updated.modify_node(&split_id, &mut |node| {
@@ -440,12 +541,19 @@ pub fn apply_action_to_grid(
         }
         UiAction::SetLayout { layout, .. } => {
             match serde_json::from_value::<PaneNode>(layout.clone()) {
-                Ok(updated) => {
-                    if updated.describe_panes().is_empty() {
-                        return UiActionResult::failure(name, "Layout has no panes.");
+                Ok(mut updated) => {
+                    if let Err(error) = normalize_layout(&mut updated, &base) {
+                        return UiActionResult::failure(name, error);
+                    }
+                    let agent = find_agent_pane(&tree, caller_pane);
+                    if let Err(error) = ensure_agent_pane(&mut updated, agent) {
+                        return UiActionResult::failure(name, error);
                     }
                     grid.set_tree(updated, cx);
-                    UiActionResult::success(name, "Dashboard layout replaced.")
+                    UiActionResult::success(
+                        name,
+                        "Dashboard layout replaced; the agent pane was preserved.",
+                    )
                 }
                 Err(error) => UiActionResult::failure(
                     name,
@@ -453,5 +561,19 @@ pub fn apply_action_to_grid(
                 ),
             }
         }
+        UiAction::ApplyPreset { preset, config, .. } => match build_preset(preset, &base, config) {
+            Ok(mut updated) => {
+                if let Err(error) = normalize_layout(&mut updated, &base) {
+                    return UiActionResult::failure(name, error);
+                }
+                let agent = find_agent_pane(&tree, caller_pane);
+                if let Err(error) = ensure_agent_pane(&mut updated, agent) {
+                    return UiActionResult::failure(name, error);
+                }
+                grid.set_tree(updated, cx);
+                UiActionResult::success(name, format!("Applied the '{preset}' preset."))
+            }
+            Err(error) => UiActionResult::failure(name, error),
+        },
     }
 }

@@ -360,7 +360,7 @@ Every action accepts `dashboard`. Emit one fenced block per action:
 ```
 
 ```ui
-{"action":"split","pane":"#1","axis":"vertical"}
+{"action":"split","pane":"#1","axis":"vertical","module_type":"orderbook","config":{"symbol":"BTC/USDT"}}
 ```
 
 ```ui
@@ -396,7 +396,11 @@ Every action accepts `dashboard`. Emit one fenced block per action:
 ```
 
 ```ui
-{"action":"set_layout","dashboard":"all","layout":{"kind":"split","id":"root","axis":"vertical","ratio":0.25,"a":{"kind":"pane","id":"p1","data":{"type":"watchlist","config":{}}},"b":{"kind":"pane","id":"p2","data":{"type":"chart","config":{"symbol":"BTC/USDT"}}}}}
+{"action":"apply_preset","preset":"trading","config":{"exchange":"binance","symbol":"BTC/USDT","timeframe":"15m"}}
+```
+
+```ui
+{"action":"set_layout","dashboard":"active","layout":{"kind":"split","id":"root","axis":"vertical","ratio":0.7,"a":{"kind":"pane","id":"p1","data":{"type":"chart","config":{"exchange":"binance","symbol":"BTC/USDT","timeframe":"15m"}}},"b":{"kind":"pane","id":"p2","data":{"type":"agent","config":{}}}}}
 ```
 
 Allowed actions:
@@ -408,13 +412,18 @@ Allowed actions:
 - swap: exchange the contents of two panes.
 - maximize / restore: show one pane full-bleed, or return to the full layout.
 - focus: make a pane the active pane.
-- resize: move a split divider. `ratio` is the share given to the first child, 0.05–0.95.
-- set_layout: replace an entire dashboard with a complete pane tree.
+- resize: move a split divider. `ratio` is the share given to the first child, 0.1–0.9.
+- set_layout: replace an entire dashboard with a complete pane tree. The app keeps the existing agent pane even if the tree omits it.
+- apply_preset: build a ready-to-use terminal. Presets: trading, analysis, monitoring, execution, minimal. Optional `config` overrides exchange/symbol/timeframe for every market pane.
 
 Rules:
 - Only emit `ui` blocks when the user asks you to change, arrange, build, or clean up a layout. Never rearrange a dashboard speculatively.
 - Read the snapshot before acting: use the `ref`/`id` values that are actually present. If a reference does not resolve, the receipt names the panes that do exist — correct yourself from that and retry once.
-- Prefer several small actions (`split`, then `set_module` per pane) over one large `set_layout` when editing an existing dashboard. Use `set_layout` when building a dashboard from scratch or when the user asks for a wholesale replacement.
+- The agent pane is protected. Never close it, swap it, convert it to another module, or omit it from a layout. The app preserves the pane and its conversation automatically; a blocked action returns a failed receipt.
+- Prefer several small actions (`split`, then `set_module` per pane) when editing an existing dashboard. Prefer `apply_preset` for "build me a trading terminal" requests, then `set_module`/`update_config` to refine it.
+- Use `set_layout` only for a custom tree. Keep it flat and readable: 2–8 panes is ideal, 12 is the hard maximum. Ratios outside 0.1–0.9 are clamped.
+- Supported module types: chart, ticker, orderbook, trades, watchlist, positions, execution, marketcap, newsfeed, time, feargreed, agent, empty. Unknown names become empty panes.
+- Market panes inherit exchange/symbol/timeframe from the dashboard when omitted; chart panes also get an interval. Do not invent symbols.
 - After the blocks, say in one or two sentences what changed. The receipts are the authoritative record; never claim a change the receipts do not confirm.
 - A reply may combine `ui`, `trade`, and `chart` blocks.
 "##;

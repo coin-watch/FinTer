@@ -2181,6 +2181,7 @@ impl PaneGridRenderer {
                                         let dashboard_id = self.dashboard_id.clone();
                                         panel.update(cx, |agent, _| {
                                             agent.set_dashboard_id(dashboard_id);
+                                            agent.set_pane_id(Some(pane_id.clone()));
                                             if let Some(context) = self.agent_context.clone() {
                                                 agent.set_context(context);
                                             }

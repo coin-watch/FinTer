@@ -54,6 +54,9 @@ pub struct AgentPanel {
     /// Id of the dashboard this pane lives in. Used as the default target for
     /// `ui` directives that omit their `dashboard` selector.
     dashboard_id: Option<String>,
+    /// Pane-grid id of this Agent module. Layout actions use it to protect the
+    /// pane (and its conversation) from being replaced or closed.
+    pane_id: Option<String>,
 }
 
 impl AgentPanel {
@@ -104,6 +107,7 @@ impl AgentPanel {
             context_bytes: 0,
             chart_views: std::collections::HashMap::new(),
             dashboard_id: None,
+            pane_id: None,
         }
     }
 
@@ -111,6 +115,10 @@ impl AgentPanel {
     /// default to the dashboard the user is actually looking at.
     pub fn set_dashboard_id(&mut self, dashboard_id: Option<String>) {
         self.dashboard_id = dashboard_id;
+    }
+
+    pub fn set_pane_id(&mut self, pane_id: Option<String>) {
+        self.pane_id = pane_id;
     }
 
     pub fn current_conversation_id(&self) -> Option<String> {
@@ -489,6 +497,7 @@ impl AgentPanel {
                             crate::components::ui::pane_control::execute_ui_actions_in_reply(
                                 &text,
                                 panel.dashboard_id.as_deref(),
+                                panel.pane_id.as_deref(),
                                 cx,
                             );
                         // Persist the full answer before animating it, so closing the

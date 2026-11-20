@@ -267,6 +267,7 @@ impl HomePage {
     pub fn apply_ui_action(
         &mut self,
         action: &crate::data::pane_control::UiAction,
+        caller_pane: Option<&str>,
         cx: &mut Context<Self>,
     ) -> crate::data::pane_control::UiActionResult {
         let mut result = crate::data::pane_control::UiActionResult::failure(
@@ -274,7 +275,12 @@ impl HomePage {
             "The pane grid was unavailable.",
         );
         self.pane_grid.update(cx, |grid, cx| {
-            result = crate::components::ui::pane_control::apply_action_to_grid(grid, action, cx);
+            result = crate::components::ui::pane_control::apply_action_to_grid(
+                grid,
+                action,
+                caller_pane,
+                cx,
+            );
         });
         if result.ok {
             cx.emit(HomePageEvent::LayoutModified);

@@ -4,20 +4,33 @@ impl PaneNode {
     pub fn split_matrix(&mut self, target_id: &str, rows: usize, cols: usize) -> bool {
         self.modify_node(target_id, &mut |node| {
             if let PaneNode::Pane { id, data } = node.clone() {
-                if rows <= 1 && cols <= 1 { return; }
+                if rows == 0 || cols == 0 || (rows <= 1 && cols <= 1) {
+                    return;
+                }
                 let mut row_nodes = Vec::new();
                 for r in 0..rows {
                     let mut col_nodes = Vec::new();
                     for c in 0..cols {
-                        let cell_id = if r == 0 && c == 0 { id.clone() } else { PaneNode::generate_id() };
-                        let cell_data = if r == 0 && c == 0 { data.clone() } else { crate::data::pane_tree::ModuleData::default() };
-                        col_nodes.push(PaneNode::Pane { id: cell_id, data: cell_data });
+                        let cell_id = if r == 0 && c == 0 {
+                            id.clone()
+                        } else {
+                            PaneNode::generate_id()
+                        };
+                        let cell_data = if r == 0 && c == 0 {
+                            data.clone()
+                        } else {
+                            crate::data::pane_tree::ModuleData::default()
+                        };
+                        col_nodes.push(PaneNode::Pane {
+                            id: cell_id,
+                            data: cell_data,
+                        });
                     }
-                    
+
                     let mut current_row = col_nodes.pop().unwrap();
-                    
+
                     let mut splits_made = 1;
-                    
+
                     while let Some(left_pane) = col_nodes.pop() {
                         current_row = PaneNode::Split {
                             id: PaneNode::generate_id(),
@@ -30,11 +43,11 @@ impl PaneNode {
                     }
                     row_nodes.push(current_row);
                 }
-                
+
                 let mut current_tree = row_nodes.pop().unwrap();
-                
+
                 let mut splits_made = 1;
-                
+
                 while let Some(top_pane) = row_nodes.pop() {
                     current_tree = PaneNode::Split {
                         id: PaneNode::generate_id(),
@@ -45,7 +58,7 @@ impl PaneNode {
                     };
                     splits_made += 1;
                 }
-                
+
                 *node = current_tree;
             }
         })
@@ -138,46 +151,45 @@ impl PaneNode {
             return false;
         }
 
-        let mut node_a = None;
-        self.find_node(id_a, &mut |n| {
-            if let PaneNode::Pane { .. } = n {
-                node_a = Some(n.clone());
-            }
-        });
+        // Swap the module data, not the pane nodes. Pane ids are the renderer's
+        // cache keys and the Agent's stable references; swapping ids silently
+        // moves live panels (including the Agent conversation) to new slots.
+        let Some(data_a) = pane_data(self, id_a) else {
+            return false;
+        };
+        let Some(data_b) = pane_data(self, id_b) else {
+            return false;
+        };
 
-        let mut node_b = None;
-        self.find_node(id_b, &mut |n| {
-            if let PaneNode::Pane { .. } = n {
-                node_b = Some(n.clone());
-            }
-        });
-
-        if let (Some(a), Some(b)) = (node_a, node_b) {
-            Self::swap_nodes_recursive(self, id_a, id_b, &a, &b);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn swap_nodes_recursive(node: &mut PaneNode, id_a: &str, id_b: &str, node_a: &PaneNode, node_b: &PaneNode) {
-        match node {
-            PaneNode::Pane { id, .. } => {
-                if id == id_a {
-                    *node = node_b.clone();
-                } else if id == id_b {
-                    *node = node_a.clone();
-                }
-            }
-            PaneNode::Split { a, b, .. } => {
-                Self::swap_nodes_recursive(a, id_a, id_b, node_a, node_b);
-                Self::swap_nodes_recursive(b, id_a, id_b, node_a, node_b);
-            }
-        }
+        set_pane_data(self, id_a, data_b) && set_pane_data(self, id_b, data_a)
     }
 
     pub fn swap_data(&mut self, id_a: &str, id_b: &str) -> bool {
         self.swap_panes(id_a, id_b)
+    }
+}
+
+fn pane_data(node: &PaneNode, id: &str) -> Option<crate::data::pane_tree::ModuleData> {
+    match node {
+        PaneNode::Pane { id: pane_id, data } if pane_id == id => Some(data.clone()),
+        PaneNode::Pane { .. } => None,
+        PaneNode::Split { a, b, .. } => pane_data(a, id).or_else(|| pane_data(b, id)),
+    }
+}
+
+fn set_pane_data(node: &mut PaneNode, id: &str, data: crate::data::pane_tree::ModuleData) -> bool {
+    match node {
+        PaneNode::Pane {
+            id: pane_id,
+            data: current,
+        } if pane_id == id => {
+            *current = data;
+            true
+        }
+        PaneNode::Pane { .. } => false,
+        PaneNode::Split { a, b, .. } => {
+            set_pane_data(a, id, data.clone()) || set_pane_data(b, id, data)
+        }
     }
 }
 
@@ -211,14 +223,14 @@ mod tests {
 
         if let PaneNode::Split { a, b, .. } = tree {
             if let PaneNode::Pane { id, data } = *a {
-                assert_eq!(id, "pane-2");
+                assert_eq!(id, "pane-1");
                 assert_eq!(data.module_type.as_deref(), Some("ticker"));
             } else {
                 panic!("expected pane a");
             }
 
             if let PaneNode::Pane { id, data } = *b {
-                assert_eq!(id, "pane-1");
+                assert_eq!(id, "pane-2");
                 assert_eq!(data.module_type.as_deref(), Some("chart"));
             } else {
                 panic!("expected pane b");
