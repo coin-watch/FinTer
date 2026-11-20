@@ -192,7 +192,10 @@ fn normalize_pane_data(data: &mut ModuleData, base: &Value) {
     if !data.config.is_object() {
         data.config = json!({});
     }
-    data.config = config_for(&kind, base, &data.config);
+    // Agent config may carry conversation state; keep it verbatim.
+    if kind != "agent" {
+        data.config = config_for(&kind, base, &data.config);
+    }
     data.module_type = Some(kind);
 }
 
