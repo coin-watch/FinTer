@@ -185,10 +185,12 @@ impl CandleFeed {
         if incoming.is_empty() {
             return;
         }
+        let tf = self.timeframe.as_deref().unwrap_or("1m");
+        let aligned = align_batch(incoming, get_interval_ms(tf), tf);
         let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
         let ticker_ts = inner.live_ticker_candle_ts;
         let latest_price = inner.latest_ticker_price;
-        if merge_candles(&mut inner.candles, incoming, ticker_ts, latest_price) {
+        if merge_candles(&mut inner.candles, &aligned, ticker_ts, latest_price) {
             inner.version = inner.version.saturating_add(1);
             inner.last_update_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -198,10 +200,12 @@ impl CandleFeed {
     }
 
     pub fn prepend_history(&self, older_candles: &[OhlcvCandle]) {
+        let tf = self.timeframe.as_deref().unwrap_or("1m");
+        let aligned = align_batch(older_candles, get_interval_ms(tf), tf);
         let mut inner = self.inner.lock().unwrap();
         let ticker_ts = inner.live_ticker_candle_ts;
         let latest_price = inner.latest_ticker_price;
-        if merge_candles(&mut inner.candles, older_candles, ticker_ts, latest_price) {
+        if merge_candles(&mut inner.candles, &aligned, ticker_ts, latest_price) {
             inner.version = inner.version.saturating_add(1);
         }
     }
@@ -354,6 +358,32 @@ fn align_timestamp(ts: i64, interval_ms: i64, timeframe: &str) -> i64 {
     }
 }
 
+/// Snap every incoming candle to the feed's timeframe bucket.
+///
+/// Exchange payloads are normally aligned already, but REST pages and some
+/// adapters use the candle's close/second timestamp. Without this step a
+/// slightly offset live update becomes a second candle beside the real one
+/// instead of updating it.
+fn align_batch(candles: &[OhlcvCandle], interval_ms: i64, timeframe: &str) -> Vec<OhlcvCandle> {
+    if interval_ms <= 0 {
+        return candles.to_vec();
+    }
+    candles
+        .iter()
+        .map(|candle| {
+            let timestamp = align_timestamp(candle.timestamp, interval_ms, timeframe);
+            if timestamp == candle.timestamp {
+                candle.clone()
+            } else {
+                OhlcvCandle {
+                    timestamp,
+                    ..candle.clone()
+                }
+            }
+        })
+        .collect()
+}
+
 /// Form and append any live candles whose period boundary has been crossed
 /// between the last buffered candle and `now_ms`.
 ///
@@ -377,10 +407,11 @@ pub(crate) fn check_and_form_live_candle(
         None => return false,
     };
 
+    let last_open = align_timestamp(last.timestamp, interval_ms, timeframe);
     let next_candle_ts = if timeframe == "1M" {
-        align_timestamp(last.timestamp + 32 * 86_400_000, interval_ms, timeframe)
+        align_timestamp(last_open + 32 * 86_400_000, interval_ms, timeframe)
     } else {
-        last.timestamp + interval_ms
+        last_open + interval_ms
     };
 
     if now_ms < next_candle_ts {
@@ -478,11 +509,12 @@ async fn drain_loop(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
+                        let aligned = align_batch(&batch, interval_ms, &timeframe);
 
                         let mut inner = buffer.lock().expect("CandleFeed mutex poisoned");
                         let ticker_ts = inner.live_ticker_candle_ts;
                         let latest_price = inner.latest_ticker_price;
-                        if merge_candles(&mut inner.candles, &batch, ticker_ts, latest_price) {
+                        if merge_candles(&mut inner.candles, &aligned, ticker_ts, latest_price) {
                             inner.version = inner.version.saturating_add(1);
                             inner.last_update_ms = now_ms;
                         }
@@ -555,6 +587,35 @@ async fn drain_loop(
 // ---------------------------------------------------------------------------
 // Merge helper — upsert-by-timestamp
 // ---------------------------------------------------------------------------
+
+/// Keep the forming candle's open anchored to the previous candle's close.
+///
+/// A live candle is usually seeded from the previous candle's *provisional*
+/// close. When the exchange finalizes that previous candle late, its close can
+/// move; without this step the forming candle starts at the old price and the
+/// chart shows a vertical gap between them.
+fn reanchor_live_open(buf: &mut [OhlcvCandle], live_ts: Option<i64>) -> bool {
+    let Some(live_ts) = live_ts else {
+        return false;
+    };
+    let Some(index) = buf.iter().position(|candle| candle.timestamp == live_ts) else {
+        return false;
+    };
+    if index == 0 {
+        return false;
+    }
+
+    let previous_close = buf[index - 1].close;
+    let live = &mut buf[index];
+    if (live.open - previous_close).abs() <= f64::EPSILON {
+        return false;
+    }
+
+    live.open = previous_close;
+    live.high = live.high.max(previous_close);
+    live.low = live.low.min(previous_close);
+    true
+}
 
 /// Merge `incoming` candles into `buf`, which is kept sorted by timestamp.
 ///
@@ -630,6 +691,7 @@ fn merge_candles(
         let excess = buf.len() - MAX_CANDLES;
         buf.drain(0..excess);
     }
+    reanchor_live_open(buf, live_ticker_candle_ts);
     *buf != before
 }
 
@@ -693,6 +755,46 @@ mod tests {
     }
 
     #[test]
+    fn align_batch_snaps_offsets_to_the_timeframe() {
+        let batch = vec![candle(60_500, 1.0), candle(120_900, 2.0)];
+        let aligned = align_batch(&batch, 60_000, "1m");
+        assert_eq!(aligned[0].timestamp, 60_000);
+        assert_eq!(aligned[1].timestamp, 120_000);
+    }
+
+    #[test]
+    fn merge_reanchors_live_open_after_previous_candle_finalizes() {
+        let mut buf = vec![
+            candle(1_000, 100.0),
+            OhlcvCandle {
+                timestamp: 2_000,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 101.0,
+                volume: 0.0,
+            },
+        ];
+
+        // The exchange finalizes the previous candle at 102 after the live
+        // candle (open 100) was already created.
+        let final_previous = OhlcvCandle {
+            timestamp: 1_000,
+            open: 99.0,
+            high: 103.0,
+            low: 99.0,
+            close: 102.0,
+            volume: 10.0,
+        };
+        merge_candles(&mut buf, &[final_previous], Some(2_000), Some(101.0));
+
+        assert_eq!(buf[0].close, 102.0);
+        assert_eq!(buf[1].open, 102.0, "live open follows the final close");
+        assert!(buf[1].low <= 102.0);
+        assert!(buf[1].high >= 102.0);
+    }
+
+    #[test]
     fn merge_evicts_oldest_when_over_limit() {
         let mut buf: Vec<OhlcvCandle> = (0..MAX_CANDLES as i64)
             .map(|i| candle(i * 1000, i as f64))
@@ -706,7 +808,8 @@ mod tests {
 
     #[test]
     fn merge_protects_live_ticker_candle() {
-        let mut buf = vec![candle(1000, 1.0), candle(2000, 2.8)];
+        let mut buf = vec![candle(1000, 2.0), candle(2000, 2.8)];
+        buf[1].open = 2.0;
         buf[1].high = 3.0;
         buf[1].low = 2.0;
         buf[1].volume = 10.0;
