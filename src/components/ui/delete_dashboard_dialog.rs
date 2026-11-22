@@ -23,19 +23,29 @@ pub enum DeleteDashboardDialogEvent {
 /// Dialog for confirming dashboard deletion
 pub struct DeleteDashboardDialog {
     focus_handle: FocusHandle,
-    /// Module ID to delete
+    /// Relative path to delete
     module_id: String,
-    /// Module name for display
+    /// Display name for the entry
     module_name: String,
+    is_folder: bool,
+    child_count: usize,
 }
 
 impl DeleteDashboardDialog {
     /// Create a new DeleteDashboardDialog
-    pub fn new(module_id: String, module_name: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        module_id: String,
+        module_name: String,
+        is_folder: bool,
+        child_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             module_id,
             module_name,
+            is_folder,
+            child_count,
         }
     }
 
@@ -67,10 +77,35 @@ impl Render for DeleteDashboardDialog {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(div().text_sm().text_color(colors.foreground).child(format!(
-                "Are you sure you want to delete the dashboard \"{}\"?",
-                self.module_name
-            )))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(colors.foreground)
+                    .child(if self.is_folder {
+                        if self.child_count > 0 {
+                            format!(
+                                "Delete the folder \"{}\" and its {} layout{}?",
+                                self.module_name,
+                                self.child_count,
+                                if self.child_count == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            format!("Delete the empty folder \"{}\"?", self.module_name)
+                        }
+                    } else {
+                        format!("Delete the layout \"{}\"?", self.module_name)
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(colors.muted_foreground)
+                    .child(if self.is_folder {
+                        "The folder and everything inside it will be removed from disk."
+                    } else {
+                        "The layout file will be removed from disk."
+                    }),
+            )
             .child(
                 div()
                     .text_xs()
@@ -85,10 +120,14 @@ impl Render for DeleteDashboardDialog {
 pub fn open_delete_dashboard_dialog(
     module_id: String,
     module_name: String,
+    is_folder: bool,
+    child_count: usize,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<DeleteDashboardDialog> {
-    let dialog_entity = cx.new(|cx| DeleteDashboardDialog::new(module_id, module_name.clone(), cx));
+    let dialog_entity = cx.new(|cx| {
+        DeleteDashboardDialog::new(module_id, module_name.clone(), is_folder, child_count, cx)
+    });
     let dialog_entity_clone = dialog_entity.clone();
     let dialog_entity_for_ok = dialog_entity.clone();
     let dialog_entity_for_cancel = dialog_entity.clone();

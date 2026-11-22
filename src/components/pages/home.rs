@@ -288,6 +288,83 @@ impl HomePage {
         result
     }
 
+    /// Push one market configuration to every matching pane in this dashboard.
+    ///
+    /// Used by the Agent's `set_market` directive. Returns the number of panes
+    /// whose config actually changed; `LayoutModified` is emitted so the edit is
+    /// persisted exactly like a mouse-driven change.
+    pub fn apply_market_broadcast(
+        &mut self,
+        exchange: Option<&str>,
+        symbol: Option<&str>,
+        timeframe: Option<&str>,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let mut updated = 0usize;
+        let scope = scope.trim().to_ascii_lowercase();
+        self.pane_grid.update(cx, |grid, cx| {
+            let Some(mut tree) = grid.tree.clone() else {
+                return;
+            };
+            tree.for_each_pane_mut(&mut |data| {
+                let kind = data
+                    .module_type
+                    .as_deref()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let matches = match scope.as_str() {
+                    "" | "all" => matches!(
+                        kind.as_str(),
+                        "chart" | "ticker" | "orderbook" | "trades" | "tape" | "watchlist" | "execution"
+                    ),
+                    "charts" | "chart" => kind == "chart",
+                    "tickers" | "ticker" => kind == "ticker",
+                    "orderbooks" | "orderbook" | "books" => kind == "orderbook",
+                    "trades" | "tape" => kind == "trades" || kind == "tape",
+                    "watchlist" => kind == "watchlist",
+                    "execution" => kind == "execution",
+                    _ => false,
+                };
+                if !matches {
+                    return;
+                }
+                if data.config.is_null() {
+                    data.config = serde_json::json!({});
+                }
+                let Some(config) = data.config.as_object_mut() else {
+                    return;
+                };
+                let mut changed = false;
+                if let Some(exchange) = exchange {
+                    config.insert("exchange".into(), serde_json::json!(exchange));
+                    changed = true;
+                }
+                if let Some(symbol) = symbol {
+                    config.insert("symbol".into(), serde_json::json!(symbol));
+                    changed = true;
+                }
+                if kind == "chart" {
+                    if let Some(timeframe) = timeframe {
+                        config.insert("timeframe".into(), serde_json::json!(timeframe));
+                        config.insert("interval".into(), serde_json::json!(timeframe));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    updated += 1;
+                }
+            });
+            if updated > 0 {
+                grid.set_tree(tree, cx);
+            }
+        });
+        if updated > 0 {
+            cx.emit(HomePageEvent::LayoutModified);
+        }
+        updated
+    }
+
     pub fn apply_settings(&mut self, settings: SettingsData, cx: &mut Context<Self>) {
         let timezone = settings.timezone.unwrap_or_else(|| "UTC".into());
         let sound_alerts = settings.alert_sound_enabled.unwrap_or(true);

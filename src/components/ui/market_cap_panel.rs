@@ -1,7 +1,7 @@
 /// Market Cap panel — cryptocurrency market capitalization treemap & ranked table.
 ///
-/// Fetches market data snapshot from `https://cap.coinwat.ch/market-caps`
-/// and streams real-time updates via `wss://cap.coinwat.ch/ws`.
+/// Fetches market data snapshot from the CoinWatch `/api/market-caps` proxy
+/// and streams real-time updates via the `/ws/market-caps` relay.
 ///
 /// Features dynamic view switching (Heatmap Tiles vs Ranked Table),
 /// color-coded 24h performance gradients, global telemetry (Total Market Cap,
@@ -869,7 +869,7 @@ async fn run_market_cap_syncer(
         if base.trim().is_empty() {
             None
         } else {
-            Some(format!("{}/market-caps?limit=50", base.trim_end_matches('/')))
+            Some(format!("{}/api/market-caps?limit=50", base.trim_end_matches('/')))
         }
     });
 
@@ -913,11 +913,11 @@ async fn run_market_cap_syncer(
         if base.is_empty() {
             None
         } else if let Some(origin) = base.strip_prefix("https://") {
-            Some(format!("wss://{origin}/ws"))
+            Some(format!("wss://{origin}/ws/market-caps"))
         } else if let Some(origin) = base.strip_prefix("http://") {
-            Some(format!("ws://{origin}/ws"))
+            Some(format!("ws://{origin}/ws/market-caps"))
         } else {
-            Some(format!("wss://{base}/ws"))
+            Some(format!("wss://{base}/ws/market-caps"))
         }
     });
 

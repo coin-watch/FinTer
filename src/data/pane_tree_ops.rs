@@ -1,6 +1,20 @@
-use crate::data::pane_tree::PaneNode;
+use crate::data::pane_tree::{ModuleData, PaneNode};
 
 impl PaneNode {
+    /// Visit every pane leaf, letting the caller mutate its module data.
+    ///
+    /// Used by the Agent's `set_market` broadcast; split nodes are traversed in
+    /// tree order so ids and configs stay aligned with what the user sees.
+    pub fn for_each_pane_mut<F: FnMut(&mut ModuleData)>(&mut self, f: &mut F) {
+        match self {
+            PaneNode::Pane { data, .. } => f(data),
+            PaneNode::Split { a, b, .. } => {
+                a.for_each_pane_mut(f);
+                b.for_each_pane_mut(f);
+            }
+        }
+    }
+
     pub fn split_matrix(&mut self, target_id: &str, rows: usize, cols: usize) -> bool {
         self.modify_node(target_id, &mut |node| {
             if let PaneNode::Pane { id, data } = node.clone() {

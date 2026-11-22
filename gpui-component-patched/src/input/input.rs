@@ -241,6 +241,10 @@ impl Styled for Input {
 impl RenderOnce for Input {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         const LINE_HEIGHT: Rems = Rems(1.25);
+        // An explicit height (for example `Input::h_full()`) must win over the
+        // multi-line auto-height rule, otherwise code editors collapse to a
+        // single visible line inside a flex container.
+        let explicit_height = self.height.is_some();
 
         self.state.update(cx, |state, _| {
             state.disabled = self.disabled;
@@ -361,7 +365,9 @@ impl RenderOnce for Input {
             .cursor_text()
             .items_center()
             .when_some(self.height, |this, height| this.h(height))
-            .when(state.mode.is_multi_line(), |this| this.h_auto())
+            .when(state.mode.is_multi_line() && !explicit_height, |this| {
+                this.h_auto()
+            })
             .when(self.appearance, |this| {
                 this.bg(bg)
                     .rounded(cx.theme().radius)

@@ -1,9 +1,9 @@
 use crate::components::mainview::{MainView, Page, SecondarySidebar};
 use crate::components::ui::title_bar::TITLE_BAR_HEIGHT;
 use gpui::{
-    prelude::FluentBuilder as _, App, AppContext, ClickEvent, Context, Corner, Hsla,
-    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    StyleRefinement, Styled, StyledImage, WeakEntity, Window, WindowControlArea, div, img, px,
+    App, AppContext, ClickEvent, Context, Corner, Hsla, InteractiveElement, IntoElement,
+    ParentElement, StatefulInteractiveElement, StyleRefinement, Styled, StyledImage, WeakEntity,
+    Window, WindowControlArea, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::Icon;
 use gpui_component::button::{Button, ButtonVariants};
@@ -413,22 +413,21 @@ fn build_user_button(
                             );
                         }
 
-                        menu = menu
-                            .item(
-                                PopupMenuItem::new("Settings")
-                                    .icon(Icon::default().path("icons/settings.svg"))
-                                    .on_click(move |_event, _window, app| {
-                                        if let Some(e) = entity_settings.upgrade() {
-                                            app.update_entity(
-                                                &e,
-                                                |view: &mut MainView, cx: &mut Context<MainView>| {
-                                                    view.switch_page(Page::Settings);
-                                                    cx.notify();
-                                                },
-                                            );
-                                        }
-                                    }),
-                            );
+                        menu = menu.item(
+                            PopupMenuItem::new("Settings")
+                                .icon(Icon::default().path("icons/settings.svg"))
+                                .on_click(move |_event, _window, app| {
+                                    if let Some(e) = entity_settings.upgrade() {
+                                        app.update_entity(
+                                            &e,
+                                            |view: &mut MainView, cx: &mut Context<MainView>| {
+                                                view.switch_page(Page::Settings);
+                                                cx.notify();
+                                            },
+                                        );
+                                    }
+                                }),
+                        );
 
                         if is_logged_in {
                             menu = menu.separator().item(
@@ -456,6 +455,11 @@ fn build_user_button(
 /// Get the secondary sidebar width
 pub fn get_secondary_sidebar_width() -> f32 {
     SECONDARY_SIDEBAR_WIDTH
+}
+
+/// Get the icon sidebar width
+pub fn get_icon_sidebar_width() -> f32 {
+    ICON_SIDEBAR_WIDTH
 }
 
 /// Build the complete sidebar element (icon sidebar + optional secondary sidebar)

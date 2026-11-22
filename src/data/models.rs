@@ -255,7 +255,7 @@ where
 // Module models (workspace layouts)
 // ──────────────────────────────────────────────
 
-/// A saved workspace module as returned by GET /api/modules.
+/// A saved workspace layout, mapped from a local layout file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Module {
     pub id: Option<String>,
@@ -268,45 +268,30 @@ pub struct Module {
     pub updated_at: Option<String>,
 }
 
-/// Request body for POST /api/modules.
-#[derive(Debug, Serialize)]
-pub struct CreateModuleRequest {
-    pub user_id: String,
-    pub module_name: String,
-    pub module: serde_json::Value,
-}
-
-/// Request body for PATCH /api/modules/{id}.
-#[derive(Debug, Serialize)]
-pub struct UpdateModuleRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub module_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub module: Option<serde_json::Value>,
-}
-
 // ──────────────────────────────────────────────
-// Layout Preset models
+// Local layout workspace tree
 // ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct LayoutPreset {
-    pub id: Option<String>,
-    pub user_id: Option<String>,
-    pub name: String,
-    pub tree: serde_json::Value,
-    #[serde(default)]
-    pub is_public: Option<bool>,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
+/// Whether an explorer entry is a folder, a layout file, or any other file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutEntryKind {
+    Folder,
+    Layout,
+    File,
 }
 
-#[derive(Debug, Serialize)]
-pub struct CreateLayoutPresetRequest {
-    pub user_id: String,
+/// One row in the local layout explorer.
+#[derive(Debug, Clone)]
+pub struct LayoutEntry {
+    /// Path relative to the workspace root, using `/` separators.
+    pub path: String,
+    /// Display name: folder name, layout stem, or full file name.
     pub name: String,
-    pub tree: serde_json::Value,
-    pub is_public: bool,
+    pub kind: LayoutEntryKind,
+    pub children: Vec<LayoutEntry>,
+    /// Number of layout files below this entry.
+    pub layout_count: usize,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ──────────────────────────────────────────────
@@ -530,46 +515,50 @@ impl AuthResponse {
     }
 
     pub fn user_id(&self) -> Option<String> {
-        self.user_id
-            .clone()
-            .or_else(|| self.session.as_ref().and_then(|s| s.user.as_ref()).and_then(|u| u.id.clone()))
+        self.user_id.clone().or_else(|| {
+            self.session
+                .as_ref()
+                .and_then(|s| s.user.as_ref())
+                .and_then(|u| u.id.clone())
+        })
     }
 
     pub fn email(&self) -> Option<String> {
-        self.email
-            .clone()
-            .or_else(|| self.session.as_ref().and_then(|s| s.user.as_ref()).and_then(|u| u.email.clone()))
+        self.email.clone().or_else(|| {
+            self.session
+                .as_ref()
+                .and_then(|s| s.user.as_ref())
+                .and_then(|u| u.email.clone())
+        })
     }
 
     pub fn name(&self) -> Option<String> {
-        self.name
-            .clone()
-            .or_else(|| {
-                self.session.as_ref()
-                    .and_then(|s| s.user.as_ref())
-                    .and_then(|u| u.user_metadata.as_ref())
-                    .and_then(|m| {
-                        m.get("name")
-                            .or_else(|| m.get("full_name"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
+        self.name.clone().or_else(|| {
+            self.session
+                .as_ref()
+                .and_then(|s| s.user.as_ref())
+                .and_then(|u| u.user_metadata.as_ref())
+                .and_then(|m| {
+                    m.get("name")
+                        .or_else(|| m.get("full_name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+        })
     }
 
     pub fn avatar_url(&self) -> Option<String> {
-        self.avatar_url
-            .clone()
-            .or_else(|| {
-                self.session.as_ref()
-                    .and_then(|s| s.user.as_ref())
-                    .and_then(|u| u.user_metadata.as_ref())
-                    .and_then(|m| {
-                        m.get("avatar_url")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
+        self.avatar_url.clone().or_else(|| {
+            self.session
+                .as_ref()
+                .and_then(|s| s.user.as_ref())
+                .and_then(|u| u.user_metadata.as_ref())
+                .and_then(|m| {
+                    m.get("avatar_url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+        })
     }
 }
 

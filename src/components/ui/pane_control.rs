@@ -9,7 +9,7 @@
 //! The registry lives in the component layer because it holds `WeakEntity`
 //! handles to `HomePage`; the wire types it consumes live in
 //! [`crate::data::pane_control`] so the data layer stays UI-free.
-use gpui::{App, Global, WeakEntity};
+use gpui::{AnyWindowHandle, App, Global, WeakEntity};
 
 use crate::components::pages::home::HomePage;
 use crate::data::pane_control::{ParsedUiAction, UiAction, UiActionResult, parse_axis};
@@ -26,6 +26,9 @@ pub struct DashboardTarget {
     pub name: String,
     /// True when the dashboard is rendered in its own top-level window.
     pub detached: bool,
+    /// Handle to that window, when detached. Lets the Agent focus or close it
+    /// without guessing which screen it lives on.
+    pub window: Option<AnyWindowHandle>,
     pub home: WeakEntity<HomePage>,
 }
 
@@ -41,8 +44,20 @@ impl Global for DashboardRegistry {}
 impl DashboardRegistry {
     /// Replace the tabbed-dashboard entries, keeping detached ones intact.
     pub fn sync_main(&mut self, entries: Vec<DashboardTarget>) {
-        self.targets.retain(|target| target.detached);
+        // Drop detached windows that have been closed or attached.
+        self.targets
+            .retain(|target| !target.detached || target.home.upgrade().is_some());
         for entry in entries {
+            // A detached window owns that layout. If the user also has a tab
+            // copy, keep addressing the detached screen rather than silently
+            // dropping it from the Agent's catalog.
+            if self
+                .targets
+                .iter()
+                .any(|target| target.detached && target.id == entry.id)
+            {
+                continue;
+            }
             self.upsert(entry);
         }
     }
@@ -62,6 +77,14 @@ impl DashboardRegistry {
         self.targets.retain(|target| target.id != id);
     }
 
+    /// Forget a dashboard's tab entry while keeping a detached window with the
+    /// same id. Detaching a dashboard closes its tab after the new window has
+    /// registered itself; removing by id would erase that fresh registration.
+    pub fn remove_tabbed(&mut self, id: &str) {
+        self.targets
+            .retain(|target| target.id != id || target.detached);
+    }
+
     /// Every entry whose `HomePage` is still alive.
     pub fn live(&self) -> Vec<DashboardTarget> {
         self.targets
@@ -69,6 +92,14 @@ impl DashboardRegistry {
             .filter(|target| target.home.upgrade().is_some())
             .cloned()
             .collect()
+    }
+
+    /// The top-level window currently showing a detached dashboard, if any.
+    pub fn detached_window(&self, id: &str) -> Option<AnyWindowHandle> {
+        self.targets
+            .iter()
+            .find(|target| target.detached && target.id == id)
+            .and_then(|target| target.window)
     }
 
     /// Resolve an Agent selector (`id`, `name`, `active`, `all`, or empty) into
@@ -575,5 +606,47 @@ pub fn apply_action_to_grid(
             }
             Err(error) => UiActionResult::failure(name, error),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn detached_target(id: &str) -> DashboardTarget {
+        DashboardTarget {
+            id: id.to_string(),
+            name: id.to_string(),
+            detached: true,
+            window: None,
+            home: WeakEntity::<HomePage>::new_invalid(),
+        }
+    }
+
+    #[test]
+    fn remove_tabbed_keeps_detached_window_registration() {
+        // `detach_dashboard` registers the new window, then closes the tab. The
+        // tab close must not erase the registration it just created.
+        let mut registry = DashboardRegistry::default();
+        registry.register(detached_target("Macro"));
+        registry.remove_tabbed("Macro");
+        assert_eq!(registry.targets.len(), 1);
+        assert!(registry.targets[0].detached);
+    }
+
+    #[test]
+    fn sync_main_prunes_dead_detached_windows() {
+        let mut registry = DashboardRegistry::default();
+        registry.register(detached_target("Macro"));
+        registry.sync_main(Vec::new());
+        assert!(registry.targets.is_empty());
+    }
+
+    #[test]
+    fn remove_clears_a_closed_detached_window() {
+        let mut registry = DashboardRegistry::default();
+        registry.register(detached_target("Macro"));
+        registry.remove("Macro");
+        assert!(registry.targets.is_empty());
     }
 }

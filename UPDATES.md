@@ -39,6 +39,8 @@ Required GitHub Actions secrets:
 - `FINTER_WS_URL`: optional WebSocket market gateway; otherwise derived from `FINTER_REST_URL`.
 - `FINTER_NEWS_API_URL`: optional news API base URL.
 - `FINTER_NEWS_WS_URL`: optional news WebSocket URL.
+- `FINTER_CAP_URL`: optional market-cap snapshot URL; defaults to `<api-origin>/api/market-caps?limit=50`.
+- `FINTER_CAP_WS_URL`: optional market-cap stream URL; defaults to `wss://<api-origin>/ws/market-caps`.
 
 ### Update channels
 

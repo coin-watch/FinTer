@@ -6,9 +6,9 @@
 //! - On Linux: Renders custom window controls with client-side decorations
 
 use gpui::{
-    AnyElement, App, ClickEvent, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    Window, WindowControlArea, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, ClickEvent, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Pixels, RenderOnce, StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
+    WindowControlArea, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme, Icon, InteractiveElementExt as _, Sizable as _, StyledExt, h_flex,
@@ -41,6 +41,15 @@ pub struct FinTerTitleBar {
     on_close_window: CloseWindowFn,
     title: String,
     tab_strip: Option<AnyElement>,
+}
+
+/// Left padding applied before a tab strip in the custom title bar.
+pub fn tab_strip_left_padding() -> Pixels {
+    if cfg!(target_os = "macos") {
+        TITLE_BAR_LEFT_PADDING
+    } else {
+        px(0.0)
+    }
 }
 
 impl FinTerTitleBar {
@@ -110,7 +119,11 @@ impl RenderOnce for FinTerTitleBar {
                 .flex_row()
                 .justify_between()
                 .h(TITLE_BAR_HEIGHT)
-                .pl(if has_tabs && !is_macos { px(0.0) } else { TITLE_BAR_LEFT_PADDING })
+                .pl(if has_tabs && !is_macos {
+                    px(0.0)
+                } else {
+                    TITLE_BAR_LEFT_PADDING
+                })
                 .pr(TITLE_BAR_RIGHT_PADDING)
                 .bg(title_bar_bg)
                 .refine_style(&self.style)
@@ -148,10 +161,7 @@ impl RenderOnce for FinTerTitleBar {
                                     )
                                     .when(self.tab_strip.is_some(), |this| {
                                         this.child(
-                                            div()
-                                                .w(px(1.0))
-                                                .h(px(16.0))
-                                                .bg(title_bar_border),
+                                            div().w(px(1.0)).h(px(16.0)).bg(title_bar_border),
                                         )
                                     }),
                             )
@@ -180,6 +190,14 @@ impl RenderOnce for FinTerTitleBar {
                     on_close_window: self.on_close_window,
                 }),
         )
+    }
+}
+
+/// Render the platform window controls (minimize / maximize / close) so custom
+/// title rows can reuse them.
+pub fn render_window_controls() -> impl IntoElement {
+    WindowControls {
+        on_close_window: None,
     }
 }
 

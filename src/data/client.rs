@@ -567,7 +567,7 @@ pub async fn parse_api_response<T: serde::de::DeserializeOwned>(
         }
         Err(_) => {
             // If not a standard envelope, try to parse T directly
-            // (some endpoints return raw arrays, e.g. GET /api/modules)
+            // (some endpoints return raw arrays).
             serde_json::from_str::<T>(&body).map_err(|e| {
                 if status >= 400 {
                     let msg = if body.trim_start().starts_with("<!doctype") || body.trim_start().starts_with("<html") {

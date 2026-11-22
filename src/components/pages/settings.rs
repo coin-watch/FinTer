@@ -3,17 +3,17 @@ use crate::data::models::SettingsData;
 use crate::data::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_component::Sizable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::Sizable;
 use gpui_component::{
+    ActiveTheme,
     setting::{
         NumberFieldOptions, RenderOptions, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings,
     },
-    ActiveTheme,
 };
 use std::sync::Arc;
 
@@ -211,8 +211,12 @@ impl Default for AppSettings {
             default_timezone: "UTC".into(),
             startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
             startup_tab_ids: tab_preferences.selected_tab_ids,
-            agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
-            agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
+            agent_base_url: std::env::var("FINTER_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into())
+                .into(),
+            agent_api_key: std::env::var("FINTER_AI_API_KEY")
+                .unwrap_or_default()
+                .into(),
             api_exchange: initial_ex.into(),
             api_key: initial_cred.api_key.into(),
             api_secret: initial_cred.api_secret.into(),
@@ -260,11 +264,7 @@ impl AppSettings {
             enable_chart_grid: data.chart_grid_visible.unwrap_or(false),
             enable_magnet_snap: data.magnet_snap_enabled.unwrap_or(true),
             sync_dashboard_tabs: data.link_dashboard_tabs.unwrap_or(true),
-            default_timezone: data
-                .timezone
-                .clone()
-                .unwrap_or_else(|| "UTC".into())
-                .into(),
+            default_timezone: data.timezone.clone().unwrap_or_else(|| "UTC".into()).into(),
             auto_check_updates: data.auto_check_updates.unwrap_or(true),
             update_channel: data
                 .update_channel
@@ -275,9 +275,17 @@ impl AppSettings {
                 .into(),
             startup_tabs_mode: tab_preferences.startup_mode.as_str().into(),
             startup_tab_ids: tab_preferences.selected_tab_ids,
-            agent_base_url: std::env::var("FINTER_AI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into()).into(),
-            agent_api_key: std::env::var("FINTER_AI_API_KEY").unwrap_or_default().into(),
-            api_exchange: crate::data::api_management::load().first().map(|c| c.exchange.clone()).unwrap_or_else(|| "binance".into()).into(),
+            agent_base_url: std::env::var("FINTER_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into())
+                .into(),
+            agent_api_key: std::env::var("FINTER_AI_API_KEY")
+                .unwrap_or_default()
+                .into(),
+            api_exchange: crate::data::api_management::load()
+                .first()
+                .map(|c| c.exchange.clone())
+                .unwrap_or_else(|| "binance".into())
+                .into(),
             api_key: String::new().into(),
             api_secret: String::new().into(),
             api_passphrase: String::new().into(),
@@ -339,9 +347,62 @@ impl AppSettings {
     }
 }
 
-/// Multi-select control for the dashboards that should open on startup.
+/// Payload for reordering the selected startup dashboards.
+#[derive(Clone)]
+struct DragStartupTab(String);
+
+struct StartupTabDragPreview(String);
+
+impl Render for StartupTabDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors;
+        div()
+            .w(px(180.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(colors.popover)
+            .border_1()
+            .border_color(colors.border)
+            .text_xs()
+            .child(self.0.clone())
+    }
+}
+
+/// Move `dragged` immediately before `target` in the selected-tab order.
+fn reorder_startup_id(ids: &mut Vec<String>, dragged: &str, target: &str) {
+    if dragged == target {
+        return;
+    }
+    let Some(from) = ids.iter().position(|id| id == dragged) else {
+        return;
+    };
+    let moved = ids.remove(from);
+    let to = ids.iter().position(|id| id == target).unwrap_or(ids.len());
+    ids.insert(to, moved);
+}
+
+/// Move a selected startup tab one slot up (`-1`) or down (`+1`).
+fn move_startup_id_step(ids: &mut Vec<String>, id: &str, delta: isize) {
+    let Some(from) = ids.iter().position(|candidate| candidate == id) else {
+        return;
+    };
+    if ids.len() < 2 {
+        return;
+    }
+    let last = ids.len() as isize - 1;
+    let to = (from as isize + delta).clamp(0, last) as usize;
+    if from == to {
+        return;
+    }
+    let moved = ids.remove(from);
+    ids.insert(to, moved);
+}
+
+/// Ordered multi-select for startup dashboards.
 ///
-/// The trigger summarizes the current selection and opens a checkbox list.
+/// The selected section is the persisted tab order: drag a row (or use the
+/// arrow buttons) to choose the order tabs open in "Open selected dashboards".
 /// Selections are written to the draft settings entity immediately; the Tabs
 /// page's Save Section button commits them.
 fn dashboard_multi_select(
@@ -360,7 +421,7 @@ fn dashboard_multi_select(
     } else if selected_count == 0 {
         "Select dashboards".to_string()
     } else if selected_count == dashboards.len() {
-        "All dashboards".to_string()
+        format!("All dashboards ({selected_count}, ordered)")
     } else {
         format!("{selected_count} dashboards selected")
     };
@@ -383,9 +444,7 @@ fn dashboard_multi_select(
             let dashboards = content_dashboards.clone();
             let selected_ids = settings.read(cx).startup_tab_ids.clone();
             let all_selected = !dashboards.is_empty()
-                && dashboards
-                    .iter()
-                    .all(|(id, _)| selected_ids.contains(id));
+                && dashboards.iter().all(|(id, _)| selected_ids.contains(id));
 
             let select_all_settings = settings.clone();
             let select_all_dashboards = dashboards.clone();
@@ -415,11 +474,30 @@ fn dashboard_multi_select(
                     cx.refresh_windows();
                 });
 
+            // Selected rows keep their persisted order; available rows follow
+            // the explorer's order.
+            let selected: Vec<(String, String)> = selected_ids
+                .iter()
+                .filter_map(|id| {
+                    dashboards
+                        .iter()
+                        .find(|(dashboard_id, _)| dashboard_id == id)
+                        .cloned()
+                })
+                .collect();
+            let available: Vec<(String, String)> = dashboards
+                .iter()
+                .filter(|(id, _)| !selected_ids.contains(id))
+                .cloned()
+                .collect();
+
+            let colors = cx.theme().colors;
+            let row_hover = colors.list_hover;
             let mut list = div()
                 .w_full()
-                .min_w(px(200.0))
-                .max_w(px(340.0))
-                .max_h(px(320.0))
+                .min_w(px(240.0))
+                .max_w(px(360.0))
+                .max_h(px(420.0))
                 .overflow_y_scrollbar()
                 .flex()
                 .flex_col()
@@ -432,37 +510,178 @@ fn dashboard_multi_select(
                         .px(px(6.0))
                         .py(px(4.0))
                         .border_b_1()
-                        .border_color(cx.theme().colors.border)
+                        .border_color(colors.border)
                         .child(select_all),
                 );
 
-            for (id, name) in dashboards {
-                let checked = selected_ids.contains(&id);
+            if !selected.is_empty() {
+                list = list.child(
+                    div()
+                        .px(px(6.0))
+                        .pt(px(4.0))
+                        .text_xs()
+                        .text_color(colors.muted_foreground)
+                        .child("Selected — drag or use ↑↓ to set tab order"),
+                );
+            }
+
+            let selected_len = selected.len();
+            for (index, (id, name)) in selected.into_iter().enumerate() {
+                let checked = true;
                 let checkbox_settings = settings.clone();
                 let checkbox_id = id.clone();
+                let drag_settings = settings.clone();
+                let drag_target = id.clone();
+                let drag_name = name.clone();
+                let up_settings = settings.clone();
+                let up_id = id.clone();
+                let down_settings = settings.clone();
+                let down_id = id.clone();
+
                 list = list.child(
-                    div().w_full().min_w_0().px(px(6.0)).py(px(3.0)).child(
-                        Checkbox::new(ElementId::Name(SharedString::from(format!(
-                            "tabs-dashboard-{id}"
+                    div()
+                        .id(ElementId::Name(SharedString::from(format!(
+                            "tabs-selected-{id}"
                         ))))
-                        .label(name)
-                        .checked(checked)
-                        .on_click(move |checked, _window, cx| {
-                            checkbox_settings.update(cx, |saved, _| {
-                                if *checked {
-                                    if !saved.startup_tab_ids.contains(&checkbox_id) {
-                                        saved.startup_tab_ids.push(checkbox_id.clone());
-                                    }
-                                } else {
-                                    saved
-                                        .startup_tab_ids
-                                        .retain(|saved_id| saved_id != &checkbox_id);
-                                }
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .px(px(4.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .drag_over::<DragStartupTab>(move |style, _, _, _| style.bg(row_hover))
+                        .on_drop(move |drag: &DragStartupTab, _window, app| {
+                            let dragged = drag.0.clone();
+                            let target = drag_target.clone();
+                            drag_settings.update(app, |saved, _| {
+                                reorder_startup_id(&mut saved.startup_tab_ids, &dragged, &target);
                             });
-                            cx.refresh_windows();
+                            app.refresh_windows();
+                        })
+                        .on_drag(
+                            DragStartupTab(id.clone()),
+                            move |_drag, _offset, _window, app| {
+                                let name = drag_name.clone();
+                                app.new(|_| StartupTabDragPreview(name))
+                            },
+                        )
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .text_color(colors.muted_foreground)
+                                .child("⋮⋮"),
+                        )
+                        .child(
+                            Checkbox::new(ElementId::Name(SharedString::from(format!(
+                                "tabs-dashboard-{id}"
+                            ))))
+                            .label(name)
+                            .checked(checked)
+                            .on_click(
+                                move |checked, _window, cx| {
+                                    checkbox_settings.update(cx, |saved, _| {
+                                        if *checked {
+                                            if !saved.startup_tab_ids.contains(&checkbox_id) {
+                                                saved.startup_tab_ids.push(checkbox_id.clone());
+                                            }
+                                        } else {
+                                            saved
+                                                .startup_tab_ids
+                                                .retain(|saved_id| saved_id != &checkbox_id);
+                                        }
+                                    });
+                                    cx.refresh_windows();
+                                },
+                            ),
+                        )
+                        .child(div().flex_1())
+                        .when(index > 0, |this| {
+                            this.child(
+                                Button::new(ElementId::Name(SharedString::from(format!(
+                                    "tabs-up-{id}"
+                                ))))
+                                .label("↑")
+                                .xsmall()
+                                .ghost()
+                                .on_click(
+                                    move |_event, _window, cx| {
+                                        up_settings.update(cx, |saved, _| {
+                                            move_startup_id_step(
+                                                &mut saved.startup_tab_ids,
+                                                &up_id,
+                                                -1,
+                                            );
+                                        });
+                                        cx.refresh_windows();
+                                    },
+                                ),
+                            )
+                        })
+                        .when(index + 1 < selected_len, |this| {
+                            this.child(
+                                Button::new(ElementId::Name(SharedString::from(format!(
+                                    "tabs-down-{id}"
+                                ))))
+                                .label("↓")
+                                .xsmall()
+                                .ghost()
+                                .on_click(
+                                    move |_event, _window, cx| {
+                                        down_settings.update(cx, |saved, _| {
+                                            move_startup_id_step(
+                                                &mut saved.startup_tab_ids,
+                                                &down_id,
+                                                1,
+                                            );
+                                        });
+                                        cx.refresh_windows();
+                                    },
+                                ),
+                            )
                         }),
-                    ),
                 );
+            }
+
+            if !available.is_empty() {
+                list = list.child(
+                    div()
+                        .px(px(6.0))
+                        .pt(px(6.0))
+                        .text_xs()
+                        .text_color(colors.muted_foreground)
+                        .child("Available"),
+                );
+                for (id, name) in available {
+                    let checkbox_settings = settings.clone();
+                    let checkbox_id = id.clone();
+                    list = list.child(
+                        div().w_full().min_w_0().px(px(6.0)).py(px(3.0)).child(
+                            Checkbox::new(ElementId::Name(SharedString::from(format!(
+                                "tabs-dashboard-{id}"
+                            ))))
+                            .label(name)
+                            .checked(false)
+                            .on_click(
+                                move |checked, _window, cx| {
+                                    checkbox_settings.update(cx, |saved, _| {
+                                        if *checked {
+                                            if !saved.startup_tab_ids.contains(&checkbox_id) {
+                                                saved.startup_tab_ids.push(checkbox_id.clone());
+                                            }
+                                        } else {
+                                            saved
+                                                .startup_tab_ids
+                                                .retain(|saved_id| saved_id != &checkbox_id);
+                                        }
+                                    });
+                                    cx.refresh_windows();
+                                },
+                            ),
+                        ),
+                    );
+                }
             }
 
             list.into_any_element()
@@ -593,10 +812,7 @@ impl SettingsPage {
         self
     }
 
-    pub fn with_channel_selected(
-        mut self,
-        callback: Arc<dyn Fn(&mut App) + Send + Sync>,
-    ) -> Self {
+    pub fn with_channel_selected(mut self, callback: Arc<dyn Fn(&mut App) + Send + Sync>) -> Self {
         self.on_channel_selected = Some(callback);
         self
     }
@@ -851,7 +1067,9 @@ impl SettingsPage {
         let settings_clone = settings.clone();
 
         SettingPage::new("Trading & Exchange")
-            .description("Configure your default trading preferences. Changes are saved automatically.")
+            .description(
+                "Configure your default trading preferences. Changes are saved automatically.",
+            )
             .group(
                 SettingGroup::new()
                     .title("Exchange Settings")
@@ -1251,6 +1469,38 @@ impl Render for SettingsPage {
 mod tests {
     // Avoid `use super::*`: it re-exports `gpui::test` and shadows `#[test]`.
     use super::AppSettings;
+    use super::{move_startup_id_step, reorder_startup_id};
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn reorders_selected_startup_tabs_by_drag() {
+        let mut order = ids(&["a", "b", "c"]);
+        reorder_startup_id(&mut order, "c", "a");
+        assert_eq!(order, ids(&["c", "a", "b"]));
+        reorder_startup_id(&mut order, "c", "b");
+        assert_eq!(order, ids(&["a", "c", "b"]));
+        // Unknown ids and no-ops leave the order untouched.
+        reorder_startup_id(&mut order, "missing", "a");
+        reorder_startup_id(&mut order, "a", "a");
+        assert_eq!(order, ids(&["a", "c", "b"]));
+    }
+
+    #[test]
+    fn moves_selected_startup_tabs_stepwise() {
+        let mut order = ids(&["a", "b", "c"]);
+        move_startup_id_step(&mut order, "a", 1);
+        assert_eq!(order, ids(&["b", "a", "c"]));
+        move_startup_id_step(&mut order, "a", -1);
+        assert_eq!(order, ids(&["a", "b", "c"]));
+        // Clamped at the ends.
+        move_startup_id_step(&mut order, "a", -1);
+        assert_eq!(order, ids(&["a", "b", "c"]));
+        move_startup_id_step(&mut order, "c", 1);
+        assert_eq!(order, ids(&["a", "b", "c"]));
+    }
 
     #[test]
     fn apply_cloud_fields_keeps_local_settings() {

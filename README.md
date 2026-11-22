@@ -32,7 +32,8 @@
 Most market tools ask you to choose between a browser tab that eats your RAM and a terminal that eats your afternoon. FinTer is a native desktop application: it starts fast, renders smoothly, and keeps your layout, symbols, and indicators on disk.
 
 - **Local-first by default** — Guest Mode runs without an account or a backend; layouts and settings persist locally.
-- **Optional cloud sync** — sign in only when you want dashboards and settings on more than one machine.
+- **Layouts are files** — choose a folder, organize layouts into subfolders, and manage them with a right-click explorer menu. Layout files never leave your machine.
+- **Optional account sync** — sign in when you want account, profile, and settings data across machines. Layouts stay local.
 - **Yours to inspect** — MIT-licensed Rust, from the chart engine to the keyring integration.
 
 ## What's inside
@@ -43,7 +44,7 @@ Most market tools ask you to choose between a browser tab that eats your RAM and
 
 | **Workspace** | **Account & updates** |
 | --- | --- |
-| A resizable pane grid with dashboard modules, saved layouts, a dashboard manager, and local persistence for guest sessions. | Optional sign-in with cloud sync, tokens in the OS keyring, and verified HTTPS updates with SHA-256 metadata checks. |
+| A resizable pane grid with saved layouts, a filesystem-style explorer for every file in your chosen folder, and a built-in text/image viewer for non-layout files. | Optional sign-in with tokens in the OS keyring, profile/settings sync, and verified HTTPS updates with SHA-256 metadata checks. |
 
 ### Indicators
 
@@ -87,7 +88,7 @@ cargo clippy -- -D warnings
 
 ## Connect a backend (optional)
 
-FinTer runs in **Guest Mode** without a backend: it persists your layout and settings locally and shows clear empty states when market data is unavailable. Once you sign in, the native client defaults to the hosted CoinWatch staging backend (`https://staging.coinwat.ch`) so account, dashboard, preset, and profile data load without extra setup.
+FinTer runs in **Guest Mode** without a backend: it persists your layouts and settings locally and shows clear empty states when market data is unavailable. Once you sign in, the native client defaults to the hosted CoinWatch staging backend (`https://staging.coinwat.ch`) for account, profile, and settings data. Layouts are always local files.
 
 Point it at a different backend in **Settings → Network & Server**, or set the environment variable before launch:
 
@@ -104,6 +105,8 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | `FINTER_WS_URL` | Optional WebSocket override; defaults to `wss://<api-origin>/ws`. |
 | `FINTER_NEWS_API_URL` | News article API. |
 | `FINTER_NEWS_WS_URL` | News WebSocket stream. |
+| `FINTER_CAP_URL` | Market-cap snapshot URL; defaults to `<api-origin>/api/market-caps`. |
+| `FINTER_CAP_WS_URL` | Market-cap WebSocket; defaults to `wss://<api-origin>/ws/market-caps`. |
 | `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel, and users can switch channels in Settings → Updates. |
 | `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
 
@@ -116,18 +119,19 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 
 **Exchange API keys.** API keys, secrets, and passphrases are encrypted with AES-256-GCM before being written to `~/.config/finter/api_providers.json` (mode `0600`). The 256-bit key is generated on first use, stored in the OS keyring under `finter/api-credentials-key`, and only held in process memory while FinTer is running. Legacy plaintext credential files are encrypted in place on first load.
 
-**Guest and cloud data never share files.**
+**Layouts are local files. Settings can still sync per account.**
 
-| | Guest / offline | Cloud account |
+| | Local / guest | Cloud account |
 | --- | --- | --- |
-| Layout | `~/.config/finter/guest_layout.json` | `~/.config/finter/cloud_layout.json` |
-| Settings | `~/.config/finter/guest_settings.json` | `~/.config/finter/cloud_settings.json` |
+| Layouts | Any folder you choose; default `<config>/finter/dashboards/` | Same local folder; layouts are never uploaded |
+| Layout workspace state | `<config>/finter/workspace.json` | `<config>/finter/workspace.json` |
+| Settings | `~/.config/finter/guest_settings.json` | Cached in `~/.config/finter/cloud_settings.json` and synced with the backend |
 | Session credentials | — | OS keyring (`finter/session`) |
 | Exchange API keys | AES-256-GCM in `api_providers.json`; key in OS keyring (`finter/api-credentials-key`) | AES-256-GCM in `api_providers.json`; key in OS keyring (`finter/api-credentials-key`) |
 
-Cloud files are cached locally and synchronized with the backend. Logging out restores the guest workspace immediately, without erasing or altering cloud configurations.
+Use **Layouts → right-click → Open Folder…** to choose the workspace root. Every file and subfolder in that folder is shown. Layouts are `<name>.finter.json` files and open as trading layouts; other text files open in the built-in editor as tabs alongside layouts (`Ctrl/Cmd+S` saves), images are previewed, and binary files show their size. Use **New File** to create any file name or extension, or **New Layout** for a `.finter.json` trading layout. Right-click a file or folder for open, rename, duplicate, move, reveal, copy-path, and delete actions. Logging out does not move or delete local files.
 
-Tab preferences (which dashboard tabs open on startup) are local-only and stored in `~/.config/finter/guest_tab_settings.json` and `~/.config/finter/cloud_tab_settings.json`; they are never synced.
+Tab preferences (which layouts open on startup) are local-only and stored in `~/.config/finter/guest_tab_settings.json` and `~/.config/finter/cloud_tab_settings.json`; they are never synced.
 
 </details>
 

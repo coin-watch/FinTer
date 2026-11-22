@@ -43,17 +43,46 @@ impl StartupTabMode {
     }
 }
 
+/// One entry in the title-bar tab strip.
+///
+/// File paths are workspace-relative so the saved session keeps working when
+/// the workspace folder is moved. Older settings files only contain
+/// [`TabSettings::open_tab_ids`]; [`TabSettings::open_tabs`] is a superset
+/// that also preserves the exact interleaving of dashboards and files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpenTab {
+    Dashboard { id: String },
+    File { path: String },
+}
+
+impl OpenTab {
+    pub fn dashboard(id: impl Into<String>) -> Self {
+        Self::Dashboard { id: id.into() }
+    }
+
+    pub fn file(path: impl Into<String>) -> Self {
+        Self::File { path: path.into() }
+    }
+}
+
 /// Local tab preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabSettings {
     #[serde(default)]
     pub startup_mode: StartupTabMode,
     /// Tab ids that were open at the end of the previous session.
+    ///
+    /// Kept as the dashboard-only mirror of [`Self::open_tabs`] so older
+    /// readers (and Settings → Tabs) keep working.
     #[serde(default)]
     pub open_tab_ids: Vec<String>,
     /// Tab ids the user pinned for [`StartupTabMode::Selected`].
     #[serde(default)]
     pub selected_tab_ids: Vec<String>,
+    /// Ordered title-bar tabs, including local files.
+    #[serde(default)]
+    pub open_tabs: Vec<OpenTab>,
 }
 
 impl Default for TabSettings {
@@ -62,6 +91,7 @@ impl Default for TabSettings {
             startup_mode: StartupTabMode::Restore,
             open_tab_ids: Vec::new(),
             selected_tab_ids: Vec::new(),
+            open_tabs: Vec::new(),
         }
     }
 }
@@ -188,6 +218,7 @@ mod tests {
             startup_mode: StartupTabMode::All,
             open_tab_ids: ids(&["a"]),
             selected_tab_ids: ids(&["b"]),
+            ..TabSettings::default()
         };
         assert_eq!(
             settings.resolve_open_tabs(&ids(&["a", "b", "c"])),
@@ -201,6 +232,7 @@ mod tests {
             startup_mode: StartupTabMode::Restore,
             open_tab_ids: ids(&["c", "missing", "a"]),
             selected_tab_ids: Vec::new(),
+            ..TabSettings::default()
         };
         assert_eq!(
             settings.resolve_open_tabs(&ids(&["a", "b", "c"])),
@@ -214,6 +246,7 @@ mod tests {
             startup_mode: StartupTabMode::Selected,
             open_tab_ids: ids(&["a", "b"]),
             selected_tab_ids: ids(&["b"]),
+            ..TabSettings::default()
         };
         assert_eq!(
             settings.resolve_open_tabs(&ids(&["a", "b", "c"])),
@@ -227,6 +260,7 @@ mod tests {
             startup_mode: StartupTabMode::Selected,
             open_tab_ids: Vec::new(),
             selected_tab_ids: Vec::new(),
+            ..TabSettings::default()
         };
         assert_eq!(
             settings.resolve_open_tabs(&ids(&["a", "b"])),
@@ -240,6 +274,7 @@ mod tests {
             startup_mode: StartupTabMode::Empty,
             open_tab_ids: ids(&["a"]),
             selected_tab_ids: ids(&["b"]),
+            ..TabSettings::default()
         };
         assert!(
             settings
@@ -262,5 +297,33 @@ mod tests {
             StartupTabMode::from_value("something-else"),
             StartupTabMode::Restore
         );
+    }
+
+    #[test]
+    fn unified_open_tabs_round_trip_in_order() {
+        let settings = TabSettings {
+            startup_mode: StartupTabMode::Restore,
+            open_tab_ids: ids(&["Crypto.finter.json", "Macro.finter.json"]),
+            open_tabs: vec![
+                OpenTab::dashboard("Crypto.finter.json"),
+                OpenTab::file("notes/ideas.txt"),
+                OpenTab::dashboard("Macro.finter.json"),
+                OpenTab::file("README.md"),
+            ],
+            ..TabSettings::default()
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let restored: TabSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.open_tabs, settings.open_tabs);
+        assert_eq!(restored.open_tab_ids, settings.open_tab_ids);
+    }
+
+    #[test]
+    fn legacy_settings_without_open_tabs_still_load() {
+        let restored: TabSettings =
+            serde_json::from_str(r#"{"open_tab_ids":["a","b"],"selected_tab_ids":[]}"#).unwrap();
+        assert_eq!(restored.open_tab_ids, ids(&["a", "b"]));
+        assert!(restored.open_tabs.is_empty());
     }
 }
