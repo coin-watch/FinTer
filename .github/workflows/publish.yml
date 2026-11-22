@@ -1,0 +1,61 @@
+name: Publish
+
+# Re-publishes an existing build's artifacts without rebuilding. Use this when
+# the Build workflow's release job failed after the artifacts were produced, or
+# to verify a publishing change against a build that already exists.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build workflow run ID that produced the artifacts
+        required: true
+      git_ref:
+        description: Publishing ref (refs/heads/alpha, refs/heads/beta, or refs/tags/v<version>)
+        required: true
+      git_sha:
+        description: Build commit SHA (required for alpha/beta refs)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    name: Publish existing artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: b2-${{ inputs.git_ref }}
+      cancel-in-progress: false
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.B2_REGION }}
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+      B2_PUBLIC_BASE_URL: ${{ secrets.B2_PUBLIC_BASE_URL }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_MAX_ATTEMPTS: "5"
+      AWS_RETRY_MODE: standard
+      PUBLISH_GIT_REF: ${{ inputs.git_ref }}
+      PUBLISH_GIT_SHA: ${{ inputs.git_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts/
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      # Keep the S3 client and concurrency identical to the Build workflow.
+      - name: Configure S3 transfer client
+        run: |
+          mkdir -p "$HOME/.aws"
+          printf '[default]\ns3 =\n  preferred_transfer_client = classic\n  max_concurrent_requests = 4\n' > "$HOME/.aws/config"
+          aws --version
+      - name: Publish verified binaries then metadata
+        run: python3 scripts/publish_updates.py

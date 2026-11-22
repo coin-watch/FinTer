@@ -10,6 +10,8 @@ The included GitHub Actions workflow builds and tests platform binaries. On push
 
 Alpha/beta builds stage under `<channel>/<sha>/` and update `<channel>/version.json`, pruning obsolete builds. Tagged releases stage under `releases/v<version>/` and update `latest/version.json`. When the optional Linux GPG signing secrets are configured, detached `.asc` signatures are published next to the raw binaries and listed in the `signatures` map of `version.json`.
 
+Publishing is idempotent: a binary that is already present with the expected size is skipped, transient storage errors are retried with backoff, and the workflow pins the AWS CLI's classic S3 transfer client with reduced concurrency because the CRT transfer client is unreliable against B2. If a publish fails after the build succeeded, re-run it without rebuilding through the **Publish** workflow (`workflow_dispatch`): supply the build run ID, the publishing ref (`refs/heads/alpha`, `refs/heads/beta`, or `refs/tags/v<version>`), and the build commit SHA for branch publishes.
+
 CI embeds the matching metadata endpoint in each binary automatically: `alpha` → `https://data.coinwat.ch/alpha/version.json`, `beta` → `https://data.coinwat.ch/beta/version.json`, and `v*` tags → `https://data.coinwat.ch/latest/version.json`. Pull-request builds leave update checks disabled. Local builds can opt in at build or run time with `FINTER_VERSION_URL`.
 
 Required GitHub Actions secrets:

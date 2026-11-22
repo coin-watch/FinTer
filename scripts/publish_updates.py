@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 import tomllib
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -17,6 +18,20 @@ PUBLIC_USER_AGENT = "FinTer-Publisher/1.0"
 
 def open_public(url: str):
     return urlopen(Request(url, headers={"User-Agent": PUBLIC_USER_AGENT}), timeout=120)
+
+
+def retry(operation, description: str, attempts: int = 3, delay: float = 2.0, sleep=time.sleep):
+    """Run an operation, retrying transient failures with exponential backoff."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except RuntimeError as error:
+            if attempt == attempts:
+                raise
+            wait = delay * (2 ** (attempt - 1))
+            print(f"{description} failed (attempt {attempt}/{attempts}): {error}", flush=True)
+            print(f"Retrying in {wait:g}s", flush=True)
+            sleep(wait)
 
 
 PLATFORMS = {
@@ -34,6 +49,17 @@ def obsolete_versions(versions: list[dict], channel: str, current_prefix: str) -
         (item["Key"] != f"{channel}/version.json" and not item["Key"].startswith(f"{current_prefix}/"))
         or not item["IsLatest"]
     )]
+
+
+def publishing_target(environ):
+    """Return the ref/sha to publish, allowing explicit overrides for republishes."""
+    if environ.get("PUBLISH_GIT_REF"):
+        ref = environ["PUBLISH_GIT_REF"]
+        sha = environ.get("PUBLISH_GIT_SHA", "")
+        if not sha and not ref.startswith("refs/tags/"):
+            raise ValueError("PUBLISH_GIT_SHA is required when PUBLISH_GIT_REF is a branch")
+        return ref, sha
+    return environ["GITHUB_REF"], environ["GITHUB_SHA"]
 
 
 def prepare(root: Path, base_url: str, git_ref: str, git_sha: str):
@@ -90,32 +116,71 @@ def main():
     if missing:
         raise ValueError(f"Missing workflow values: {', '.join(missing)}")
     root = Path.cwd()
-    metadata, files, prefix, channel = prepare(root, os.environ["B2_PUBLIC_BASE_URL"], os.environ["GITHUB_REF"], os.environ["GITHUB_SHA"])
+    git_ref, git_sha = publishing_target(os.environ)
+    metadata, files, prefix, channel = prepare(root, os.environ["B2_PUBLIC_BASE_URL"], git_ref, git_sha)
+
+    version = subprocess.run(["aws", "--version"], capture_output=True, text=True)
+    if version.returncode == 0:
+        print((version.stdout or version.stderr).strip(), flush=True)
 
     def aws(*args):
-        return subprocess.run(
-            ["aws", "--endpoint-url", os.environ["B2_ENDPOINT"], *args],
-            check=True,
+        command = ["aws", "--endpoint-url", os.environ["B2_ENDPOINT"], *args]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"`{' '.join(command)}` exited {result.returncode}: {detail}")
+        if result.stderr.strip():
+            print(result.stderr.strip(), flush=True)
+        return result
+
+    def remote_size(key: str):
+        """Return the published object size, or None when it is not present."""
+        result = subprocess.run(
+            ["aws", "--endpoint-url", os.environ["B2_ENDPOINT"], "s3api", "head-object",
+             "--bucket", os.environ["B2_BUCKET"], "--key", key],
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            return None
+        try:
+            return int(json.loads(result.stdout)["ContentLength"])
+        except (ValueError, TypeError, KeyError):
+            return None
 
     def upload(path: Path, key: str, metadata_file=False):
-        aws(
-            "s3", "cp", str(path), f"s3://{os.environ['B2_BUCKET']}/{key}", "--only-show-errors",
-            "--cache-control", "no-cache" if metadata_file else "public,max-age=31536000,immutable",
-            "--content-type", "application/json" if metadata_file else "application/octet-stream",
+        size = path.stat().st_size
+        # Object keys are immutable per build, so a file that is already present
+        # with the expected size was published by an earlier (possibly partial)
+        # run. The post-upload checksum verification still guards the content.
+        if not metadata_file and remote_size(key) == size:
+            print(f"Skipping {key}: already published ({size} bytes)", flush=True)
+            return
+        retry(
+            lambda: aws(
+                "s3", "cp", str(path), f"s3://{os.environ['B2_BUCKET']}/{key}", "--only-show-errors",
+                "--cache-control", "no-cache" if metadata_file else "public,max-age=31536000,immutable",
+                "--content-type", "application/json" if metadata_file else "application/octet-stream",
+            ),
+            f"Uploading {key} ({size} bytes)",
         )
+        print(f"Uploaded {key}", flush=True)
 
     def prune_channel():
-        listing = json.loads(aws(
-            "s3api", "list-object-versions", "--bucket", os.environ["B2_BUCKET"],
-            "--prefix", f"{channel}/", "--output", "json",
+        listing = json.loads(retry(
+            lambda: aws(
+                "s3api", "list-object-versions", "--bucket", os.environ["B2_BUCKET"],
+                "--prefix", f"{channel}/", "--output", "json",
+            ),
+            "Listing channel versions",
         ).stdout)
         versions = listing.get("Versions", []) + listing.get("DeleteMarkers", [])
         for item in obsolete_versions(versions, channel, prefix):
-            aws("s3api", "delete-object", "--bucket", os.environ["B2_BUCKET"],
-                "--key", item["Key"], "--version-id", item["VersionId"])
+            retry(
+                lambda: aws("s3api", "delete-object", "--bucket", os.environ["B2_BUCKET"],
+                            "--key", item["Key"], "--version-id", item["VersionId"]),
+                f"Deleting {item['Key']} ({item['VersionId']})",
+            )
 
     for path, key in files:
         upload(path, key)

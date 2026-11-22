@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
-from publish_updates import open_public, prepare, obsolete_versions, PLATFORMS
+from publish_updates import open_public, prepare, obsolete_versions, publishing_target, retry, PLATFORMS
 
 
 class Response:
@@ -59,4 +59,38 @@ versions = [
 ]
 assert [item["VersionId"] for item in obsolete_versions(versions, "alpha", "alpha/bbb")] == ["old-meta", "old-build", "old-file"]
 assert obsolete_versions(versions, "beta", "beta/ccc") == []
-print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, signatures, pruning")
+
+# retry: a transient failure is retried with exponential backoff, then succeeds.
+calls = []
+sleeps = []
+def flaky():
+    calls.append(1)
+    if len(calls) < 2:
+        raise RuntimeError("503 SlowDown")
+    return "ok"
+assert retry(flaky, "Uploading test", attempts=3, sleep=sleeps.append) == "ok"
+assert calls == [1, 1] and sleeps == [2.0]
+
+# retry: a permanent failure is surfaced after the attempts are exhausted.
+def broken():
+    raise RuntimeError("403 AccessDenied")
+try:
+    retry(broken, "Uploading test", attempts=3, sleep=lambda _: None)
+except RuntimeError as error:
+    assert "403 AccessDenied" in str(error)
+else:
+    raise AssertionError("Permanent failure was swallowed")
+
+# publishing_target: GitHub values by default, explicit overrides for republishes.
+assert publishing_target({"GITHUB_REF": "refs/heads/alpha", "GITHUB_SHA": "b" * 40}) == ("refs/heads/alpha", "b" * 40)
+assert publishing_target({"PUBLISH_GIT_REF": "refs/heads/alpha", "PUBLISH_GIT_SHA": "c" * 40,
+                          "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": "d" * 40}) == ("refs/heads/alpha", "c" * 40)
+assert publishing_target({"PUBLISH_GIT_REF": "refs/tags/v0.2.0"}) == ("refs/tags/v0.2.0", "")
+try:
+    publishing_target({"PUBLISH_GIT_REF": "refs/heads/alpha"})
+except ValueError as error:
+    assert "PUBLISH_GIT_SHA" in str(error)
+else:
+    raise AssertionError("Branch republish without a SHA was accepted")
+
+print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, signatures, pruning, retries, republish targets")

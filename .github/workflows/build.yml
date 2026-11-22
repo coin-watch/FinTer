@@ -555,6 +555,8 @@ jobs:
       B2_PUBLIC_BASE_URL: ${{ secrets.B2_PUBLIC_BASE_URL }}
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
       AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      AWS_MAX_ATTEMPTS: "5"
+      AWS_RETRY_MODE: standard
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -562,5 +564,14 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts/
+      # AWS CLI >= 2.38 hands `aws s3 cp` to the CRT transfer client by default.
+      # Its multipart behaviour and concurrency differ from the classic client and
+      # are known to be fragile against S3-compatible stores such as B2, so pin
+      # the client the workflow was validated against and keep concurrency low.
+      - name: Configure S3 transfer client
+        run: |
+          mkdir -p "$HOME/.aws"
+          printf '[default]\ns3 =\n  preferred_transfer_client = classic\n  max_concurrent_requests = 4\n' > "$HOME/.aws/config"
+          aws --version
       - name: Publish verified binaries then metadata
         run: python3 scripts/publish_updates.py
