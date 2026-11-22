@@ -9,11 +9,15 @@ import subprocess
 import tempfile
 import time
 import tomllib
+from urllib import error as urlerror
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
 PUBLIC_USER_AGENT = "FinTer-Publisher/1.0"
+
+# B2 accepts single PutObject uploads up to 5 GB; larger objects need multipart.
+SINGLE_PUT_LIMIT = 5 * 1024 ** 3
 
 
 def open_public(url: str):
@@ -32,6 +36,23 @@ def retry(operation, description: str, attempts: int = 3, delay: float = 2.0, sl
             print(f"{description} failed (attempt {attempt}/{attempts}): {error}", flush=True)
             print(f"Retrying in {wait:g}s", flush=True)
             sleep(wait)
+
+
+def upload_command(size: int, path: Path, bucket: str, key: str, metadata_file: bool) -> list[str]:
+    """Build the aws CLI arguments that upload one file to B2."""
+    cache_control = "no-cache" if metadata_file else "public,max-age=31536000,immutable"
+    content_type = "application/json" if metadata_file else "application/octet-stream"
+    if size <= SINGLE_PUT_LIMIT:
+        # A single PutObject avoids the multipart and transfer-manager code paths
+        # that have intermittently reported success without publishing the object.
+        return [
+            "s3api", "put-object", "--bucket", bucket, "--key", key, "--body", str(path),
+            "--cache-control", cache_control, "--content-type", content_type,
+        ]
+    return [
+        "s3", "cp", str(path), f"s3://{bucket}/{key}", "--only-show-errors",
+        "--cache-control", cache_control, "--content-type", content_type,
+    ]
 
 
 PLATFORMS = {
@@ -133,8 +154,8 @@ def main():
             print(result.stderr.strip(), flush=True)
         return result
 
-    def remote_size(key: str):
-        """Return the published object size, or None when it is not present."""
+    def object_size(key: str):
+        """Return (known, size); known is False when the lookup itself failed."""
         result = subprocess.run(
             ["aws", "--endpoint-url", os.environ["B2_ENDPOINT"], "s3api", "head-object",
              "--bucket", os.environ["B2_BUCKET"], "--key", key],
@@ -142,29 +163,70 @@ def main():
             text=True,
         )
         if result.returncode != 0:
-            return None
+            detail = result.stderr.strip()
+            if "(404)" in detail or "Not Found" in detail or "NoSuchKey" in detail:
+                return True, None
+            print(f"Could not inspect {key}: {detail}", flush=True)
+            return False, None
         try:
-            return int(json.loads(result.stdout)["ContentLength"])
+            return True, int(json.loads(result.stdout)["ContentLength"])
         except (ValueError, TypeError, KeyError):
-            return None
+            return False, None
 
     def upload(path: Path, key: str, metadata_file=False):
         size = path.stat().st_size
         # Object keys are immutable per build, so a file that is already present
         # with the expected size was published by an earlier (possibly partial)
         # run. The post-upload checksum verification still guards the content.
-        if not metadata_file and remote_size(key) == size:
-            print(f"Skipping {key}: already published ({size} bytes)", flush=True)
+        if not metadata_file:
+            known, published = object_size(key)
+            if known and published == size:
+                print(f"Skipping {key}: already published ({size} bytes)", flush=True)
+                return
+
+        def publish():
+            aws(*upload_command(size, path, os.environ["B2_BUCKET"], key, metadata_file))
+            known, published = object_size(key)
+            if known and published != size:
+                raise RuntimeError(f"object is {published!r} bytes after upload, expected {size}")
+
+        retry(publish, f"Uploading {key} ({size} bytes)")
+        print(f"Uploaded {key} ({size} bytes)", flush=True)
+
+    def dump_prefix():
+        try:
+            listing = json.loads(aws(
+                "s3api", "list-objects-v2", "--bucket", os.environ["B2_BUCKET"],
+                "--prefix", f"{prefix}/", "--output", "json",
+            ).stdout).get("Contents", [])
+        except (RuntimeError, ValueError) as error:
+            print(f"Could not list {prefix}/: {error}", flush=True)
             return
-        retry(
-            lambda: aws(
-                "s3", "cp", str(path), f"s3://{os.environ['B2_BUCKET']}/{key}", "--only-show-errors",
-                "--cache-control", "no-cache" if metadata_file else "public,max-age=31536000,immutable",
-                "--content-type", "application/json" if metadata_file else "application/octet-stream",
-            ),
-            f"Uploading {key} ({size} bytes)",
-        )
-        print(f"Uploaded {key}", flush=True)
+        print(f"Objects published under {prefix}/:", flush=True)
+        for item in listing:
+            print(f"  {item['Key']} ({item['Size']} bytes)", flush=True)
+
+    def verify_public(metadata):
+        for platform, url in metadata["downloads"].items():
+            expected = metadata["checksums"][platform]
+            for attempt in range(1, 4):
+                try:
+                    with open_public(url) as response:
+                        digest = hashlib.file_digest(response, "sha256").hexdigest()
+                except (urlerror.URLError, OSError) as error:
+                    failure = error
+                else:
+                    if digest != expected:
+                        raise ValueError(f"Public checksum mismatch: {platform} ({url})")
+                    print(f"Verified {platform}: {url}", flush=True)
+                    break
+                if attempt == 3:
+                    dump_prefix()
+                    raise RuntimeError(f"Public verification failed for {platform} ({url}): {failure}")
+                wait = 3 * attempt
+                print(f"Verifying {platform} failed (attempt {attempt}/3): {failure}", flush=True)
+                print(f"Retrying in {wait}s", flush=True)
+                time.sleep(wait)
 
     def prune_channel():
         listing = json.loads(retry(
@@ -184,10 +246,7 @@ def main():
 
     for path, key in files:
         upload(path, key)
-    for platform, url in metadata["downloads"].items():
-        with open_public(url) as response:
-            if hashlib.file_digest(response, "sha256").hexdigest() != metadata["checksums"][platform]:
-                raise ValueError(f"Public checksum mismatch: {platform}")
+    verify_public(metadata)
     with tempfile.TemporaryDirectory() as directory:
         metadata_path = Path(directory) / "version.json"
         metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")

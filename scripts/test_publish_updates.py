@@ -3,7 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
-from publish_updates import open_public, prepare, obsolete_versions, publishing_target, retry, PLATFORMS
+from publish_updates import open_public, prepare, obsolete_versions, publishing_target, retry, upload_command, PLATFORMS, SINGLE_PUT_LIMIT
 
 
 class Response:
@@ -93,4 +93,15 @@ except ValueError as error:
 else:
     raise AssertionError("Branch republish without a SHA was accepted")
 
-print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, signatures, pruning, retries, republish targets")
+# upload_command: single PutObject for normal artifacts, multipart above the B2 limit.
+binary = Path("finter-windows.exe")
+command = upload_command(300 * 1024 ** 2, binary, "bucket", "alpha/build/finter-windows.exe", False)
+assert command[:2] == ["s3api", "put-object"]
+assert "application/octet-stream" in command and "public,max-age=31536000,immutable" in command
+metadata_command = upload_command(512, Path("version.json"), "bucket", "alpha/version.json", True)
+assert metadata_command[:2] == ["s3api", "put-object"]
+assert "application/json" in metadata_command and "no-cache" in metadata_command
+huge = upload_command(SINGLE_PUT_LIMIT + 1, binary, "bucket", "key", False)
+assert huge[:2] == ["s3", "cp"] and "s3://bucket/key" in huge
+
+print("Publication checks passed: alpha, beta, tag, HTTPS, version mismatch, checksum mismatch, signatures, pruning, retries, republish targets, upload commands")
