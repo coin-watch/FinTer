@@ -508,7 +508,7 @@ impl ChartPanel {
     /// Footprint rows need enough horizontal space for numeric cells.
     fn ensure_footprint_density(&mut self) {
         let available = (self.pane_width - 70.0).max(240.0);
-        let target = (available / 54.0).floor().clamp(16.0, 40.0) as usize;
+        let target = (available / 54.0).floor().clamp(12.0, 40.0) as usize;
         if self.chart_state.visible_count > target {
             self.chart_state.visible_count = target;
         }

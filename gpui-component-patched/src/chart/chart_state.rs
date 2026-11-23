@@ -81,7 +81,7 @@ pub struct ChartOverlayHitbox {
 }
 
 /// Fewest candles that can be shown at maximum zoom-in.
-pub const MIN_VISIBLE: usize = 20;
+pub const MIN_VISIBLE: usize = 12;
 /// Most candles that can be shown at maximum zoom-out.
 pub const MAX_VISIBLE: usize = 300;
 /// Default number of visible candles.
