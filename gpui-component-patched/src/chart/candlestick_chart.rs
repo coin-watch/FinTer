@@ -114,6 +114,9 @@ pub struct AlertOverlaySpec {
 const VOLUME_GAP: f32 = 4.;
 /// Font size used for tooltips and axis labels.
 const TIP_FONT: f32 = 10.;
+/// Estimated character width for footprint cell text fitting. The actual
+/// shaped width is used by GPUI, but this keeps the two-column decision cheap.
+const FOOTPRINT_CHAR_WIDTH: f32 = 5.4;
 /// Estimated character width at TIP_FONT size, used for dynamic Y-axis sizing.
 const CHAR_WIDTH_EST: f32 = 6.0;
 /// Minimum Y-axis label area width.
@@ -914,10 +917,10 @@ where
 
                 let cell_h = (bottom - top).as_f32();
                 let text_y = top + px((cell_h - TIP_FONT).max(0.0) * 0.5);
-                let left_w = cell.left_text.len() as f32 * CHAR_WIDTH_EST;
-                let right_w = cell.right_text.len() as f32 * CHAR_WIDTH_EST;
-                let single_w = cell.single_text.len() as f32 * CHAR_WIDTH_EST;
-                let gap = 4.0;
+                let left_w = cell.left_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
+                let right_w = cell.right_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
+                let single_w = cell.single_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
+                let gap = 3.0;
                 let show_two = !cell.left_text.is_empty()
                     && !cell.right_text.is_empty()
                     && left_w + right_w + gap <= cell_w;
