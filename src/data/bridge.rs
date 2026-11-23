@@ -998,7 +998,7 @@ async fn connect_and_stream(
             requirement: Requirement::Profile {
                 exchange: &config.exchange,
                 symbol: &config.symbol,
-                timeframe: "session",
+                timeframe: &config.timeframe,
                 mode: "session",
             },
         };
