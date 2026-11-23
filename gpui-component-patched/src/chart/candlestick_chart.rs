@@ -33,6 +33,15 @@ pub struct PositionOverlaySpec {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HeatmapCellSpec {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub price_low: f64,
+    pub price_high: f64,
+    pub color: Hsla,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FootprintCellSpec {
     pub timestamp_ms: i64,
     pub price_low: f64,
@@ -186,6 +195,8 @@ where
     profile_bars: Vec<ProfileBarSpec>,
     /// Optional POC/VAH/VAL profile lines.
     profile_lines: Vec<ProfileLineSpec>,
+    /// Optional resting-liquidity heatmap cells.
+    heatmap_cells: Vec<HeatmapCellSpec>,
     /// Optional bid x ask footprint cells.
     footprint_cells: Vec<FootprintCellSpec>,
 }
@@ -223,6 +234,7 @@ where
             alert_overlays: Vec::new(),
             profile_bars: Vec::new(),
             profile_lines: Vec::new(),
+            heatmap_cells: Vec::new(),
             footprint_cells: Vec::new(),
         }
     }
@@ -369,6 +381,11 @@ where
 
     pub fn profile_lines(mut self, lines: Vec<ProfileLineSpec>) -> Self {
         self.profile_lines = lines;
+        self
+    }
+
+    pub fn heatmap_cells(mut self, cells: Vec<HeatmapCellSpec>) -> Self {
+        self.heatmap_cells = cells;
         self
     }
 
@@ -745,6 +762,32 @@ where
         let crosshair_bg = cx.theme().foreground;
         let crosshair_fg = cx.theme().background;
         let candle_type = self.candle_type;
+
+        // Resting-liquidity heatmap, behind profile/candles.
+        if !self.heatmap_cells.is_empty() {
+            let heat_first = *timestamps.first().unwrap_or(&0) as f64;
+            let heat_last = *timestamps.last().unwrap_or(&0) as f64;
+            let heat_span = (heat_last - heat_first).max(1.0);
+            for cell in &self.heatmap_cells {
+                if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
+                    continue;
+                }
+                let x0 = chart_w * ((cell.start_ms as f64 - heat_first) / heat_span) as f32;
+                let x1 = chart_w * ((cell.end_ms as f64 - heat_first) / heat_span) as f32;
+                if x1 < 0.0 || x0 > chart_w {
+                    continue;
+                }
+                let x0 = x0.clamp(0.0, chart_w);
+                let x1 = x1.clamp(0.0, chart_w).max(x0 + 1.0);
+                let y_top = origin.y + px(y_scale.scale(cell.price_high));
+                let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
+                let bounds = Bounds::from_corners(
+                    gpui::point(origin.x + px(x0), y_top.min(y_bottom)),
+                    gpui::point(origin.x + px(x1), y_top.max(y_bottom)),
+                );
+                window.paint_quad(fill(bounds, cell.color));
+            }
+        }
 
         // Right-aligned volume profile. Drawn before candles so price action
         // remains readable through the translucent bars.

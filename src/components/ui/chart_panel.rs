@@ -41,8 +41,8 @@ use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::Selectable;
 use gpui_component::chart::{
     AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
-    FootprintCellSpec, IndicatorStyle, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
-    ProfileBarSpec, ProfileLineSpec,
+    FootprintCellSpec, HeatmapCellSpec, IndicatorStyle, OrderOverlaySpec, PaneTarget,
+    PositionOverlaySpec, ProfileBarSpec, ProfileLineSpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
@@ -60,6 +60,7 @@ use crate::chart::drawings::{
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
+use crate::data::liquidity_feed::{LiquidityFeed, LiquiditySnapshot};
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
 use crate::data::orderflow_feed::{OrderFlowFeed, OrderFlowSnapshot};
 use crate::data::price_format::format_price;
@@ -145,6 +146,10 @@ pub struct ChartPanel {
     show_profile: bool,
     /// Render the chart as a bid x ask footprint.
     show_footprint: bool,
+    /// Optional book-history feed for the liquidity heatmap.
+    liquidity_feed: Option<LiquidityFeed>,
+    /// Show resting-liquidity bands behind candles.
+    show_liquidity: bool,
 
     // Parameterized Indicators
     pub indicators: Vec<IndicatorInstance>,
@@ -317,6 +322,8 @@ impl ChartPanel {
             show_delta: true,
             show_profile: false,
             show_footprint: false,
+            liquidity_feed: None,
+            show_liquidity: false,
 
             // Parameterized indicators & cache
             indicators: Vec::new(),
@@ -381,18 +388,47 @@ impl ChartPanel {
         cx.spawn(async move |this, cx| {
             let mut last = u64::MAX;
             loop {
-                let changed = this
+                let failed = this
                     .update(cx, |panel, cx| {
                         let current = version.load(std::sync::atomic::Ordering::Relaxed);
                         if current != last {
                             last = current;
-                            if panel.show_delta {
+                            if panel.show_delta || panel.show_footprint {
                                 cx.notify();
                             }
                         }
                     })
                     .is_err();
-                if changed {
+                if failed {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Attach the order-book history feed for the liquidity heatmap.
+    pub fn set_liquidity_feed(&mut self, feed: LiquidityFeed, cx: &mut Context<Self>) {
+        let version = feed.version_handle();
+        self.liquidity_feed = Some(feed);
+        cx.spawn(async move |this, cx| {
+            let mut last = u64::MAX;
+            loop {
+                let failed = this
+                    .update(cx, |panel, cx| {
+                        let current = version.load(std::sync::atomic::Ordering::Relaxed);
+                        if current != last {
+                            last = current;
+                            if panel.show_liquidity {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .is_err();
+                if failed {
                     break;
                 }
                 cx.background_executor()
@@ -509,6 +545,7 @@ impl ChartPanel {
         self.show_delta = layout.show_delta;
         self.show_profile = layout.show_profile;
         self.show_footprint = layout.show_footprint;
+        self.show_liquidity = layout.show_liquidity;
         if let Some(geom) = layout.library_geometry {
             self.library_x = geom.x;
             self.library_y = geom.y;
@@ -533,6 +570,7 @@ impl ChartPanel {
         layout.show_delta = self.show_delta;
         layout.show_profile = self.show_profile;
         layout.show_footprint = self.show_footprint;
+        layout.show_liquidity = self.show_liquidity;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
@@ -937,6 +975,94 @@ impl ChartPanel {
         cells
     }
 
+    fn compute_liquidity_cells(
+        &self,
+        candles: &[OhlcvCandle],
+        liquidity: Option<&LiquiditySnapshot>,
+        color: gpui::Hsla,
+    ) -> Vec<HeatmapCellSpec> {
+        if !self.show_liquidity {
+            return Vec::new();
+        }
+        let Some(liquidity) = liquidity else {
+            return Vec::new();
+        };
+        if liquidity.samples.is_empty() || candles.is_empty() {
+            return Vec::new();
+        }
+
+        let visible_candles = &candles[candles.len().saturating_sub(120)..];
+        let first_ts = visible_candles.first().map(|c| c.timestamp).unwrap_or(0);
+        let last_ts = visible_candles.last().map(|c| c.timestamp).unwrap_or(0);
+        let bar_ms = crate::data::bridge::BridgeConfig::timeframe_to_ms(&self.timeframe).max(1_000);
+        let end_ts = last_ts + bar_ms;
+        let mut min_price = f64::INFINITY;
+        let mut max_price = f64::NEG_INFINITY;
+        for candle in visible_candles {
+            min_price = min_price.min(candle.low);
+            max_price = max_price.max(candle.high);
+        }
+        if !min_price.is_finite() || !max_price.is_finite() || max_price <= min_price {
+            return Vec::new();
+        }
+
+        const ROWS: usize = 30;
+        let step = (max_price - min_price) / ROWS as f64;
+        let max_level = liquidity
+            .samples
+            .iter()
+            .flat_map(|sample| sample.levels.iter())
+            .map(|level| level.quantity)
+            .fold(0.0, f64::max);
+        if step <= 0.0 || max_level <= 0.0 {
+            return Vec::new();
+        }
+
+        let samples: Vec<&crate::data::liquidity_feed::LiquiditySample> = liquidity
+            .samples
+            .iter()
+            .rev()
+            .take(120)
+            .rev()
+            .collect();
+        if samples.is_empty() {
+            return Vec::new();
+        }
+
+        let mut cells = Vec::new();
+        for (index, sample) in samples.iter().enumerate() {
+            if sample.timestamp_ms < first_ts || sample.timestamp_ms > end_ts {
+                continue;
+            }
+            let next_ts = samples
+                .get(index + 1)
+                .map(|next| next.timestamp_ms)
+                .unwrap_or(end_ts);
+            let start_ms = sample.timestamp_ms.max(first_ts);
+            let end_ms = next_ts.min(end_ts).max(start_ms + 1);
+            let mut buckets = vec![0.0f64; ROWS];
+            for level in &sample.levels {
+                let idx = (((level.price - min_price) / step).floor() as isize)
+                    .clamp(0, ROWS as isize - 1) as usize;
+                buckets[idx] += level.quantity;
+            }
+            for (idx, quantity) in buckets.into_iter().enumerate() {
+                if quantity <= 0.0 {
+                    continue;
+                }
+                let alpha = 0.04 + 0.24 * (quantity / max_level).clamp(0.0, 1.0);
+                cells.push(HeatmapCellSpec {
+                    start_ms,
+                    end_ms,
+                    price_low: min_price + step * idx as f64,
+                    price_high: min_price + step * (idx + 1) as f64,
+                    color: color.opacity(alpha as f32),
+                });
+            }
+        }
+        cells
+    }
+
     fn compute_profile_bars(
         &self,
         candles: &[OhlcvCandle],
@@ -1164,6 +1290,10 @@ impl Render for ChartPanel {
             .orderflow_feed
             .as_ref()
             .map(|feed| feed.snapshot());
+        let liquidity_snapshot = self
+            .liquidity_feed
+            .as_ref()
+            .map(|feed| feed.snapshot_with_version().1);
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
         if current_oldest > 0 && current_oldest != self.oldest_loaded_ts {
             if self.oldest_loaded_ts > 0 {
@@ -1331,6 +1461,11 @@ impl Render for ChartPanel {
             cx.theme().bullish,
             cx.theme().bearish,
             cx.theme().colors.foreground,
+        );
+        let heatmap_cells = self.compute_liquidity_cells(
+            &candles,
+            liquidity_snapshot.as_ref(),
+            cx.theme().primary,
         );
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
@@ -2013,6 +2148,7 @@ impl Render for ChartPanel {
             .volume(|c: &OhlcvCandle| c.volume)
             .profile_bars(profile_bars)
             .profile_lines(profile_lines)
+            .heatmap_cells(heatmap_cells)
             .footprint_cells(footprint_cells)
             .format_timestamp_short({
                 let timezone = self.timezone.clone();
@@ -2860,6 +2996,11 @@ impl Render for ChartPanel {
                         this.mark_dirty();
                         cx.notify();
                     }
+                    "h" => {
+                        this.show_liquidity = !this.show_liquidity;
+                        this.mark_dirty();
+                        cx.notify();
+                    }
                     "l" => {
                         let total = this.feed.len();
                         this.chart_state.scroll_to_latest(total);
@@ -3028,6 +3169,20 @@ impl ChartPanel {
         .tooltip("Bid x ask footprint")
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.show_footprint = !this.show_footprint;
+            this.mark_dirty();
+            cx.notify();
+        }));
+
+        let liquidity = toolbar_button(
+            "toolbar_btn_liquidity",
+            "icons/panel-bottom-open.svg",
+            "Liquidity",
+        )
+        .selected(self.show_liquidity)
+        .when(self.show_liquidity, |button| button.bg(active_bg).text_color(active_fg))
+        .tooltip("Resting liquidity heatmap")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_liquidity = !this.show_liquidity;
             this.mark_dirty();
             cx.notify();
         }));
@@ -3462,6 +3617,7 @@ impl ChartPanel {
                     .child(orderflow)
                     .child(profile)
                     .child(footprint)
+                    .child(liquidity)
                     .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(drawing_button(None, "toolbar_pointer", "icons/mouse-pointer.svg", "Pointer"))
                     .when(!is_ultra_compact, |this| {

@@ -16,6 +16,7 @@ pub mod file_control;
 pub mod gateway_registry;
 pub mod indicators;
 pub mod layout_workspace;
+pub mod liquidity_feed;
 pub mod models;
 pub mod modules;
 pub mod orderbook;

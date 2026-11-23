@@ -43,6 +43,9 @@ pub struct ChartLayout {
     /// Render the chart as a bid x ask footprint.
     #[serde(default)]
     pub show_footprint: bool,
+    /// Show resting-liquidity bands behind candles.
+    #[serde(default)]
+    pub show_liquidity: bool,
 }
 
 fn default_show_delta() -> bool {
@@ -70,6 +73,7 @@ impl ChartLayout {
             show_delta: true,
             show_profile: false,
             show_footprint: false,
+            show_liquidity: false,
         }
     }
 }

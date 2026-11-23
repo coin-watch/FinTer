@@ -213,6 +213,8 @@ pub struct BridgeConfig {
     pub trade_limit: u32,
     /// Request the trade snapshot from the current bar's open when connecting.
     pub trade_since_current_bar: bool,
+    /// Order-book depth requested at subscribe time.
+    pub orderbook_depth: u32,
 }
 
 impl BridgeConfig {
@@ -232,6 +234,7 @@ impl BridgeConfig {
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
+            orderbook_depth: 20,
         }
     }
 
@@ -876,7 +879,7 @@ async fn connect_and_stream(
             requirement: Requirement::Orderbook {
                 exchange: &config.exchange,
                 symbol: &config.symbol,
-                depth: 20,
+                depth: config.orderbook_depth,
             },
         };
         write
@@ -1854,6 +1857,7 @@ mod tests {
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
+            orderbook_depth: 20,
         }
     }
 
