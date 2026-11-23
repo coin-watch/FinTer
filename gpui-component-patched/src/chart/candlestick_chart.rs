@@ -62,6 +62,10 @@ pub struct FootprintCellSpec {
     /// `1` = bid imbalance, `-1` = ask imbalance, `0` = none.
     pub imbalance: i8,
     pub is_live: bool,
+    pub is_hovered: bool,
+    pub is_selected: bool,
+    /// Responsive text size for this cell.
+    pub font_size: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,9 +118,6 @@ pub struct AlertOverlaySpec {
 const VOLUME_GAP: f32 = 4.;
 /// Font size used for tooltips and axis labels.
 const TIP_FONT: f32 = 10.;
-/// Estimated character width for footprint cell text fitting. The actual
-/// shaped width is used by GPUI, but this keeps the two-column decision cheap.
-const FOOTPRINT_CHAR_WIDTH: f32 = 5.4;
 /// Estimated character width at TIP_FONT size, used for dynamic Y-axis sizing.
 const CHAR_WIDTH_EST: f32 = 6.0;
 /// Minimum Y-axis label area width.
@@ -882,6 +883,27 @@ where
                     }
                 }
 
+                if cell.is_selected || cell.is_hovered {
+                    let stroke = if cell.is_selected { 1.5 } else { 1.0 };
+                    let color = if cell.is_selected {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().primary.opacity(0.75)
+                    };
+                    let mut border = PathBuilder::stroke(px(stroke));
+                    border.move_to(bounds.origin);
+                    border.line_to(gpui::point(bounds.origin.x + bounds.size.width, bounds.origin.y));
+                    border.line_to(gpui::point(
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + bounds.size.height,
+                    ));
+                    border.line_to(gpui::point(bounds.origin.x, bounds.origin.y + bounds.size.height));
+                    border.close();
+                    if let Ok(path) = border.build() {
+                        window.paint_path(path, color);
+                    }
+                }
+
                 if cell.is_vah || cell.is_val {
                     let y = if cell.is_vah {
                         bounds.origin.y
@@ -916,37 +938,45 @@ where
                 }
 
                 let cell_h = (bottom - top).as_f32();
-                let text_y = top + px((cell_h - TIP_FONT).max(0.0) * 0.5);
-                let left_w = cell.left_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
-                let right_w = cell.right_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
-                let single_w = cell.single_text.len() as f32 * FOOTPRINT_CHAR_WIDTH;
+                let font_size = cell.font_size.max(6.0);
+                let text_y = top + px((cell_h - font_size).max(0.0) * 0.5);
+                let char_w = font_size * 0.55;
+                let left_w = cell.left_text.len() as f32 * char_w;
+                let right_w = cell.right_text.len() as f32 * char_w;
+                let single_w = cell.single_text.len() as f32 * char_w;
                 let gap = 3.0;
-                let show_two = !cell.left_text.is_empty()
+                let can_draw_text = cell_h >= font_size + 1.0;
+                let show_two = can_draw_text
+                    && !cell.left_text.is_empty()
                     && !cell.right_text.is_empty()
                     && left_w + right_w + gap <= cell_w;
 
                 if show_two {
-                    paint_text_line(
+                    paint_text_line_sized(
                         cell.left_text.clone(),
                         gpui::point(x_left + px(2.0), text_y),
                         cell.left_color,
-                        bounds,
+                        font_size,
                         window,
                         cx,
                     );
-                    paint_text_line(
+                    paint_text_line_sized(
                         cell.right_text.clone(),
                         gpui::point(x_right - px(right_w + 2.0), text_y),
                         cell.right_color,
-                        bounds,
+                        font_size,
                         window,
                         cx,
                     );
-                } else if !cell.single_text.is_empty() && single_w + gap <= cell_w {
-                    paint_text_line_centered(
+                } else if can_draw_text
+                    && !cell.single_text.is_empty()
+                    && single_w + gap <= cell_w
+                {
+                    paint_text_line_centered_sized(
                         cell.single_text.clone(),
                         cell.single_color,
                         bounds,
+                        font_size,
                         window,
                         cx,
                     );
@@ -2566,6 +2596,74 @@ pub fn paint_text_line_centered(
     cx: &mut App,
 ) {
     let font_size = px(TIP_FONT);
+    let mut font = window.text_style().font();
+    font.weight = gpui::FontWeight::BOLD;
+    let text_run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+
+    if let Ok(shaped) = window
+        .text_system()
+        .shape_text(text, font_size, &[text_run], None, None)
+    {
+        let bottom_right = bounds.corner(Corner::BottomRight);
+        let center_x = (bounds.origin.x + bottom_right.x).as_f32() / 2.0;
+        let center_y = (bounds.origin.y + bottom_right.y).as_f32() / 2.0;
+
+        for line in shaped {
+            let line_size = line.size(font_size);
+            let origin = gpui::point(
+                px(center_x - line_size.width.as_f32() / 2.0),
+                px(center_y - font_size.as_f32() / 2.0),
+            );
+            let _ = line.paint(origin, font_size, TextAlign::Left, None, window, cx);
+        }
+    }
+}
+
+/// Draw a single line of text at a responsive size.
+fn paint_text_line_sized(
+    text: SharedString,
+    origin: gpui::Point<Pixels>,
+    color: Hsla,
+    font_size: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use gpui::TextRun;
+    let font_size = px(font_size.max(6.0));
+    let text_run = TextRun {
+        len: text.len(),
+        font: window.text_style().font(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    if let Ok(shaped) = window
+        .text_system()
+        .shape_text(text, font_size, &[text_run], None, None)
+    {
+        for line in shaped {
+            let _ = line.paint(origin, font_size, TextAlign::Left, None, window, cx);
+        }
+    }
+}
+
+fn paint_text_line_centered_sized(
+    text: SharedString,
+    color: Hsla,
+    bounds: Bounds<Pixels>,
+    font_size: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let font_size = px(font_size.max(6.0));
     let mut font = window.text_style().font();
     font.weight = gpui::FontWeight::BOLD;
     let text_run = gpui::TextRun {

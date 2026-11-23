@@ -2095,7 +2095,9 @@ impl PaneGridRenderer {
                                         // Reuse the live feed; update layout only when the pane actually resizes.
                                         let ent = chart_map.get(&pane_id).unwrap().entity.clone();
                                         if !ent.read(cx).has_size(content_w, content_h) {
-                                            ent.update(cx, |chart, _| chart.set_size(content_w, content_h));
+                                            ent.update(cx, |chart, cx| {
+                                                chart.resize(content_w, content_h, cx)
+                                            });
                                         }
                                         cached_panel(ent)
                                     }

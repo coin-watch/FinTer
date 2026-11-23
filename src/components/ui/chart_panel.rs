@@ -58,6 +58,7 @@ use crate::chart::model::{
 };
 use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid};
 use crate::chart::indicators::{validate_params, IndicatorCache};
+use crate::chart::layout::ChartMetrics;
 use crate::chart::drawings::{
     DrawingInstance, DrawingPoint, DrawingTool, DrawingInteractionState, hit_test_drawings,
 };
@@ -113,6 +114,12 @@ struct IndicatorLineSpec {
     pane: PaneTarget,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FootprintFocus {
+    timestamp: i64,
+    price: f64,
+}
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -152,6 +159,14 @@ pub struct ChartPanel {
     show_footprint: bool,
     /// Footprint mode and analytics settings.
     footprint_settings: FootprintSettings,
+    /// Footprint row under the cursor.
+    hovered_footprint: Option<FootprintFocus>,
+    /// Footprint row pinned by a click.
+    pinned_footprint: Option<FootprintFocus>,
+    /// Press origin used to distinguish a click from a pan.
+    footprint_press: Option<(FootprintFocus, f32, f32)>,
+    /// Latest order-flow snapshot, cached for hover hit-testing.
+    orderflow_cache: Option<OrderFlowSnapshot>,
     /// Optional book-history feed for the liquidity heatmap.
     liquidity_feed: Option<LiquidityFeed>,
     /// Show resting-liquidity bands behind candles.
@@ -359,6 +374,10 @@ impl ChartPanel {
             show_profile: false,
             show_footprint: false,
             footprint_settings: FootprintSettings::default(),
+            hovered_footprint: None,
+            pinned_footprint: None,
+            footprint_press: None,
+            orderflow_cache: None,
             liquidity_feed: None,
             show_liquidity: false,
 
@@ -488,9 +507,24 @@ impl ChartPanel {
 
     /// Footprint rows need enough horizontal space for numeric cells.
     fn ensure_footprint_density(&mut self) {
-        if self.chart_state.visible_count > 20 {
-            self.chart_state.visible_count = 20;
+        let available = (self.pane_width - 70.0).max(240.0);
+        let target = (available / 54.0).floor().clamp(16.0, 40.0) as usize;
+        if self.chart_state.visible_count > target {
+            self.chart_state.visible_count = target;
         }
+    }
+
+    fn chart_metrics(&self) -> ChartMetrics {
+        let (plot_width, plot_height) = self
+            .chart_state
+            .candle_plot_size
+            .get()
+            .unwrap_or_else(|| ((self.pane_width - 64.0).max(80.0), (self.pane_height - 34.0).max(80.0)));
+        ChartMetrics::new(self.pane_width, self.pane_height, plot_width, plot_height)
+    }
+
+    fn settings_panel_width(&self) -> f32 {
+        260.0_f32.min((self.pane_width - 24.0).max(180.0))
     }
 
     fn set_footprint_mode(&mut self, mode: FootprintMode, cx: &mut Context<Self>) {
@@ -546,14 +580,24 @@ impl ChartPanel {
         self.mark_dirty();
     }
 
-    pub fn set_size(&mut self, width: f32, height: f32) {
+    pub fn set_size(&mut self, width: f32, height: f32) -> bool {
         if (self.pane_width - width).abs() < 0.5 && (self.pane_height - height).abs() < 0.5 {
-            return;
+            return false;
         }
         self.pane_width = width;
         self.pane_height = height;
+        self.hovered_footprint = None;
+        self.footprint_press = None;
         // last_chart_width belongs to the measured chart canvas, not the pane.
         // Overwriting it here makes toolbar breakpoints oscillate on live updates.
+        true
+    }
+
+    /// Resize from the pane grid and redraw overlays at the new size.
+    pub fn resize(&mut self, width: f32, height: f32, cx: &mut Context<Self>) {
+        if self.set_size(width, height) {
+            cx.notify();
+        }
     }
 
     pub fn has_size(&self, width: f32, height: f32) -> bool {
@@ -596,7 +640,7 @@ impl ChartPanel {
         }
         if self.active_legend_settings.is_some() {
             if x >= self.settings_panel_x
-                && x <= self.settings_panel_x + 280.0
+                && x <= self.settings_panel_x + self.settings_panel_width()
                 && y >= self.settings_panel_y
                 && y <= self.settings_panel_y + 240.0
             {
@@ -990,6 +1034,7 @@ impl ChartPanel {
             return Vec::new();
         }
         let timestamps: HashSet<i64> = visible.iter().map(|candle| candle.timestamp).collect();
+        let metrics = self.chart_metrics();
 
         let (price_min, price_max) = match self.chart_state.candle_price_range.get() {
             Some((min, max)) if min.is_finite() && max.is_finite() && max > min => (min, max),
@@ -1009,15 +1054,10 @@ impl ChartPanel {
             }
         };
 
-        let plot_h = self
-            .chart_state
-            .candle_plot_size
-            .get()
-            .map(|(_, height)| height)
-            .unwrap_or(self.pane_height * 0.7)
-            .max(120.0);
-        let min_row_h = self.footprint_settings.min_row_height.max(6.0);
-        let max_rows = (plot_h / min_row_h).floor().clamp(12.0, 96.0) as usize;
+        let min_row_h = self.footprint_settings.min_row_height.max(metrics.text_size + 1.0);
+        let max_rows = (metrics.plot_height / min_row_h)
+            .floor()
+            .clamp(10.0, 96.0) as usize;
 
         let grid = build_footprint_grid(&FootprintBuildInput {
             bars: &orderflow.bars,
@@ -1031,6 +1071,8 @@ impl ChartPanel {
             imbalance_ratio: self.footprint_settings.imbalance_ratio,
         });
 
+        let hover_focus = self.hovered_footprint;
+        let pinned_focus = self.pinned_footprint;
         let mut cells = Vec::new();
         for bar in &grid.bars {
             let max_abs_delta = bar
@@ -1058,6 +1100,13 @@ impl ChartPanel {
                     ),
                     FootprintMode::Volume => ("".into(), "".into(), compact_flow(row.volume()).into()),
                 };
+                let is_focus_row = |focus: Option<FootprintFocus>| {
+                    focus.is_some_and(|focus| {
+                        focus.timestamp == bar.timestamp
+                            && focus.price >= row.price_low - 1e-9
+                            && focus.price < row.price_high - 1e-9
+                    })
+                };
                 let single_color = if delta >= 0.0 { bullish } else { bearish };
                 cells.push(FootprintCellSpec {
                     timestamp_ms: bar.timestamp,
@@ -1079,6 +1128,9 @@ impl ChartPanel {
                         0
                     },
                     is_live: !bar.is_closed,
+                    is_hovered: is_focus_row(hover_focus),
+                    is_selected: is_focus_row(pinned_focus),
+                    font_size: metrics.text_size,
                 });
             }
         }
@@ -1116,8 +1168,9 @@ impl ChartPanel {
             return Vec::new();
         }
 
-        const ROWS: usize = 30;
-        let step = (max_price - min_price) / ROWS as f64;
+        let metrics = self.chart_metrics();
+        let rows = metrics.liquidity_rows.max(1);
+        let step = (max_price - min_price) / rows as f64;
         let max_level = liquidity
             .samples
             .iter()
@@ -1150,10 +1203,10 @@ impl ChartPanel {
                 .unwrap_or(end_ts);
             let start_ms = sample.timestamp_ms.max(first_ts);
             let end_ms = next_ts.min(end_ts).max(start_ms + 1);
-            let mut buckets = vec![0.0f64; ROWS];
+            let mut buckets = vec![0.0f64; rows];
             for level in &sample.levels {
                 let idx = (((level.price - min_price) / step).floor() as isize)
-                    .clamp(0, ROWS as isize - 1) as usize;
+                    .clamp(0, rows as isize - 1) as usize;
                 buckets[idx] += level.quantity;
             }
             for (idx, quantity) in buckets.into_iter().enumerate() {
@@ -1188,6 +1241,7 @@ impl ChartPanel {
         if orderflow.bars.is_empty() || candles.is_empty() {
             return (Vec::new(), Vec::new());
         }
+        let metrics = self.chart_metrics();
 
         if !orderflow.profile_rows.is_empty() {
             let max_volume = orderflow
@@ -1205,7 +1259,7 @@ impl ChartPanel {
                         price_high: row.price_high,
                         width_fraction: ((row.buy + row.sell) / max_volume).clamp(0.0, 1.0)
                             as f32
-                            * 0.18,
+                            * metrics.profile_width_fraction,
                         color: color.opacity(0.30)
                     })
                     .collect();
@@ -1235,17 +1289,17 @@ impl ChartPanel {
             return (Vec::new(), Vec::new());
         }
 
-        const ROWS: usize = 24;
-        let step = (max_price - min_price) / ROWS as f64;
+        let rows = metrics.profile_rows.max(1);
+        let step = (max_price - min_price) / rows as f64;
         if step <= 0.0 {
             return (Vec::new(), Vec::new());
         }
-        let mut volume = vec![0.0f64; ROWS];
-        let mut delta = vec![0.0f64; ROWS];
+        let mut volume = vec![0.0f64; rows];
+        let mut delta = vec![0.0f64; rows];
         for bar in &orderflow.bars {
             for row in &bar.price_rows {
                 let idx = (((row.price - min_price) / step).floor() as isize)
-                    .clamp(0, ROWS as isize - 1) as usize;
+                    .clamp(0, rows as isize - 1) as usize;
                 volume[idx] += row.volume();
                 delta[idx] += row.delta();
             }
@@ -1261,7 +1315,8 @@ impl ChartPanel {
             .enumerate()
             .filter(|(_, value)| **value > 0.0)
             .map(|(idx, value)| {
-                let width = (value / max_volume).clamp(0.0, 1.0) as f32 * 0.18;
+                let width = (value / max_volume).clamp(0.0, 1.0) as f32
+                    * metrics.profile_width_fraction;
                 let bar_color = if delta[idx] >= 0.0 {
                     color.opacity(0.36)
                 } else {
@@ -1283,7 +1338,7 @@ impl ChartPanel {
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        let mut order: Vec<usize> = (0..ROWS).collect();
+        let mut order: Vec<usize> = (0..rows).collect();
         order.sort_by(|&a, &b| volume[b].total_cmp(&volume[a]));
         let target = total_volume * 0.70;
         let mut accumulated = 0.0;
@@ -1434,6 +1489,12 @@ impl Render for ChartPanel {
             .orderflow_feed
             .as_ref()
             .map(|feed| feed.snapshot());
+        self.orderflow_cache = if self.show_footprint {
+            orderflow_snapshot.clone()
+        } else {
+            None
+        };
+        let metrics = self.chart_metrics();
         let liquidity_snapshot = self
             .liquidity_feed
             .as_ref()
@@ -1615,11 +1676,12 @@ impl Render for ChartPanel {
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;
         let mut total_subpane_ratio = 0.0;
-        let mut subpane_ratios = vec![0.18; subpane_count];
+        let default_subpane_ratio = if metrics.plot_height < 280.0 { 0.26 } else { 0.18 };
+        let mut subpane_ratios = vec![default_subpane_ratio; subpane_count];
         {
             let ratios = self.chart_state.subpane_ratios.borrow();
             for i in 0..subpane_count {
-                subpane_ratios[i] = *ratios.get(&i).unwrap_or(&0.18);
+                subpane_ratios[i] = *ratios.get(&i).unwrap_or(&default_subpane_ratio);
                 total_subpane_ratio += subpane_ratios[i];
             }
         }
@@ -1676,7 +1738,7 @@ impl Render for ChartPanel {
                         .flex()
                         .items_center()
                         .gap(px(8.0))
-                        .text_sm()
+                        .text_size(px(metrics.legend_text_size))
                         .id("main_legend_row")
                         .bg(gpui::transparent_black())
                         .on_hover(cx.listener(|this, hovered: &bool, _win, cx| {
@@ -1825,7 +1887,7 @@ impl Render for ChartPanel {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .text_xs()
+                            .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
                             .child(
                                 div()
                                     .text_color(cx.theme().colors.muted_foreground)
@@ -1852,6 +1914,82 @@ impl Render for ChartPanel {
                                     .child(if bar.is_closed { "CLOSED" } else { "LIVE" }),
                             ),
                     );
+                }
+            }
+
+            if self.show_footprint {
+                let focus = self.hovered_footprint.or(self.pinned_footprint);
+                if let Some(focus) = focus {
+                    let found = orderflow_snapshot.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .bars
+                            .iter()
+                            .find(|bar| bar.timestamp == focus.timestamp)
+                            .and_then(|bar| {
+                                bar.price_rows
+                                    .iter()
+                                    .min_by(|a, b| {
+                                        (a.price - focus.price)
+                                            .abs()
+                                            .total_cmp(&(b.price - focus.price).abs())
+                                    })
+                                    .map(|row| (bar, row))
+                            })
+                    });
+                    if let Some((_, row)) = found {
+                        let delta = row.delta();
+                        let delta_color = if delta >= 0.0 {
+                            cx.theme().bullish
+                        } else {
+                            cx.theme().bearish
+                        };
+                        let price = format_price(row.price, precision.as_ref());
+                        let marker = if self.pinned_footprint == Some(focus) {
+                            "PIN"
+                        } else {
+                            "ROW"
+                        };
+                        legend = legend.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(marker),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().colors.foreground)
+                                        .child(price),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().bearish)
+                                        .child(format!("Bid {}", compact_flow(row.sell_volume))),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().bullish)
+                                        .child(format!("Ask {}", compact_flow(row.buy_volume))),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(delta_color)
+                                        .child(format!("Δ {}", compact_delta(delta))),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().colors.muted_foreground)
+                                        .child(format!(
+                                            "T {}",
+                                            row.buy_count + row.sell_count
+                                        )),
+                                ),
+                        );
+                    }
                 }
             }
 
@@ -2241,7 +2379,7 @@ impl Render for ChartPanel {
                 .absolute()
                 .top(px(self.settings_panel_y))
                 .left(px(self.settings_panel_x))
-                .w(px(260.0))
+                .w(px(self.settings_panel_width()))
                 .p(px(10.0))
                 .border_1()
                 .border_color(cx.theme().colors.border)
@@ -2797,6 +2935,7 @@ impl Render for ChartPanel {
                     if this.chart_state.crosshair_pos.is_some() || this.drawing_cursor_point.is_some() {
                         this.chart_state.crosshair_pos = None;
                         this.drawing_cursor_point = None;
+                        this.hovered_footprint = None;
                         cx.notify();
                     }
                 }
@@ -2919,6 +3058,34 @@ impl Render for ChartPanel {
                         timestamp: ts,
                         price: p,
                     });
+
+                    if this.show_footprint {
+                        let focus = this.orderflow_cache.as_ref().and_then(|snapshot| {
+                            snapshot
+                                .bars
+                                .iter()
+                                .find(|bar| bar.timestamp == ts)
+                                .and_then(|bar| {
+                                    let min = bar.price_rows.first()?.price_low;
+                                    let max = bar.price_rows.last()?.price_high;
+                                    if p < min || p > max {
+                                        return None;
+                                    }
+                                    bar.price_rows
+                                        .iter()
+                                        .min_by(|a, b| {
+                                            (a.price - p).abs().total_cmp(&(b.price - p).abs())
+                                        })
+                                        .map(|row| FootprintFocus {
+                                            timestamp: bar.timestamp,
+                                            price: row.price,
+                                        })
+                                })
+                        });
+                        this.hovered_footprint = focus;
+                    } else {
+                        this.hovered_footprint = None;
+                    }
                 }
 
                 this.chart_state.crosshair_pos = Some(pos);
@@ -3058,7 +3225,15 @@ impl Render for ChartPanel {
                         }
                     }
 
-                    // 3. Otherwise hit-test existing drawings
+                    // 3. Footprint click candidate. The actual pin happens on
+                    // mouse-up only when the pointer did not pan.
+                    if this.show_footprint {
+                        this.footprint_press = this
+                            .hovered_footprint
+                            .map(|focus| (focus, pos.x.as_f32(), pos.y.as_f32()));
+                    }
+
+                    // 4. Otherwise hit-test existing drawings
                     let origin = this.chart_state.candle_plot_origin.get();
                     let size = this.chart_state.candle_plot_size.get();
                     let ts_range = this.chart_state.candle_ts_range.get();
@@ -3112,6 +3287,18 @@ impl Render for ChartPanel {
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
                     let pos: Point<Pixels> = ev.position;
+                    if let Some((focus, press_x, press_y)) = this.footprint_press.take() {
+                        let dx = pos.x.as_f32() - press_x;
+                        let dy = pos.y.as_f32() - press_y;
+                        if dx * dx + dy * dy <= 25.0 {
+                            this.pinned_footprint =
+                                if this.pinned_footprint == Some(focus) {
+                                    None
+                                } else {
+                                    Some(focus)
+                                };
+                        }
+                    }
                     if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
                         cx.notify();
                         return;
@@ -3127,6 +3314,7 @@ impl Render for ChartPanel {
                     this.settings_panel_dragging = false;
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
+                    this.footprint_press = None;
                     cx.notify();
                 }),
             )
@@ -3234,6 +3422,7 @@ impl Render for ChartPanel {
                     if this.chart_state.crosshair_pos.is_some() || this.drawing_cursor_point.is_some() {
                         this.chart_state.crosshair_pos = None;
                         this.drawing_cursor_point = None;
+                        this.hovered_footprint = None;
                         cx.notify();
                     }
                 }
