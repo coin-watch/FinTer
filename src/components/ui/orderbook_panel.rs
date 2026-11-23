@@ -38,6 +38,8 @@ pub struct OrderBookPanel {
     focus_handle: FocusHandle,
     width: f32,
     height: f32,
+    /// Number of adjacent book levels merged into one ladder row.
+    group_size: u32,
 }
 
 impl OrderBookPanel {
@@ -81,6 +83,7 @@ impl OrderBookPanel {
             focus_handle: cx.focus_handle(),
             width: 300.0,
             height: 350.0,
+            group_size: 1,
         }
     }
 
@@ -120,6 +123,30 @@ impl OrderBookPanel {
         }
     }
 
+    fn grouped_levels(levels: &[PriceLevel], group_size: u32) -> Vec<PriceLevel> {
+        let group_size = group_size.max(1) as usize;
+        if group_size == 1 {
+            return levels.to_vec();
+        }
+        levels
+            .chunks(group_size)
+            .map(|chunk| {
+                let price = chunk.first().map(|level| level.price).unwrap_or(0.0);
+                let quantity = chunk.iter().map(|level| level.quantity).sum();
+                PriceLevel::new(price, quantity)
+            })
+            .collect()
+    }
+
+    fn cycle_group_size(&mut self) {
+        self.group_size = match self.group_size {
+            1 => 2,
+            2 => 5,
+            5 => 10,
+            _ => 1,
+        };
+    }
+
     /// Render a single level row with an inline size bar.
     ///
     /// `bar_frac` is the fraction [0, 1] of the maximum quantity on either
@@ -139,12 +166,16 @@ impl OrderBookPanel {
         let colors = &cx.theme().colors;
         let price_str = Self::fmt_price(level.price);
         let qty_str = Self::fmt_qty(level.quantity);
+        let is_wall = bar_frac >= 0.60;
 
         div()
             .id(ElementId::Name(format!("{id_prefix}-{idx}").into()))
             .w_full()
             .h(px(row_h))
             .relative()
+            .when(is_wall, |row| {
+                row.border_l_2().border_color(price_color)
+            })
             // Size bar dynamically spans proportional percentage of the module width
             .child(
                 div()
@@ -220,7 +251,7 @@ impl OrderBookPanel {
     }
 
     /// Render the spread row between asks and bids.
-    fn render_spread(book: &Arc<OrderBook>, cx: &Context<Self>) -> impl IntoElement {
+    fn render_spread(&self, book: &Arc<OrderBook>, cx: &Context<Self>) -> impl IntoElement {
         let colors = &cx.theme().colors;
         let spread_str = book.spread().map_or("—".to_string(), |s| {
             if s < 1.0 {
@@ -278,6 +309,27 @@ impl OrderBookPanel {
             )
             .child(
                 div()
+                    .id("orderbook-group-size")
+                    .cursor_pointer()
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(colors.border)
+                    .px(px(4.0))
+                    .text_size(px(10.0))
+                    .text_color(colors.muted_foreground)
+                    .hover(|style| style.text_color(colors.foreground))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.cycle_group_size();
+                            cx.notify();
+                        }),
+                    )
+                    .child(format!("{}x", self.group_size)),
+            )
+            .child(
+                div()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(px(11.0))
                     .text_color(colors.muted_foreground)
@@ -297,14 +349,20 @@ impl OrderBookPanel {
         if is_dual_column {
             // Dual-column mode for wide short panes: BIDS on left, ASKS on right
             let depth = (((self.height - 52.0) / row_h).floor() as usize).clamp(3, 30);
-            let max_qty = book.max_quantity(depth).max(f64::EPSILON);
-            let asks = book.top_asks(depth);
-            let bids = book.top_bids(depth);
+            let raw_depth = (depth * self.group_size as usize).min(100);
+            let asks = Self::grouped_levels(book.top_asks(raw_depth), self.group_size);
+            let bids = Self::grouped_levels(book.top_bids(raw_depth), self.group_size);
+            let max_qty = asks
+                .iter()
+                .chain(bids.iter())
+                .map(|level| level.quantity)
+                .fold(0.0, f64::max)
+                .max(f64::EPSILON);
 
             v_flex()
                 .size_full()
                 .overflow_hidden()
-                .child(Self::render_spread(book, cx))
+                .child(self.render_spread(book, cx))
                 .child(
                     h_flex()
                         .flex_1()
@@ -363,10 +421,16 @@ impl OrderBookPanel {
             // Stacked depth ladder: Asks at top, Spread in center, Bids at bottom
             let available_h = (self.height - 24.0 - 24.0).max(36.0);
             let depth = (((available_h / (row_h * 2.0))).floor() as usize).clamp(3, 35);
+            let raw_depth = (depth * self.group_size as usize).min(100);
 
-            let max_qty = book.max_quantity(depth).max(f64::EPSILON);
-            let asks = book.top_asks(depth);
-            let bids = book.top_bids(depth);
+            let asks = Self::grouped_levels(book.top_asks(raw_depth), self.group_size);
+            let bids = Self::grouped_levels(book.top_bids(raw_depth), self.group_size);
+            let max_qty = asks
+                .iter()
+                .chain(bids.iter())
+                .map(|level| level.quantity)
+                .fold(0.0, f64::max)
+                .max(f64::EPSILON);
             let asks_reversed: Vec<&PriceLevel> = asks.iter().rev().collect();
 
             v_flex()
@@ -392,7 +456,7 @@ impl OrderBookPanel {
                     )
                 }))
                 // Spread / mid price separator
-                .child(Self::render_spread(book, cx))
+                .child(self.render_spread(book, cx))
                 // Bids section
                 .children(bids.iter().enumerate().map(|(i, level)| {
                     let frac = level.quantity / max_qty;
@@ -573,5 +637,19 @@ mod tests {
         ));
         assert!((book.spread().unwrap() - 10.0).abs() < f64::EPSILON);
         assert!((book.mid_price().unwrap() - 67_005.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn grouping_sums_adjacent_levels() {
+        let levels = vec![
+            PriceLevel::new(100.0, 1.0),
+            PriceLevel::new(99.0, 2.0),
+            PriceLevel::new(98.0, 3.0),
+        ];
+        let grouped = OrderBookPanel::grouped_levels(&levels, 2);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].price, 100.0);
+        assert!((grouped[0].quantity - 3.0).abs() < f64::EPSILON);
+        assert!((grouped[1].quantity - 3.0).abs() < f64::EPSILON);
     }
 }
