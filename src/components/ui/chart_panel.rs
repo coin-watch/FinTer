@@ -3135,6 +3135,53 @@ impl ChartPanel {
                 cx.notify();
             }));
 
+        let candle_label = |kind: CandleType| match kind {
+            CandleType::Solid => "Candles",
+            CandleType::HeikinAshi => "Heikin Ashi",
+            CandleType::Stroke => "Stroke",
+            CandleType::UpStroke => "Up stroke",
+            CandleType::DownStroke => "Down stroke",
+            CandleType::Ohlc => "OHLC",
+            CandleType::Area => "Area",
+        };
+        let chart_type_view = cx.entity().downgrade();
+        let current_candle_type = self.candle_type;
+        let chart_type = toolbar_button(
+            "toolbar_chart_type",
+            "icons/chart-candlestick.svg",
+            candle_label(current_candle_type),
+        )
+        .tooltip(format!("Chart type: {}", candle_label(current_candle_type)))
+        .dropdown_caret(true)
+        .dropdown_menu(move |mut menu, _, _| {
+            for kind in [
+                CandleType::Solid,
+                CandleType::HeikinAshi,
+                CandleType::Stroke,
+                CandleType::UpStroke,
+                CandleType::DownStroke,
+                CandleType::Ohlc,
+                CandleType::Area,
+            ] {
+                let view = chart_type_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(candle_label(kind))
+                        .checked(current_candle_type == kind)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.set_candle_type(kind);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        }),
+                );
+            }
+            menu
+        });
+
         let orderflow = toolbar_button("toolbar_btn_orderflow", "icons/trending-up.svg", "Order flow")
             .selected(self.show_delta)
             .when(self.show_delta, |button| button.bg(active_bg).text_color(active_fg))
@@ -3614,6 +3661,7 @@ impl ChartPanel {
                     .gap(px(2.0))
                     .flex_shrink_0()
                     .child(indicators)
+                    .child(chart_type)
                     .child(orderflow)
                     .child(profile)
                     .child(footprint)

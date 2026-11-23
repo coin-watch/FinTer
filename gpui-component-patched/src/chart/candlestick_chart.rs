@@ -2119,10 +2119,10 @@ where
                             let d = visible[idx];
                             let ts = timestamps[idx];
                             let open_v = open_fn(d).to_f64().unwrap_or(0.0);
-                            let _high_v = high_fn(d).to_f64().unwrap_or(0.0);
-                            let _low_v = low_fn(d).to_f64().unwrap_or(0.0);
+                            let high_v = high_fn(d).to_f64().unwrap_or(0.0);
+                            let low_v = low_fn(d).to_f64().unwrap_or(0.0);
                             let close_v = close_fn(d).to_f64().unwrap_or(0.0);
-                            let _vol_v = self.volume.as_ref().map(|f| f(d)).unwrap_or(0.0);
+                            let vol_v = self.volume.as_ref().map(|f| f(d)).unwrap_or(0.0);
                             let is_bull = close_v >= open_v;
                             let _candle_col: Hsla = if is_bull {
                                 bullish_color
@@ -2242,9 +2242,115 @@ where
                                 );
                             }
 
-                            // --- Inline OHLCV tooltip (top of chart, horizontal row) ---
+                            // --- Floating OHLCV card ---
                             {
+                                let time_label = self
+                                    .format_timestamp_long
+                                    .as_ref()
+                                    .map(|formatter| formatter(ts))
+                                    .unwrap_or_else(|| format_timestamp_long(ts).into());
+                                let price = |value: f64| self.price_str(value).to_string();
+                                let ohlc_line = format!(
+                                    "O {}   H {}   L {}   C {}",
+                                    price(open_v),
+                                    price(high_v),
+                                    price(low_v),
+                                    price(close_v)
+                                );
+                                let change = close_v - open_v;
+                                let change_pct = if open_v.abs() > f64::EPSILON {
+                                    change / open_v * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let change_line = format!(
+                                    "Vol {}   {}{:.2} ({}{:.2}%)",
+                                    format_volume(vol_v),
+                                    if change >= 0.0 { "+" } else { "" },
+                                    change,
+                                    if change >= 0.0 { "+" } else { "" },
+                                    change_pct
+                                );
+                                let text_w = time_label
+                                    .len()
+                                    .max(ohlc_line.len())
+                                    .max(change_line.len()) as f32
+                                    * CHAR_WIDTH_EST;
+                                let max_card_w = (chart_w - 16.0).max(80.0);
+                                let min_card_w = 180.0_f32.min(max_card_w);
+                                let card_w = (text_w + 18.0).clamp(min_card_w, max_card_w);
+                                let card_h = 52.0;
+                                let preferred_x = if cursor_x_in_chart + 16.0 + card_w <= chart_w {
+                                    cursor_x_in_chart + 16.0
+                                } else {
+                                    cursor_x_in_chart - card_w - 16.0
+                                };
+                                let preferred_y = if cursor_rel.y.as_f32() + 16.0 + card_h <= candle_h {
+                                    cursor_rel.y.as_f32() + 16.0
+                                } else {
+                                    cursor_rel.y.as_f32() - card_h - 16.0
+                                };
+                                let card_x = preferred_x.clamp(4.0, (chart_w - card_w - 4.0).max(4.0));
+                                let card_y = preferred_y.clamp(4.0, (candle_h - card_h - 4.0).max(4.0));
+                                let card_bounds = Bounds::from_corners(
+                                    gpui::point(origin.x + px(card_x), origin.y + px(card_y)),
+                                    gpui::point(
+                                        origin.x + px(card_x + card_w),
+                                        origin.y + px(card_y + card_h),
+                                    ),
+                                );
+                                window.paint_quad(fill(
+                                    card_bounds,
+                                    cx.theme().background.opacity(0.94),
+                                ));
+                                let mut card_border = PathBuilder::stroke(px(1.0));
+                                card_border.move_to(card_bounds.origin);
+                                card_border.line_to(gpui::point(
+                                    card_bounds.origin.x + card_bounds.size.width,
+                                    card_bounds.origin.y,
+                                ));
+                                card_border.line_to(gpui::point(
+                                    card_bounds.origin.x + card_bounds.size.width,
+                                    card_bounds.origin.y + card_bounds.size.height,
+                                ));
+                                card_border.line_to(gpui::point(
+                                    card_bounds.origin.x,
+                                    card_bounds.origin.y + card_bounds.size.height,
+                                ));
+                                card_border.close();
+                                if let Ok(path) = card_border.build() {
+                                    window.paint_path(path, cx.theme().border);
+                                }
 
+                                let text_x = card_x + 8.0;
+                                paint_text_line(
+                                    time_label,
+                                    gpui::point(origin.x + px(text_x), origin.y + px(card_y + 6.0)),
+                                    cx.theme().muted_foreground,
+                                    card_bounds,
+                                    window,
+                                    cx,
+                                );
+                                paint_text_line(
+                                    ohlc_line.into(),
+                                    gpui::point(origin.x + px(text_x), origin.y + px(card_y + 21.0)),
+                                    cx.theme().foreground,
+                                    card_bounds,
+                                    window,
+                                    cx,
+                                );
+                                paint_text_line(
+                                    change_line.into(),
+                                    gpui::point(origin.x + px(text_x), origin.y + px(card_y + 36.0)),
+                                    if change >= 0.0 {
+                                        bullish_color
+                                    } else {
+                                        bearish_color
+                                    },
+                                    card_bounds,
+                                    window,
+                                    cx,
+                                );
                             }
                         }
                     }
