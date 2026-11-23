@@ -15,6 +15,8 @@
 /// - **Period high / low markers** – gold tick + label at the highest high and
 ///   lowest low in the current visible window.
 /// - **Volume sub-pane** – transparent bar chart below the candles.
+/// - **Footprint** – adaptive bid × ask / delta / volume grid with POC,
+///   value-area boundaries, imbalance stripes, and a bar summary.
 /// - **Technical Indicators** – parameterized indicator instances with cached
 ///   computation keyed to candle feed version.
 /// - **Drawing Tools** – full suite of charting tools (Trendline, Ray, Horizontal,
@@ -51,8 +53,10 @@ use gpui_component::theme::ActiveTheme;
 use gpui_component::v_flex;
 
 use crate::chart::model::{
-    ChartLayout, IndicatorCategory, IndicatorInstance, IndicatorKind, WindowGeometry,
+    ChartLayout, FootprintMode, FootprintSettings, IndicatorCategory, IndicatorInstance,
+    IndicatorKind, WindowGeometry,
 };
+use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid};
 use crate::chart::indicators::{validate_params, IndicatorCache};
 use crate::chart::drawings::{
     DrawingInstance, DrawingPoint, DrawingTool, DrawingInteractionState, hit_test_drawings,
@@ -146,6 +150,8 @@ pub struct ChartPanel {
     show_profile: bool,
     /// Render the chart as a bid x ask footprint.
     show_footprint: bool,
+    /// Footprint mode and analytics settings.
+    footprint_settings: FootprintSettings,
     /// Optional book-history feed for the liquidity heatmap.
     liquidity_feed: Option<LiquidityFeed>,
     /// Show resting-liquidity bands behind candles.
@@ -215,6 +221,36 @@ pub struct ChartPanel {
     timezone: String,
     pub pane_width: f32,
     pub pane_height: f32,
+}
+
+/// Compact volume label used inside footprint cells.
+fn compact_flow(value: f64) -> String {
+    let value = value.abs();
+    if value >= 1_000_000_000.0 {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else if value >= 100.0 {
+        format!("{value:.0}")
+    } else if value >= 1.0 {
+        format!("{value:.1}")
+    } else if value > 0.0 {
+        format!("{value:.2}")
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Compact signed delta label used inside footprint cells.
+fn compact_delta(value: f64) -> String {
+    if value.abs() < 1e-9 {
+        "0".to_string()
+    } else {
+        let sign = if value > 0.0 { "+" } else { "-" };
+        format!("{sign}{}", compact_flow(value.abs()))
+    }
 }
 
 impl ChartPanel {
@@ -322,6 +358,7 @@ impl ChartPanel {
             show_delta: true,
             show_profile: false,
             show_footprint: false,
+            footprint_settings: FootprintSettings::default(),
             liquidity_feed: None,
             show_liquidity: false,
 
@@ -439,6 +476,41 @@ impl ChartPanel {
         .detach();
     }
 
+    /// Toggle footprint mode and zoom in to a readable density on first open.
+    fn toggle_footprint(&mut self, cx: &mut Context<Self>) {
+        self.show_footprint = !self.show_footprint;
+        if self.show_footprint {
+            self.ensure_footprint_density();
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Footprint rows need enough horizontal space for numeric cells.
+    fn ensure_footprint_density(&mut self) {
+        if self.chart_state.visible_count > 20 {
+            self.chart_state.visible_count = 20;
+        }
+    }
+
+    fn set_footprint_mode(&mut self, mode: FootprintMode, cx: &mut Context<Self>) {
+        self.footprint_settings.mode = mode;
+        if !self.show_footprint {
+            self.show_footprint = true;
+            self.ensure_footprint_density();
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    fn footprint_mode_label(mode: FootprintMode) -> &'static str {
+        match mode {
+            FootprintMode::BidAsk => "Bid × Ask",
+            FootprintMode::Delta => "Delta",
+            FootprintMode::Volume => "Volume",
+        }
+    }
+
     /// Set exchange and symbol context for layout persistence.
     pub fn set_context(&mut self, exchange: impl Into<String>, symbol: impl Into<String>) {
         self.exchange = exchange.into();
@@ -545,7 +617,11 @@ impl ChartPanel {
         self.show_delta = layout.show_delta;
         self.show_profile = layout.show_profile;
         self.show_footprint = layout.show_footprint;
+        self.footprint_settings = layout.footprint;
         self.show_liquidity = layout.show_liquidity;
+        if self.show_footprint {
+            self.ensure_footprint_density();
+        }
         if let Some(geom) = layout.library_geometry {
             self.library_x = geom.x;
             self.library_y = geom.y;
@@ -570,6 +646,7 @@ impl ChartPanel {
         layout.show_delta = self.show_delta;
         layout.show_profile = self.show_profile;
         layout.show_footprint = self.show_footprint;
+        layout.footprint = self.footprint_settings.clone();
         layout.show_liquidity = self.show_liquidity;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
@@ -895,7 +972,7 @@ impl ChartPanel {
         orderflow: Option<&OrderFlowSnapshot>,
         bullish: gpui::Hsla,
         bearish: gpui::Hsla,
-        foreground: gpui::Hsla,
+        _foreground: gpui::Hsla,
     ) -> Vec<FootprintCellSpec> {
         if !self.show_footprint {
             return Vec::new();
@@ -907,68 +984,101 @@ impl ChartPanel {
             return Vec::new();
         }
 
-        let visible_candles = &candles[candles.len().saturating_sub(120)..];
-        let candle_ts: HashSet<i64> = visible_candles
-            .iter()
-            .map(|candle| candle.timestamp)
-            .collect();
-        let mut min_price = f64::INFINITY;
-        let mut max_price = f64::NEG_INFINITY;
-        for candle in visible_candles {
-            min_price = min_price.min(candle.low);
-            max_price = max_price.max(candle.high);
-        }
-        if !min_price.is_finite() || !max_price.is_finite() || max_price <= min_price {
+        let range = self.chart_state.visible_range(candles.len());
+        let visible = &candles[range];
+        if visible.is_empty() {
             return Vec::new();
         }
+        let timestamps: HashSet<i64> = visible.iter().map(|candle| candle.timestamp).collect();
 
-        const ROWS: usize = 30;
-        let step = (max_price - min_price) / ROWS as f64;
-        if step <= 0.0 {
-            return Vec::new();
-        }
-        let fmt_volume = |value: f64| -> String {
-            if value >= 1_000_000.0 {
-                format!("{:.1}M", value / 1_000_000.0)
-            } else if value >= 1_000.0 {
-                format!("{:.1}K", value / 1_000.0)
-            } else if value >= 1.0 {
-                format!("{value:.1}")
-            } else {
-                format!("{value:.2}")
+        let (price_min, price_max) = match self.chart_state.candle_price_range.get() {
+            Some((min, max)) if min.is_finite() && max.is_finite() && max > min => (min, max),
+            _ => {
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for candle in visible {
+                    if candle.low.is_finite() && candle.high.is_finite() {
+                        min = min.min(candle.low);
+                        max = max.max(candle.high);
+                    }
+                }
+                if !min.is_finite() || !max.is_finite() || max <= min {
+                    return Vec::new();
+                }
+                (min, max)
             }
         };
 
+        let plot_h = self
+            .chart_state
+            .candle_plot_size
+            .get()
+            .map(|(_, height)| height)
+            .unwrap_or(self.pane_height * 0.7)
+            .max(120.0);
+        let min_row_h = self.footprint_settings.min_row_height.max(6.0);
+        let max_rows = (plot_h / min_row_h).floor().clamp(12.0, 96.0) as usize;
+
+        let grid = build_footprint_grid(&FootprintBuildInput {
+            bars: &orderflow.bars,
+            timestamps: &timestamps,
+            price_min,
+            price_max,
+            max_rows,
+            tick_size: self.precision.as_ref().and_then(|precision| precision.tick_size),
+            show_value_area: self.footprint_settings.show_value_area,
+            show_imbalance: self.footprint_settings.show_imbalance,
+            imbalance_ratio: self.footprint_settings.imbalance_ratio,
+        });
+
         let mut cells = Vec::new();
-        for bar in orderflow
-            .bars
-            .iter()
-            .filter(|bar| candle_ts.contains(&bar.timestamp))
-        {
-            let mut buckets = vec![(0.0f64, 0.0f64); ROWS];
-            for row in bar.price_rows.values() {
-                let idx = (((row.price - min_price) / step).floor() as isize)
-                    .clamp(0, ROWS as isize - 1) as usize;
-                buckets[idx].0 += row.buy_volume;
-                buckets[idx].1 += row.sell_volume;
-            }
-            for (idx, (buy, sell)) in buckets.into_iter().enumerate() {
-                if buy <= 0.0 && sell <= 0.0 {
-                    continue;
-                }
-                let delta = buy - sell;
-                let background = if delta >= 0.0 {
-                    bullish.opacity(0.20)
-                } else {
-                    bearish.opacity(0.20)
+        for bar in &grid.bars {
+            let max_abs_delta = bar
+                .rows
+                .iter()
+                .map(|row| row.delta().abs())
+                .fold(0.0, f64::max)
+                .max(1e-9);
+            for row in &bar.rows {
+                let delta = row.delta();
+                let intensity = (delta.abs() / max_abs_delta).clamp(0.0, 1.0) as f32;
+                let base = if delta >= 0.0 { bullish } else { bearish };
+                let alpha = 0.08 + 0.20 * intensity + if bar.is_closed { 0.0 } else { 0.05 };
+                let background = base.opacity(alpha.min(0.45));
+                let (left_text, right_text, single_text) = match self.footprint_settings.mode {
+                    FootprintMode::BidAsk => (
+                        compact_flow(row.sell).into(),
+                        compact_flow(row.buy).into(),
+                        compact_delta(delta).into(),
+                    ),
+                    FootprintMode::Delta => (
+                        "".into(),
+                        "".into(),
+                        compact_delta(delta).into(),
+                    ),
+                    FootprintMode::Volume => ("".into(), "".into(), compact_flow(row.volume()).into()),
                 };
+                let single_color = if delta >= 0.0 { bullish } else { bearish };
                 cells.push(FootprintCellSpec {
                     timestamp_ms: bar.timestamp,
-                    price_low: min_price + step * idx as f64,
-                    price_high: min_price + step * (idx + 1) as f64,
-                    text: format!("{}×{}", fmt_volume(buy), fmt_volume(sell)).into(),
+                    price_low: row.price_low,
+                    price_high: row.price_high,
+                    left_text,
+                    right_text,
+                    single_text,
+                    left_color: bearish.opacity(0.95),
+                    right_color: bullish.opacity(0.95),
+                    single_color,
                     background,
-                    text_color: foreground,
+                    is_poc: self.footprint_settings.show_poc && row.is_poc,
+                    is_vah: self.footprint_settings.show_value_area && row.is_vah,
+                    is_val: self.footprint_settings.show_value_area && row.is_val,
+                    imbalance: if self.footprint_settings.show_imbalance {
+                        row.imbalance
+                    } else {
+                        0
+                    },
+                    is_live: !bar.is_closed,
                 });
             }
         }
@@ -1133,7 +1243,7 @@ impl ChartPanel {
         let mut volume = vec![0.0f64; ROWS];
         let mut delta = vec![0.0f64; ROWS];
         for bar in &orderflow.bars {
-            for row in bar.price_rows.values() {
+            for row in &bar.price_rows {
                 let idx = (((row.price - min_price) / step).floor() as isize)
                     .clamp(0, ROWS as isize - 1) as usize;
                 volume[idx] += row.volume();
@@ -1683,8 +1793,67 @@ impl Render for ChartPanel {
                                 .flex()
                                 .gap(px(4.0))
                                 .child(div().text_color(c_color).child(change_str)),
-                        ),
+                        )
                 );
+
+            if self.show_footprint && self.footprint_settings.show_summary {
+                if let Some(bar) = orderflow_snapshot.as_ref().and_then(|snapshot| {
+                    snapshot.bars.iter().find(|bar| bar.timestamp == c.timestamp)
+                }) {
+                    let delta = bar.delta();
+                    let delta_color = if delta >= 0.0 {
+                        cx.theme().bullish
+                    } else {
+                        cx.theme().bearish
+                    };
+                    let volume = if bar.total_volume > 0.0 {
+                        bar.total_volume
+                    } else {
+                        bar.volume()
+                    };
+                    let poc = bar
+                        .poc
+                        .map(|price| format_price(price, precision.as_ref()))
+                        .unwrap_or_else(|| "—".to_string());
+                    let status_color = if bar.is_closed {
+                        cx.theme().colors.muted_foreground
+                    } else {
+                        cx.theme().primary
+                    };
+                    legend = legend.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child("FP"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(delta_color)
+                                    .child(format!("Δ {}", compact_delta(delta))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!("Vol {}", compact_flow(volume))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!("POC {poc}")),
+                            )
+                            .child(
+                                div()
+                                    .text_color(status_color)
+                                    .child(if bar.is_closed { "CLOSED" } else { "LIVE" }),
+                            ),
+                    );
+                }
+            }
 
             let active_timestamp = c.timestamp;
             let mut subpane_legends_map: std::collections::BTreeMap<usize, (f32, Vec<AnyElement>)> =
@@ -3026,9 +3195,7 @@ impl Render for ChartPanel {
                         cx.notify();
                     }
                     "v" => {
-                        this.show_footprint = !this.show_footprint;
-                        this.mark_dirty();
-                        cx.notify();
+                        this.toggle_footprint(cx);
                     }
                     "h" => {
                         this.show_liquidity = !this.show_liquidity;
@@ -3240,6 +3407,10 @@ impl ChartPanel {
             cx.notify();
         }));
 
+        let footprint_settings = self.footprint_settings.clone();
+        let footprint_view = cx.entity().downgrade();
+        let footprint_visible = self.show_footprint;
+        let footprint_mode_label = Self::footprint_mode_label(self.footprint_settings.mode);
         let footprint = toolbar_button(
             "toolbar_btn_footprint",
             "icons/chart-candlestick.svg",
@@ -3247,12 +3418,151 @@ impl ChartPanel {
         )
         .selected(self.show_footprint)
         .when(self.show_footprint, |button| button.bg(active_bg).text_color(active_fg))
-        .tooltip("Bid x ask footprint")
+        .tooltip(format!("Footprint: {footprint_mode_label}"))
+        .dropdown_caret(true)
         .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_footprint = !this.show_footprint;
-            this.mark_dirty();
-            cx.notify();
-        }));
+            this.toggle_footprint(cx);
+        }))
+        .dropdown_menu(move |mut menu, _, _| {
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Show footprint")
+                    .checked(footprint_visible)
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.show_footprint = !this.show_footprint;
+                                if this.show_footprint {
+                                    this.ensure_footprint_density();
+                                }
+                                this.mark_dirty();
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    }),
+            );
+
+            for (mode, label) in [
+                (FootprintMode::BidAsk, "Bid × Ask"),
+                (FootprintMode::Delta, "Delta"),
+                (FootprintMode::Volume, "Volume"),
+            ] {
+                let view = footprint_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(footprint_settings.mode == mode)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.set_footprint_mode(mode, cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        }),
+                );
+            }
+
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Point of control")
+                    .checked(footprint_settings.show_poc)
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.footprint_settings.show_poc = !this.footprint_settings.show_poc;
+                                this.mark_dirty();
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    }),
+            );
+
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Value area")
+                    .checked(footprint_settings.show_value_area)
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.footprint_settings.show_value_area =
+                                    !this.footprint_settings.show_value_area;
+                                this.mark_dirty();
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    }),
+            );
+
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Imbalance")
+                    .checked(footprint_settings.show_imbalance)
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.footprint_settings.show_imbalance =
+                                    !this.footprint_settings.show_imbalance;
+                                this.mark_dirty();
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    }),
+            );
+
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(format!(
+                    "Imbalance ratio: {:.0}×",
+                    footprint_settings.imbalance_ratio
+                ))
+                .on_click(move |_, window, cx| {
+                    let view = view.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.footprint_settings.imbalance_ratio =
+                                match this.footprint_settings.imbalance_ratio.round() as i32 {
+                                    2 => 3.0,
+                                    3 => 4.0,
+                                    4 => 5.0,
+                                    _ => 2.0,
+                                };
+                            this.mark_dirty();
+                            window.focus(&this.focus_handle);
+                            cx.notify();
+                        });
+                    });
+                }),
+            );
+
+            let view = footprint_view.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Summary")
+                    .checked(footprint_settings.show_summary)
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.footprint_settings.show_summary =
+                                    !this.footprint_settings.show_summary;
+                                this.mark_dirty();
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    }),
+            );
+            menu
+        });
 
         let liquidity = toolbar_button(
             "toolbar_btn_liquidity",

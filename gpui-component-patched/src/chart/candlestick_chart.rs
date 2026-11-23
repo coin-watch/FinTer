@@ -46,9 +46,22 @@ pub struct FootprintCellSpec {
     pub timestamp_ms: i64,
     pub price_low: f64,
     pub price_high: f64,
-    pub text: SharedString,
+    /// Bid/sell-side volume text.
+    pub left_text: SharedString,
+    /// Ask/buy-side volume text.
+    pub right_text: SharedString,
+    /// Delta or volume text shown when the cell is too narrow for two columns.
+    pub single_text: SharedString,
+    pub left_color: Hsla,
+    pub right_color: Hsla,
+    pub single_color: Hsla,
     pub background: Hsla,
-    pub text_color: Hsla,
+    pub is_poc: bool,
+    pub is_vah: bool,
+    pub is_val: bool,
+    /// `1` = bid imbalance, `-1` = ask imbalance, `0` = none.
+    pub imbalance: i8,
+    pub is_live: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -824,10 +837,11 @@ where
             }
         }
 
-        // Bid x ask footprint cells. Text is skipped on very narrow bars so
-        // adjacent columns remain readable.
+        // Bid x ask footprint cells. Numeric columns are dropped before the
+        // text can overflow; narrow cells fall back to a single delta/volume.
         if !self.footprint_cells.is_empty() {
             let cell_w = (slot_w * 0.96).max(1.0);
+            let poc_color: Hsla = gpui::rgb(0xf0b90b).into();
             for cell in &self.footprint_cells {
                 if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
                     continue;
@@ -840,17 +854,95 @@ where
                 }
                 let y_top = origin.y + px(y_scale.scale(cell.price_high));
                 let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
+                let top = y_top.min(y_bottom);
+                let bottom = y_top.max(y_bottom);
                 let x_left = origin.x + px(center_x - cell_w / 2.0);
                 let x_right = origin.x + px(center_x + cell_w / 2.0);
                 let bounds = Bounds::from_corners(
-                    gpui::point(x_left, y_top.min(y_bottom)),
-                    gpui::point(x_right, y_top.max(y_bottom)),
+                    gpui::point(x_left, top),
+                    gpui::point(x_right, bottom),
                 );
                 window.paint_quad(fill(bounds, cell.background));
-                if cell_w >= 26.0 {
+
+                if cell.is_poc {
+                    let mut border = PathBuilder::stroke(px(1.0));
+                    border.move_to(bounds.origin);
+                    border.line_to(gpui::point(bounds.origin.x + bounds.size.width, bounds.origin.y));
+                    border.line_to(gpui::point(
+                        bounds.origin.x + bounds.size.width,
+                        bounds.origin.y + bounds.size.height,
+                    ));
+                    border.line_to(gpui::point(bounds.origin.x, bounds.origin.y + bounds.size.height));
+                    border.close();
+                    if let Ok(path) = border.build() {
+                        window.paint_path(path, poc_color);
+                    }
+                }
+
+                if cell.is_vah || cell.is_val {
+                    let y = if cell.is_vah {
+                        bounds.origin.y
+                    } else {
+                        bounds.origin.y + bounds.size.height - px(1.0)
+                    };
+                    let mut line = PathBuilder::stroke(px(1.0));
+                    line.move_to(gpui::point(x_left, y));
+                    line.line_to(gpui::point(x_right, y));
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, cx.theme().muted_foreground.opacity(0.8));
+                    }
+                }
+
+                if cell.imbalance != 0 {
+                    let stripe_w = px(2.0);
+                    let stripe_x = if cell.imbalance > 0 {
+                        x_left
+                    } else {
+                        x_right - stripe_w
+                    };
+                    let stripe = Bounds::from_corners(
+                        gpui::point(stripe_x, top),
+                        gpui::point(stripe_x + stripe_w, bottom),
+                    );
+                    let color = if cell.imbalance > 0 {
+                        bullish_color
+                    } else {
+                        bearish_color
+                    };
+                    window.paint_quad(fill(stripe, color.opacity(0.9)));
+                }
+
+                let cell_h = (bottom - top).as_f32();
+                let text_y = top + px((cell_h - TIP_FONT).max(0.0) * 0.5);
+                let left_w = cell.left_text.len() as f32 * CHAR_WIDTH_EST;
+                let right_w = cell.right_text.len() as f32 * CHAR_WIDTH_EST;
+                let single_w = cell.single_text.len() as f32 * CHAR_WIDTH_EST;
+                let gap = 4.0;
+                let show_two = !cell.left_text.is_empty()
+                    && !cell.right_text.is_empty()
+                    && left_w + right_w + gap <= cell_w;
+
+                if show_two {
+                    paint_text_line(
+                        cell.left_text.clone(),
+                        gpui::point(x_left + px(2.0), text_y),
+                        cell.left_color,
+                        bounds,
+                        window,
+                        cx,
+                    );
+                    paint_text_line(
+                        cell.right_text.clone(),
+                        gpui::point(x_right - px(right_w + 2.0), text_y),
+                        cell.right_color,
+                        bounds,
+                        window,
+                        cx,
+                    );
+                } else if !cell.single_text.is_empty() && single_w + gap <= cell_w {
                     paint_text_line_centered(
-                        cell.text.clone(),
-                        cell.text_color,
+                        cell.single_text.clone(),
+                        cell.single_color,
                         bounds,
                         window,
                         cx,

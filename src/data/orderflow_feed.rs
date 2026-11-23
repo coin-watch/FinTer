@@ -19,12 +19,16 @@ use crate::data::tick::{TradeSide, UnifiedTick};
 const MAX_SEEN_TRADE_IDS: usize = 20_000;
 const MAX_BARS: usize = 5_000;
 
-/// Aggregated volume at one price within a bar.
+/// Aggregated volume at one price row within a bar.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PriceFlow {
     pub price: f64,
+    pub price_low: f64,
+    pub price_high: f64,
     pub buy_volume: f64,
     pub sell_volume: f64,
+    pub buy_count: u32,
+    pub sell_count: u32,
 }
 
 impl PriceFlow {
@@ -44,8 +48,15 @@ pub struct FlowBar {
     pub buy_volume: f64,
     pub sell_volume: f64,
     pub trades: u32,
-    /// Per-price volume, keyed by price in millionths.
-    pub price_rows: BTreeMap<i64, PriceFlow>,
+    /// Per-price rows in ascending price order.
+    pub price_rows: Vec<PriceFlow>,
+    /// Backend POC, VAH and VAL for this bar when known.
+    pub poc: Option<f64>,
+    pub vah: Option<f64>,
+    pub val: Option<f64>,
+    pub total_volume: f64,
+    pub row_size: f64,
+    pub is_closed: bool,
 }
 
 impl FlowBar {
@@ -123,17 +134,31 @@ impl State {
         } else {
             bar.sell_volume += -amount;
         }
+        bar.total_volume = bar.buy_volume + bar.sell_volume;
         bar.trades = bar.trades.saturating_add(1);
 
-        let price_key = (trade.price * 1_000_000.0).round() as i64;
-        let price_row = bar.price_rows.entry(price_key).or_insert(PriceFlow {
-            price: trade.price,
-            ..PriceFlow::default()
-        });
+        let price_row = match bar
+            .price_rows
+            .iter_mut()
+            .find(|row| (row.price_low - trade.price).abs() < 1e-9)
+        {
+            Some(row) => row,
+            None => {
+                bar.price_rows.push(PriceFlow {
+                    price: trade.price,
+                    price_low: trade.price,
+                    price_high: trade.price,
+                    ..PriceFlow::default()
+                });
+                bar.price_rows.last_mut().expect("row pushed")
+            }
+        };
         if amount >= 0.0 {
             price_row.buy_volume += amount;
+            price_row.buy_count = price_row.buy_count.saturating_add(1);
         } else {
             price_row.sell_volume += -amount;
+            price_row.sell_count = price_row.sell_count.saturating_add(1);
         }
 
         while self.bars.len() > MAX_BARS {
@@ -311,8 +336,12 @@ pub struct DerivedFootprint {
     pub bar_end: i64,
     pub rows: Vec<DerivedFootprintRow>,
     pub poc: Option<f64>,
+    pub vah: Option<f64>,
+    pub val: Option<f64>,
     pub delta: f64,
     pub total_volume: f64,
+    #[serde(default)]
+    pub row_size: f64,
     pub is_closed: bool,
 }
 
@@ -357,6 +386,8 @@ impl DerivedState {
                 bar.buy_volume = delta.buy_volume;
                 bar.sell_volume = delta.sell_volume;
                 bar.trades = delta.trades;
+                bar.total_volume = delta.buy_volume + delta.sell_volume;
+                bar.is_closed = delta.is_closed;
                 self.cvd.insert(delta.bar_start, delta.cvd);
             }
             DerivedFlowEvent::Footprint(footprint) => {
@@ -369,17 +400,28 @@ impl DerivedState {
                 bar.trades = 0;
                 bar.price_rows.clear();
                 for row in &footprint.rows {
-                    let key = (row.price_low * 1_000_000.0).round() as i64;
-                    let price_row = bar.price_rows.entry(key).or_insert(PriceFlow {
+                    let price_row = PriceFlow {
                         price: (row.price_low + row.price_high) / 2.0,
-                        ..PriceFlow::default()
-                    });
-                    price_row.buy_volume += row.buy;
-                    price_row.sell_volume += row.sell;
-                    bar.buy_volume += row.buy;
-                    bar.sell_volume += row.sell;
-                    bar.trades += row.buy_count + row.sell_count;
+                        price_low: row.price_low,
+                        price_high: row.price_high,
+                        buy_volume: row.buy,
+                        sell_volume: row.sell,
+                        buy_count: row.buy_count,
+                        sell_count: row.sell_count,
+                    };
+                    bar.buy_volume += price_row.buy_volume;
+                    bar.sell_volume += price_row.sell_volume;
+                    bar.trades += price_row.buy_count + price_row.sell_count;
+                    bar.price_rows.push(price_row);
                 }
+                bar.price_rows
+                    .sort_by(|a, b| a.price_low.total_cmp(&b.price_low));
+                bar.poc = footprint.poc;
+                bar.vah = footprint.vah;
+                bar.val = footprint.val;
+                bar.total_volume = footprint.total_volume;
+                bar.row_size = footprint.row_size;
+                bar.is_closed = footprint.is_closed;
             }
             DerivedFlowEvent::Profile(profile) => {
                 self.profile = profile.rows.clone();
@@ -525,8 +567,7 @@ mod tests {
         assert_eq!(snapshot.bars[0].price_rows.len(), 1);
         let price_row = snapshot.bars[0]
             .price_rows
-            .values()
-            .next()
+            .first()
             .expect("price row");
         assert!((price_row.price - 100.0).abs() < f64::EPSILON);
         assert!((price_row.buy_volume - 2.0).abs() < f64::EPSILON);
@@ -600,8 +641,11 @@ mod tests {
                 }
             ],
             poc: Some(100.0),
+            vah: Some(101.0),
+            val: Some(100.0),
             delta: 2.0,
             total_volume: 4.0,
+            row_size: 1.0,
             is_closed: false
         }));
 

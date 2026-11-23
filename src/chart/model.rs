@@ -20,6 +20,64 @@ impl Default for WindowGeometry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FootprintMode {
+    BidAsk,
+    Delta,
+    Volume,
+}
+
+impl Default for FootprintMode {
+    fn default() -> Self {
+        Self::BidAsk
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_imbalance_ratio() -> f64 {
+    3.0
+}
+
+fn default_min_row_height() -> f32 {
+    12.0
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FootprintSettings {
+    #[serde(default)]
+    pub mode: FootprintMode,
+    #[serde(default = "default_true")]
+    pub show_poc: bool,
+    #[serde(default = "default_true")]
+    pub show_value_area: bool,
+    #[serde(default = "default_true")]
+    pub show_imbalance: bool,
+    #[serde(default = "default_true")]
+    pub show_summary: bool,
+    #[serde(default = "default_imbalance_ratio")]
+    pub imbalance_ratio: f64,
+    #[serde(default = "default_min_row_height")]
+    pub min_row_height: f32,
+}
+
+impl Default for FootprintSettings {
+    fn default() -> Self {
+        Self {
+            mode: FootprintMode::BidAsk,
+            show_poc: true,
+            show_value_area: true,
+            show_imbalance: true,
+            show_summary: true,
+            imbalance_ratio: default_imbalance_ratio(),
+            min_row_height: default_min_row_height(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChartLayout {
     pub schema_version: u32,
@@ -43,6 +101,9 @@ pub struct ChartLayout {
     /// Render the chart as a bid x ask footprint.
     #[serde(default)]
     pub show_footprint: bool,
+    /// Footprint display mode and analytics.
+    #[serde(default)]
+    pub footprint: FootprintSettings,
     /// Show resting-liquidity bands behind candles.
     #[serde(default)]
     pub show_liquidity: bool,
@@ -73,6 +134,7 @@ impl ChartLayout {
             show_delta: true,
             show_profile: false,
             show_footprint: false,
+            footprint: FootprintSettings::default(),
             show_liquidity: false,
         }
     }

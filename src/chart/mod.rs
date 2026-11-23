@@ -1,4 +1,5 @@
 pub mod drawings;
+pub mod footprint;
 pub mod indicators;
 pub mod interaction;
 pub mod model;
