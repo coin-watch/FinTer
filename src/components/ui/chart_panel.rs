@@ -3,8 +3,8 @@
 /// Renders OHLCV candlestick data from a `CandleFeed` using gpui-component's
 /// `CandlestickChart`. Supports:
 ///
-/// - **Crosshair + OHLCV tooltip** – cursor position is tracked and passed to
-///   the chart renderer, which draws hairlines and a floating data box.
+/// - **Crosshair + OHLCV readout** – cursor position is tracked and passed to
+///   the chart renderer, which draws hairlines and an axis price badge.
 /// - **Horizontal scroll / pan** – click-drag moves the viewport through the
 ///   candle history; the drag is delta-based so the candle under the cursor
 ///   stays fixed.
