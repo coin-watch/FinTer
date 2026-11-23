@@ -217,6 +217,28 @@ impl CandleFeed {
         (inner.candles.clone(), inner.version)
     }
 
+    /// Return a point-in-time snapshot plus the feed version, sharing the
+    /// candle buffer through an `Arc` instead of cloning it on every frame.
+    pub fn snapshot_arc(&self) -> (Arc<[OhlcvCandle]>, u64) {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
+        (Arc::from(inner.candles.as_slice()), inner.version)
+    }
+
+    /// Copy a half-open index range into an `Arc` slice.
+    ///
+    /// The range is clamped to the available buffer. This is the allocation
+    /// boundary used by the chart's viewport; callers that need the full buffer
+    /// should use [`Self::snapshot_arc`].
+    pub fn range_arc(&self, start: usize, end: usize) -> Arc<[OhlcvCandle]> {
+        let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
+        self.rollover_to_now(&mut inner);
+        let len = inner.candles.len();
+        let start = start.min(len);
+        let end = end.clamp(start, len);
+        Arc::from(&inner.candles[start..end])
+    }
+
     /// Number of candles currently in the buffer.
     pub fn len(&self) -> usize {
         let mut inner = self.inner.lock().expect("CandleFeed mutex poisoned");
@@ -300,7 +322,10 @@ impl CandleFeed {
     /// Returns the last credit or fetch error message if any, or `None`.
     pub fn last_error(&self) -> Option<String> {
         let inner = self.inner.lock().expect("CandleFeed mutex poisoned");
-        inner.credit_error.as_ref().map(|e| e.message.clone())
+        inner
+            .credit_error
+            .as_ref()
+            .map(|e| e.message.clone())
             .or_else(|| inner.fetch_error.clone())
     }
 }
@@ -635,7 +660,10 @@ fn merge_candles(
 ) -> bool {
     let before = buf.clone();
     for candle in incoming {
-        let is_incoming_latest = buf.last().map(|last| candle.timestamp >= last.timestamp).unwrap_or(true);
+        let is_incoming_latest = buf
+            .last()
+            .map(|last| candle.timestamp >= last.timestamp)
+            .unwrap_or(true);
 
         if let Some(live_ts) = live_ticker_candle_ts {
             if candle.timestamp == live_ts {
@@ -800,7 +828,12 @@ mod tests {
             .map(|i| candle(i * 1000, i as f64))
             .collect();
         // Add one more — should evict the oldest.
-        merge_candles(&mut buf, &[candle(MAX_CANDLES as i64 * 1000, 999.0)], None, None);
+        merge_candles(
+            &mut buf,
+            &[candle(MAX_CANDLES as i64 * 1000, 999.0)],
+            None,
+            None,
+        );
         assert_eq!(buf.len(), MAX_CANDLES);
         // Oldest (ts=0) should be gone.
         assert_eq!(buf[0].timestamp, 1000);
@@ -820,7 +853,7 @@ mod tests {
             open: 2.0,
             high: 2.5,
             low: 1.9,
-            close: 2.2, // older close
+            close: 2.2,   // older close
             volume: 15.0, // newer/larger volume
         };
 
@@ -855,6 +888,36 @@ mod tests {
         // Prepend another candle -> version increments
         feed.prepend_history(&[candle(500, 8.0)]);
         assert_eq!(feed.version(), 3);
+    }
+
+    #[test]
+    fn snapshot_arc_and_range_arc_match_the_buffer() {
+        let (_tx, rx) = broadcast::channel(16);
+        let feed = CandleFeed::new(rx, None, Some("1m".to_string()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let bucket = now / 60_000 * 60_000;
+        feed.prepend_history(&[
+            candle(bucket - 120_000, 10.0),
+            candle(bucket - 60_000, 11.0),
+            candle(bucket, 12.0),
+        ]);
+
+        let (all, version) = feed.snapshot_arc();
+        assert_eq!(all.len(), 3);
+        assert_eq!(version, feed.version());
+        assert_eq!(all[0].timestamp, bucket - 120_000);
+        assert_eq!(all[2].timestamp, bucket);
+
+        let middle = feed.range_arc(1, 3);
+        assert_eq!(middle.len(), 2);
+        assert_eq!(middle[0].timestamp, bucket - 60_000);
+        assert_eq!(middle[1].timestamp, bucket);
+
+        assert!(feed.range_arc(10, 20).is_empty());
+        assert!(feed.range_arc(2, 1).is_empty());
     }
 
     #[test]
@@ -1138,8 +1201,12 @@ mod tests {
     #[test]
     fn check_and_form_is_idempotent_within_same_bucket() {
         let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(101.0));
-        assert!(check_and_form_live_candle(&mut inner, 60_000, "1m", 150_000));
-        assert!(!check_and_form_live_candle(&mut inner, 60_000, "1m", 150_500));
+        assert!(check_and_form_live_candle(
+            &mut inner, 60_000, "1m", 150_000
+        ));
+        assert!(!check_and_form_live_candle(
+            &mut inner, 60_000, "1m", 150_500
+        ));
         assert_eq!(inner.candles.len(), 2);
     }
 
@@ -1161,7 +1228,12 @@ mod tests {
     #[test]
     fn check_and_form_ignores_empty_buffer_and_bad_interval() {
         let mut empty = inner_with(Vec::new(), Some(1.0));
-        assert!(!check_and_form_live_candle(&mut empty, 60_000, "1m", i64::MAX));
+        assert!(!check_and_form_live_candle(
+            &mut empty,
+            60_000,
+            "1m",
+            i64::MAX
+        ));
 
         let mut inner = inner_with(vec![candle(60_000, 100.0)], Some(1.0));
         assert!(!check_and_form_live_candle(&mut inner, 0, "1m", i64::MAX));
@@ -1213,7 +1285,10 @@ mod tests {
         assert!(changed);
         assert_eq!(inner.candles.len(), 2);
         let live = inner.candles.last().unwrap();
-        assert_eq!(live.timestamp, align_timestamp(oct_1 + 33 * 86_400_000, interval_ms, "1M"));
+        assert_eq!(
+            live.timestamp,
+            align_timestamp(oct_1 + 33 * 86_400_000, interval_ms, "1M")
+        );
         assert_eq!(live.open, 50.0);
         assert_eq!(live.close, 55.0);
     }

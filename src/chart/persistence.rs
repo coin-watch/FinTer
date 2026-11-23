@@ -49,7 +49,7 @@ pub fn load_layout(root: &Path, exchange: &str, symbol: &str, timeframe: &str) -
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ChartLayout>(&bytes).ok())
-        .filter(|layout| layout.schema_version == 1)
+        .filter(|layout| (1..=2).contains(&layout.schema_version))
         .unwrap_or(fallback)
 }
 
@@ -74,7 +74,7 @@ pub fn load_preset(root: &Path, preset_name: &str) -> Option<ChartLayout> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ChartLayout>(&bytes).ok())
-        .filter(|layout| layout.schema_version == 1)
+        .filter(|layout| (1..=2).contains(&layout.schema_version))
 }
 
 pub fn list_presets(root: &Path) -> Vec<String> {
@@ -92,7 +92,11 @@ pub fn list_presets(root: &Path) -> Vec<String> {
 }
 
 /// Returns standard built-in layout presets.
-pub fn built_in_presets(exchange: &str, symbol: &str, timeframe: &str) -> Vec<(&'static str, ChartLayout)> {
+pub fn built_in_presets(
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+) -> Vec<(&'static str, ChartLayout)> {
     let mut default_layout = ChartLayout::new(exchange, symbol, timeframe);
     default_layout.indicators = vec![
         IndicatorInstance::new("ma-20", IndicatorKind::Ma),
