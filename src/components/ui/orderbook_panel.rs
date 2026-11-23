@@ -234,6 +234,20 @@ impl OrderBookPanel {
             .mid_price()
             .map_or(String::new(), |m| format!("Mid: {}", Self::fmt_price(m)));
 
+        let bid_qty: f64 = book.top_bids(10).iter().map(|level| level.quantity).sum();
+        let ask_qty: f64 = book.top_asks(10).iter().map(|level| level.quantity).sum();
+        let total_qty = bid_qty + ask_qty;
+        let imbalance_str = if total_qty > 0.0 {
+            format!("Imb: {:.0}%", bid_qty / total_qty * 100.0)
+        } else {
+            "Imb: —".to_string()
+        };
+        let imbalance_color = if bid_qty >= ask_qty {
+            colors.bullish
+        } else {
+            colors.bearish
+        };
+
         h_flex()
             .w_full()
             .px_2()
@@ -254,6 +268,13 @@ impl OrderBookPanel {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(colors.warning)
                     .child(spread_str),
+            )
+            .child(
+                div()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(11.0))
+                    .text_color(imbalance_color)
+                    .child(imbalance_str),
             )
             .child(
                 div()

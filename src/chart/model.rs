@@ -37,6 +37,12 @@ pub struct ChartLayout {
     /// Show the order-flow delta/CVD subpane.
     #[serde(default = "default_show_delta")]
     pub show_delta: bool,
+    /// Show the right-aligned volume profile.
+    #[serde(default)]
+    pub show_profile: bool,
+    /// Render the chart as a bid x ask footprint.
+    #[serde(default)]
+    pub show_footprint: bool,
 }
 
 fn default_show_delta() -> bool {
@@ -62,6 +68,8 @@ impl ChartLayout {
             pane_ratios: BTreeMap::new(),
             library_geometry: None,
             show_delta: true,
+            show_profile: false,
+            show_footprint: false,
         }
     }
 }

@@ -40,8 +40,9 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::Selectable;
 use gpui_component::chart::{
-    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle,
-    OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
+    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
+    FootprintCellSpec, IndicatorStyle, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
+    ProfileBarSpec, ProfileLineSpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::popover::Popover;
@@ -140,6 +141,10 @@ pub struct ChartPanel {
     orderflow_feed: Option<OrderFlowFeed>,
     /// Show the delta/CVD subpane when order-flow data is available.
     show_delta: bool,
+    /// Show the right-aligned volume profile.
+    show_profile: bool,
+    /// Render the chart as a bid x ask footprint.
+    show_footprint: bool,
 
     // Parameterized Indicators
     pub indicators: Vec<IndicatorInstance>,
@@ -310,6 +315,8 @@ impl ChartPanel {
             show_main_series: true,
             orderflow_feed: None,
             show_delta: true,
+            show_profile: false,
+            show_footprint: false,
 
             // Parameterized indicators & cache
             indicators: Vec::new(),
@@ -500,6 +507,8 @@ impl ChartPanel {
         self.drawings = layout.drawings;
         self.show_horizontal_grid = layout.show_grid;
         self.show_delta = layout.show_delta;
+        self.show_profile = layout.show_profile;
+        self.show_footprint = layout.show_footprint;
         if let Some(geom) = layout.library_geometry {
             self.library_x = geom.x;
             self.library_y = geom.y;
@@ -522,6 +531,8 @@ impl ChartPanel {
         };
         layout.show_grid = self.show_horizontal_grid;
         layout.show_delta = self.show_delta;
+        layout.show_profile = self.show_profile;
+        layout.show_footprint = self.show_footprint;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
@@ -840,6 +851,203 @@ impl ChartPanel {
         (lines, subpane_idx)
     }
 
+    fn compute_footprint_cells(
+        &self,
+        candles: &[OhlcvCandle],
+        orderflow: Option<&OrderFlowSnapshot>,
+        bullish: gpui::Hsla,
+        bearish: gpui::Hsla,
+        foreground: gpui::Hsla,
+    ) -> Vec<FootprintCellSpec> {
+        if !self.show_footprint {
+            return Vec::new();
+        }
+        let Some(orderflow) = orderflow else {
+            return Vec::new();
+        };
+        if orderflow.bars.is_empty() || candles.is_empty() {
+            return Vec::new();
+        }
+
+        let visible_candles = &candles[candles.len().saturating_sub(120)..];
+        let candle_ts: HashSet<i64> = visible_candles
+            .iter()
+            .map(|candle| candle.timestamp)
+            .collect();
+        let mut min_price = f64::INFINITY;
+        let mut max_price = f64::NEG_INFINITY;
+        for candle in visible_candles {
+            min_price = min_price.min(candle.low);
+            max_price = max_price.max(candle.high);
+        }
+        if !min_price.is_finite() || !max_price.is_finite() || max_price <= min_price {
+            return Vec::new();
+        }
+
+        const ROWS: usize = 30;
+        let step = (max_price - min_price) / ROWS as f64;
+        if step <= 0.0 {
+            return Vec::new();
+        }
+        let fmt_volume = |value: f64| -> String {
+            if value >= 1_000_000.0 {
+                format!("{:.1}M", value / 1_000_000.0)
+            } else if value >= 1_000.0 {
+                format!("{:.1}K", value / 1_000.0)
+            } else if value >= 1.0 {
+                format!("{value:.1}")
+            } else {
+                format!("{value:.2}")
+            }
+        };
+
+        let mut cells = Vec::new();
+        for bar in orderflow
+            .bars
+            .iter()
+            .filter(|bar| candle_ts.contains(&bar.timestamp))
+        {
+            let mut buckets = vec![(0.0f64, 0.0f64); ROWS];
+            for row in bar.price_rows.values() {
+                let idx = (((row.price - min_price) / step).floor() as isize)
+                    .clamp(0, ROWS as isize - 1) as usize;
+                buckets[idx].0 += row.buy_volume;
+                buckets[idx].1 += row.sell_volume;
+            }
+            for (idx, (buy, sell)) in buckets.into_iter().enumerate() {
+                if buy <= 0.0 && sell <= 0.0 {
+                    continue;
+                }
+                let delta = buy - sell;
+                let background = if delta >= 0.0 {
+                    bullish.opacity(0.20)
+                } else {
+                    bearish.opacity(0.20)
+                };
+                cells.push(FootprintCellSpec {
+                    timestamp_ms: bar.timestamp,
+                    price_low: min_price + step * idx as f64,
+                    price_high: min_price + step * (idx + 1) as f64,
+                    text: format!("{}×{}", fmt_volume(buy), fmt_volume(sell)).into(),
+                    background,
+                    text_color: foreground,
+                });
+            }
+        }
+        cells
+    }
+
+    fn compute_profile_bars(
+        &self,
+        candles: &[OhlcvCandle],
+        orderflow: Option<&OrderFlowSnapshot>,
+        color: gpui::Hsla,
+    ) -> (Vec<ProfileBarSpec>, Vec<ProfileLineSpec>) {
+        if !self.show_profile {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(orderflow) = orderflow else {
+            return (Vec::new(), Vec::new());
+        };
+        if orderflow.bars.is_empty() || candles.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut min_price = f64::INFINITY;
+        let mut max_price = f64::NEG_INFINITY;
+        for candle in candles {
+            if candle.low.is_finite() && candle.high.is_finite() {
+                min_price = min_price.min(candle.low);
+                max_price = max_price.max(candle.high);
+            }
+        }
+        if !min_price.is_finite() || !max_price.is_finite() || max_price <= min_price {
+            return (Vec::new(), Vec::new());
+        }
+
+        const ROWS: usize = 24;
+        let step = (max_price - min_price) / ROWS as f64;
+        if step <= 0.0 {
+            return (Vec::new(), Vec::new());
+        }
+        let mut volume = vec![0.0f64; ROWS];
+        let mut delta = vec![0.0f64; ROWS];
+        for bar in &orderflow.bars {
+            for row in bar.price_rows.values() {
+                let idx = (((row.price - min_price) / step).floor() as isize)
+                    .clamp(0, ROWS as isize - 1) as usize;
+                volume[idx] += row.volume();
+                delta[idx] += row.delta();
+            }
+        }
+        let max_volume = volume.iter().copied().fold(0.0, f64::max);
+        let total_volume: f64 = volume.iter().sum();
+        if max_volume <= 0.0 || total_volume <= 0.0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let bars: Vec<ProfileBarSpec> = volume
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value > 0.0)
+            .map(|(idx, value)| {
+                let width = (value / max_volume).clamp(0.0, 1.0) as f32 * 0.18;
+                let bar_color = if delta[idx] >= 0.0 {
+                    color.opacity(0.36)
+                } else {
+                    color.opacity(0.22)
+                };
+                ProfileBarSpec {
+                    price_low: min_price + step * idx as f64,
+                    price_high: min_price + step * (idx + 1) as f64,
+                    width_fraction: width,
+                    color: bar_color,
+                }
+            })
+            .collect();
+
+        // Value area: grow outward from POC by highest-volume rows until 70%.
+        let poc = volume
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        let mut order: Vec<usize> = (0..ROWS).collect();
+        order.sort_by(|&a, &b| volume[b].total_cmp(&volume[a]));
+        let target = total_volume * 0.70;
+        let mut accumulated = 0.0;
+        let mut included = std::collections::HashSet::new();
+        included.insert(poc);
+        accumulated += volume[poc];
+        for idx in order {
+            if accumulated >= target {
+                break;
+            }
+            if included.insert(idx) {
+                accumulated += volume[idx];
+            }
+        }
+        let low_idx = *included.iter().min().unwrap_or(&poc);
+        let high_idx = *included.iter().max().unwrap_or(&poc);
+        let lines = vec![
+            ProfileLineSpec {
+                price: min_price + step * (poc as f64 + 0.5),
+                color: color.opacity(0.75),
+            },
+            ProfileLineSpec {
+                price: min_price + step * (high_idx as f64 + 1.0),
+                color: color.opacity(0.38),
+            },
+            ProfileLineSpec {
+                price: min_price + step * low_idx as f64,
+                color: color.opacity(0.38),
+            },
+        ];
+
+        (bars, lines)
+    }
+
     // -----------------------------------------------------------------------
     // Helper Methods
     // -----------------------------------------------------------------------
@@ -1112,6 +1320,18 @@ impl Render for ChartPanel {
         // Compute parameterized indicators with versioned cache
         let (indicator_lines, subpane_count) =
             self.compute_indicators_for_chart(&candles, feed_version, orderflow_snapshot.as_ref());
+        let (profile_bars, profile_lines) = self.compute_profile_bars(
+            &candles,
+            orderflow_snapshot.as_ref(),
+            cx.theme().primary,
+        );
+        let footprint_cells = self.compute_footprint_cells(
+            &candles,
+            orderflow_snapshot.as_ref(),
+            cx.theme().bullish,
+            cx.theme().bearish,
+            cx.theme().colors.foreground,
+        );
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;
@@ -1515,6 +1735,14 @@ impl Render for ChartPanel {
                             .child(div().text_color(color).child(val_str)),
                     );
                 }
+                if orderflow_snapshot.as_ref().is_some_and(|snapshot| snapshot.partial) {
+                    row = row.child(
+                        div()
+                            .text_color(cx.theme().colors.warning)
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("PARTIAL"),
+                    );
+                }
                 if let PaneTarget::Subpane(idx) = first.pane {
                     let mut y0 = candle_h + 2.0;
                     for j in 0..idx {
@@ -1770,7 +1998,7 @@ impl Render for ChartPanel {
         // Candlestick chart construction
         let current_mark = candles.last().map(|c| c.close).unwrap_or(0.0);
         let mut chart = CandlestickChart::new(candles)
-            .show_candles(self.show_main_series)
+            .show_candles(self.show_main_series && !self.show_footprint)
             .subpane_count(subpane_count)
             .show_volume_pane(has_vol)
             .timestamp_ms(|c: &OhlcvCandle| c.timestamp)
@@ -1783,6 +2011,9 @@ impl Render for ChartPanel {
             .show_horizontal_grid(self.show_horizontal_grid)
             .chart_state(chart_st.clone())
             .volume(|c: &OhlcvCandle| c.volume)
+            .profile_bars(profile_bars)
+            .profile_lines(profile_lines)
+            .footprint_cells(footprint_cells)
             .format_timestamp_short({
                 let timezone = self.timezone.clone();
                 move |timestamp, best_interval, prev_ts_opt| {
@@ -2614,6 +2845,21 @@ impl Render for ChartPanel {
                         this.mark_dirty();
                         cx.notify();
                     }
+                    "d" => {
+                        this.show_delta = !this.show_delta;
+                        this.mark_dirty();
+                        cx.notify();
+                    }
+                    "p" => {
+                        this.show_profile = !this.show_profile;
+                        this.mark_dirty();
+                        cx.notify();
+                    }
+                    "v" => {
+                        this.show_footprint = !this.show_footprint;
+                        this.mark_dirty();
+                        cx.notify();
+                    }
                     "l" => {
                         let total = this.feed.len();
                         this.chart_state.scroll_to_latest(total);
@@ -2747,6 +2993,44 @@ impl ChartPanel {
                 this.show_indicator_library = !this.show_indicator_library;
                 cx.notify();
             }));
+
+        let orderflow = toolbar_button("toolbar_btn_orderflow", "icons/trending-up.svg", "Order flow")
+            .selected(self.show_delta)
+            .when(self.show_delta, |button| button.bg(active_bg).text_color(active_fg))
+            .tooltip("Delta / CVD order flow")
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.show_delta = !this.show_delta;
+                this.mark_dirty();
+                cx.notify();
+            }));
+
+        let profile = toolbar_button(
+            "toolbar_btn_profile",
+            "icons/sort-ascending.svg",
+            "Volume profile",
+        )
+        .selected(self.show_profile)
+        .when(self.show_profile, |button| button.bg(active_bg).text_color(active_fg))
+        .tooltip("Volume profile")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_profile = !this.show_profile;
+            this.mark_dirty();
+            cx.notify();
+        }));
+
+        let footprint = toolbar_button(
+            "toolbar_btn_footprint",
+            "icons/chart-candlestick.svg",
+            "Footprint",
+        )
+        .selected(self.show_footprint)
+        .when(self.show_footprint, |button| button.bg(active_bg).text_color(active_fg))
+        .tooltip("Bid x ask footprint")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_footprint = !this.show_footprint;
+            this.mark_dirty();
+            cx.notify();
+        }));
 
         let current_hex = self.drawing_color.clone();
         let current_hsv = self.drawing_color_hsv();
@@ -3175,6 +3459,9 @@ impl ChartPanel {
                     .gap(px(2.0))
                     .flex_shrink_0()
                     .child(indicators)
+                    .child(orderflow)
+                    .child(profile)
+                    .child(footprint)
                     .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(drawing_button(None, "toolbar_pointer", "icons/mouse-pointer.svg", "Pointer"))
                     .when(!is_ultra_compact, |this| {

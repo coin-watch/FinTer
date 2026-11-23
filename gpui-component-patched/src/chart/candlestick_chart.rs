@@ -33,6 +33,31 @@ pub struct PositionOverlaySpec {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FootprintCellSpec {
+    pub timestamp_ms: i64,
+    pub price_low: f64,
+    pub price_high: f64,
+    pub text: SharedString,
+    pub background: Hsla,
+    pub text_color: Hsla,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileLineSpec {
+    pub price: f64,
+    pub color: Hsla,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileBarSpec {
+    pub price_low: f64,
+    pub price_high: f64,
+    /// Fraction of the plot width, measured from the right edge.
+    pub width_fraction: f32,
+    pub color: Hsla,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrderOverlaySpec {
     pub id: String,
     pub symbol: String,
@@ -157,6 +182,12 @@ where
     order_overlays: Vec<OrderOverlaySpec>,
     /// Saved price-alert levels (dashed line + Y-axis pill).
     alert_overlays: Vec<AlertOverlaySpec>,
+    /// Optional right-aligned volume-profile bars.
+    profile_bars: Vec<ProfileBarSpec>,
+    /// Optional POC/VAH/VAL profile lines.
+    profile_lines: Vec<ProfileLineSpec>,
+    /// Optional bid x ask footprint cells.
+    footprint_cells: Vec<FootprintCellSpec>,
 }
 
 impl<T, Y> CandlestickChart<T, Y>
@@ -190,6 +221,9 @@ where
             position_overlays: Vec::new(),
             order_overlays: Vec::new(),
             alert_overlays: Vec::new(),
+            profile_bars: Vec::new(),
+            profile_lines: Vec::new(),
+            footprint_cells: Vec::new(),
         }
     }
 
@@ -325,6 +359,21 @@ where
     /// Attach saved price-alert levels (dashed lines + Y-axis pills).
     pub fn alert_overlays(mut self, overlays: Vec<AlertOverlaySpec>) -> Self {
         self.alert_overlays = overlays;
+        self
+    }
+
+    pub fn profile_bars(mut self, bars: Vec<ProfileBarSpec>) -> Self {
+        self.profile_bars = bars;
+        self
+    }
+
+    pub fn profile_lines(mut self, lines: Vec<ProfileLineSpec>) -> Self {
+        self.profile_lines = lines;
+        self
+    }
+
+    pub fn footprint_cells(mut self, cells: Vec<FootprintCellSpec>) -> Self {
+        self.footprint_cells = cells;
         self
     }
 }
@@ -696,6 +745,76 @@ where
         let crosshair_bg = cx.theme().foreground;
         let crosshair_fg = cx.theme().background;
         let candle_type = self.candle_type;
+
+        // Right-aligned volume profile. Drawn before candles so price action
+        // remains readable through the translucent bars.
+        for bar in &self.profile_bars {
+            if !bar.price_low.is_finite()
+                || !bar.price_high.is_finite()
+                || bar.price_high <= bar.price_low
+                || bar.width_fraction <= 0.0
+            {
+                continue;
+            }
+            let y_top = origin.y + px(y_scale.scale(bar.price_high));
+            let y_bottom = origin.y + px(y_scale.scale(bar.price_low));
+            let width = (chart_w * bar.width_fraction.clamp(0.0, 1.0)).max(1.0);
+            let x_right = origin.x + px(chart_w);
+            let x_left = x_right - px(width);
+            let bounds = Bounds::from_corners(
+                gpui::point(x_left, y_top.min(y_bottom)),
+                gpui::point(x_right, y_top.max(y_bottom)),
+            );
+            window.paint_quad(fill(bounds, bar.color));
+        }
+
+        for line in &self.profile_lines {
+            if !line.price.is_finite() {
+                continue;
+            }
+            let y = origin.y + px(y_scale.scale(line.price));
+            let mut path = PathBuilder::stroke(px(1.0));
+            path.move_to(gpui::point(origin.x, y));
+            path.line_to(gpui::point(origin.x + px(chart_w), y));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, line.color);
+            }
+        }
+
+        // Bid x ask footprint cells. Text is skipped on very narrow bars so
+        // adjacent columns remain readable.
+        if !self.footprint_cells.is_empty() {
+            let cell_w = (slot_w * 0.96).max(1.0);
+            for cell in &self.footprint_cells {
+                if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
+                    continue;
+                }
+                let Some(&center_x) = ts_to_x.get(&cell.timestamp_ms) else {
+                    continue;
+                };
+                if center_x < -slot_w || center_x > chart_w + slot_w {
+                    continue;
+                }
+                let y_top = origin.y + px(y_scale.scale(cell.price_high));
+                let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
+                let x_left = origin.x + px(center_x - cell_w / 2.0);
+                let x_right = origin.x + px(center_x + cell_w / 2.0);
+                let bounds = Bounds::from_corners(
+                    gpui::point(x_left, y_top.min(y_bottom)),
+                    gpui::point(x_right, y_top.max(y_bottom)),
+                );
+                window.paint_quad(fill(bounds, cell.background));
+                if cell_w >= 26.0 {
+                    paint_text_line_centered(
+                        cell.text.clone(),
+                        cell.text_color,
+                        bounds,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
 
         let mut period_high_f = f64::NEG_INFINITY;
         let mut period_low_f = f64::INFINITY;

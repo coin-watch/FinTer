@@ -18,6 +18,24 @@ use crate::data::tick::{TradeSide, UnifiedTick};
 const MAX_SEEN_TRADE_IDS: usize = 20_000;
 const MAX_BARS: usize = 5_000;
 
+/// Aggregated volume at one price within a bar.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PriceFlow {
+    pub price: f64,
+    pub buy_volume: f64,
+    pub sell_volume: f64,
+}
+
+impl PriceFlow {
+    pub fn delta(&self) -> f64 {
+        self.buy_volume - self.sell_volume
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.buy_volume + self.sell_volume
+    }
+}
+
 /// One aggregated bar. Volume is expressed in base units.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FlowBar {
@@ -25,6 +43,8 @@ pub struct FlowBar {
     pub buy_volume: f64,
     pub sell_volume: f64,
     pub trades: u32,
+    /// Per-price volume, keyed by price in millionths.
+    pub price_rows: BTreeMap<i64, PriceFlow>,
 }
 
 impl FlowBar {
@@ -98,6 +118,17 @@ impl State {
             bar.sell_volume += -amount;
         }
         bar.trades = bar.trades.saturating_add(1);
+
+        let price_key = (trade.price * 1_000_000.0).round() as i64;
+        let price_row = bar.price_rows.entry(price_key).or_insert(PriceFlow {
+            price: trade.price,
+            ..PriceFlow::default()
+        });
+        if amount >= 0.0 {
+            price_row.buy_volume += amount;
+        } else {
+            price_row.sell_volume += -amount;
+        }
 
         while self.bars.len() > MAX_BARS {
             let Some(oldest) = self.bars.keys().next().copied() else {
@@ -260,6 +291,15 @@ mod tests {
         assert!((snapshot.bars[0].buy_volume - 2.0).abs() < f64::EPSILON);
         assert!((snapshot.bars[0].sell_volume - 1.0).abs() < f64::EPSILON);
         assert!((snapshot.bars[0].delta() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.bars[0].price_rows.len(), 1);
+        let price_row = snapshot.bars[0]
+            .price_rows
+            .values()
+            .next()
+            .expect("price row");
+        assert!((price_row.price - 100.0).abs() < f64::EPSILON);
+        assert!((price_row.buy_volume - 2.0).abs() < f64::EPSILON);
+        assert!((price_row.sell_volume - 1.0).abs() < f64::EPSILON);
         assert!((snapshot.cvd[1].1 - 4.0).abs() < f64::EPSILON);
         assert!((snapshot.total_delta - 4.0).abs() < f64::EPSILON);
     }
