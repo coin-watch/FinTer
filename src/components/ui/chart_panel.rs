@@ -62,7 +62,7 @@ use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
 use crate::data::liquidity_feed::{LiquidityFeed, LiquiditySnapshot};
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
-use crate::data::orderflow_feed::{OrderFlowFeed, OrderFlowSnapshot};
+use crate::data::orderflow_feed::{DerivedFlowFeed, OrderFlowSnapshot};
 use crate::data::price_format::format_price;
 use crate::klinechart;
 
@@ -139,7 +139,7 @@ pub struct ChartPanel {
     show_main_series: bool,
 
     /// Optional order-flow feed (trades) for delta/CVD and future footprint.
-    orderflow_feed: Option<OrderFlowFeed>,
+    orderflow_feed: Option<DerivedFlowFeed>,
     /// Show the delta/CVD subpane when order-flow data is available.
     show_delta: bool,
     /// Show the right-aligned volume profile.
@@ -382,7 +382,7 @@ impl ChartPanel {
     }
 
     /// Attach the order-flow feed and wake the panel when new trades arrive.
-    pub fn set_orderflow_feed(&mut self, feed: OrderFlowFeed, cx: &mut Context<Self>) {
+    pub fn set_orderflow_feed(&mut self, feed: DerivedFlowFeed, cx: &mut Context<Self>) {
         let version = feed.version_handle();
         self.orderflow_feed = Some(feed);
         cx.spawn(async move |this, cx| {

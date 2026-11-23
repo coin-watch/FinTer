@@ -30,6 +30,9 @@ use tracing::{debug, error, info, warn};
 use crate::data::client::{service_base_url, tokio_runtime};
 use crate::data::models::OhlcvCandle;
 use crate::data::orderbook::{OrderBook, PriceLevel};
+use crate::data::orderflow_feed::{
+    DerivedDelta, DerivedFlowEvent, DerivedFootprint, DerivedProfile
+};
 use crate::data::tick::{TradeSide, UnifiedTick};
 
 // ---------------------------------------------------------------------------
@@ -215,6 +218,12 @@ pub struct BridgeConfig {
     pub trade_since_current_bar: bool,
     /// Order-book depth requested at subscribe time.
     pub orderbook_depth: u32,
+    /// Subscribe to derived delta bars.
+    pub delta: bool,
+    /// Subscribe to derived footprint bars.
+    pub footprint: bool,
+    /// Subscribe to the derived session profile.
+    pub profile: bool,
 }
 
 impl BridgeConfig {
@@ -235,6 +244,9 @@ impl BridgeConfig {
             trade_limit: 100,
             trade_since_current_bar: false,
             orderbook_depth: 20,
+            delta: false,
+            footprint: false,
+            profile: false,
         }
     }
 
@@ -325,6 +337,7 @@ pub struct Bridge {
     trade_sender: broadcast::Sender<Arc<UnifiedTick>>,
     ob_sender: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    derived_sender: broadcast::Sender<Arc<DerivedFlowEvent>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
     last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -349,6 +362,7 @@ impl Bridge {
         let (trade_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ob_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let (ohlcv_sender, _) = broadcast::channel(OHLCV_BROADCAST_CAPACITY);
+        let (derived_sender, _) = broadcast::channel(256);
         let cancel_token = CancellationToken::new();
         let last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -361,6 +375,7 @@ impl Bridge {
         let trade_tx = trade_sender.clone();
         let ob_tx = ob_sender.clone();
         let ohlcv_tx = ohlcv_sender.clone();
+        let derived_tx = derived_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
         let tick_cache = Arc::clone(&last_tick);
@@ -373,6 +388,7 @@ impl Bridge {
                 trade_tx,
                 ob_tx,
                 ohlcv_tx,
+                derived_tx,
                 token,
                 history_cache,
                 tick_cache,
@@ -386,6 +402,7 @@ impl Bridge {
             trade_sender,
             ob_sender,
             ohlcv_sender,
+            derived_sender,
             last_ohlcv_history,
             last_tick,
             last_orderbook,
@@ -453,6 +470,11 @@ impl Bridge {
         rx
     }
 
+    /// Subscribe to derived Level 3 order-flow events.
+    pub fn subscribe_derived_flow(&self) -> broadcast::Receiver<Arc<DerivedFlowEvent>> {
+        self.derived_sender.subscribe()
+    }
+
     /// Number of active trade tick subscribers.
     pub fn subscriber_count(&self) -> usize {
         self.tick_sender.receiver_count()
@@ -474,6 +496,7 @@ async fn supervision_loop(
     trade_tx: broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    derived_tx: broadcast::Sender<Arc<DerivedFlowEvent>>,
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -509,6 +532,7 @@ async fn supervision_loop(
             &trade_tx,
             &ob_tx,
             &ohlcv_tx,
+            &derived_tx,
             &cancel_token,
             &history_cache,
             &last_tick_cache,
@@ -578,6 +602,25 @@ enum Requirement<'a> {
         timeframe: &'a str,
         lookback: u32,
     },
+    Delta {
+        exchange: &'a str,
+        symbol: &'a str,
+        timeframe: &'a str,
+        lookback: u32,
+    },
+    Footprint {
+        exchange: &'a str,
+        symbol: &'a str,
+        timeframe: &'a str,
+        lookback: u32,
+        rows: u32,
+    },
+    Profile {
+        exchange: &'a str,
+        symbol: &'a str,
+        timeframe: &'a str,
+        mode: &'a str,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -598,6 +641,9 @@ enum StreamChannel {
     Trades,
     Orderbook,
     Ohlcv,
+    Delta,
+    Footprint,
+    Profile,
 }
 
 impl StreamChannel {
@@ -607,6 +653,9 @@ impl StreamChannel {
             Self::Trades => "trades",
             Self::Orderbook => "orderbook",
             Self::Ohlcv => "kline",
+            Self::Delta => "delta",
+            Self::Footprint => "footprint",
+            Self::Profile => "profile",
         }
     }
 
@@ -616,6 +665,9 @@ impl StreamChannel {
             "trades" | "tape" => Some(Self::Trades),
             "orderbook" | "book" => Some(Self::Orderbook),
             "kline" | "ohlcv" | "chart" => Some(Self::Ohlcv),
+            "delta" => Some(Self::Delta),
+            "footprint" => Some(Self::Footprint),
+            "profile" => Some(Self::Profile),
             _ => None,
         }
     }
@@ -630,6 +682,12 @@ fn channel_for_feed(feed: &str) -> Option<StreamChannel> {
         Some(StreamChannel::Orderbook)
     } else if feed.starts_with("ohlcv:") || feed.starts_with("candles:") {
         Some(StreamChannel::Ohlcv)
+    } else if feed.starts_with("delta:") {
+        Some(StreamChannel::Delta)
+    } else if feed.starts_with("footprint:") {
+        Some(StreamChannel::Footprint)
+    } else if feed.starts_with("profile:") {
+        Some(StreamChannel::Profile)
     } else {
         None
     }
@@ -786,6 +844,7 @@ async fn connect_and_stream(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -901,9 +960,61 @@ async fn connect_and_stream(
             .send(Message::Text(serde_json::to_string(&frame)?))
             .await?;
     }
+    if config.delta {
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Delta.id(),
+            requirement: Requirement::Delta {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                timeframe: &config.timeframe,
+                lookback: 500,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
+    }
+    if config.footprint {
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Footprint.id(),
+            requirement: Requirement::Footprint {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                timeframe: &config.timeframe,
+                lookback: 300,
+                rows: 40,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
+    }
+    if config.profile {
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Profile.id(),
+            requirement: Requirement::Profile {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                timeframe: "session",
+                mode: "session",
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
+    }
     debug!(
-        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={})",
-        config.ticker, config.kline, config.orderbook, config.trades
+        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={}, delta={}, footprint={}, profile={})",
+        config.ticker,
+        config.kline,
+        config.orderbook,
+        config.trades,
+        config.delta,
+        config.footprint,
+        config.profile
     );
 
     let mut feed_channels: HashMap<String, StreamChannel> = HashMap::new();
@@ -918,7 +1029,14 @@ async fn connect_and_stream(
     loop {
         tokio::select! {
             _ = heartbeat_interval.tick() => {
-                if !config.ticker && !config.kline && !config.orderbook && !config.trades {
+                if !config.ticker
+                    && !config.kline
+                    && !config.orderbook
+                    && !config.trades
+                    && !config.delta
+                    && !config.footprint
+                    && !config.profile
+                {
                     continue;
                 }
                 let heartbeat = HeartbeatFrame {
@@ -945,6 +1063,7 @@ async fn connect_and_stream(
                             trade_tx,
                             ob_tx,
                             ohlcv_tx,
+                            derived_tx,
                             history_cache,
                             last_tick_cache,
                             last_ob_cache,
@@ -1008,6 +1127,7 @@ fn handle_gateway_frame(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
@@ -1061,6 +1181,7 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
+                    derived_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1105,6 +1226,7 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
+                    derived_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1163,10 +1285,39 @@ fn dispatch_new_data(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
+    if matches!(
+        channel,
+        StreamChannel::Delta | StreamChannel::Footprint | StreamChannel::Profile
+    ) {
+        let items = match data.as_array() {
+            Some(rows) => rows.clone(),
+            None => vec![data.clone()]
+        };
+        for item in items {
+            let event = match channel {
+                StreamChannel::Delta => serde_json::from_value::<DerivedDelta>(item)
+                    .ok()
+                    .map(DerivedFlowEvent::Delta),
+                StreamChannel::Footprint => serde_json::from_value::<DerivedFootprint>(item)
+                    .ok()
+                    .map(DerivedFlowEvent::Footprint),
+                StreamChannel::Profile => serde_json::from_value::<DerivedProfile>(item)
+                    .ok()
+                    .map(DerivedFlowEvent::Profile),
+                _ => None
+            };
+            if let Some(event) = event {
+                let _ = derived_tx.send(Arc::new(event));
+            }
+        }
+        return;
+    }
+
     let envelope = serde_json::json!({
         "type": "data",
         "channel": channel.id(),
@@ -1858,6 +2009,9 @@ mod tests {
             trade_limit: 100,
             trade_since_current_bar: false,
             orderbook_depth: 20,
+            delta: false,
+            footprint: false,
+            profile: false,
         }
     }
 
@@ -1878,6 +2032,7 @@ mod tests {
         let (trades, mut trade_rx) = broadcast::channel(16);
         let (books, _) = broadcast::channel(16);
         let (candles, mut candle_rx) = broadcast::channel(16);
+        let (derived, _) = broadcast::channel(16);
         let history = Arc::new(std::sync::Mutex::new(None));
         let last_tick = Arc::new(std::sync::Mutex::new(None));
         let last_book = Arc::new(std::sync::Mutex::new(None));
@@ -1896,6 +2051,7 @@ mod tests {
                 &trades,
                 &books,
                 &candles,
+                &derived,
                 &history,
                 &last_tick,
                 &last_book,
@@ -2166,6 +2322,7 @@ mod tests {
         let (trade_tx, _) = broadcast::channel(16);
         let (ob_tx, _) = broadcast::channel(16);
         let (ohlcv_tx, _) = broadcast::channel(16);
+        let (derived_tx, _) = broadcast::channel(16);
 
         let cached_tick = Arc::new(UnifiedTick::new("binance", "BTC/USDT", 68500.0, 1.0, TradeSide::Buy, 1000));
         let cached_book = Arc::new(OrderBook::new(
@@ -2181,6 +2338,7 @@ mod tests {
             trade_sender: trade_tx,
             ob_sender: ob_tx,
             ohlcv_sender: ohlcv_tx,
+            derived_sender: derived_tx,
             last_ohlcv_history: Arc::new(std::sync::Mutex::new(None)),
             last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
             last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),

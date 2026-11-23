@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -267,8 +268,220 @@ async fn drain_loop(
     }
 }
 
+/// Derived Level 3 events received from the backend. FinTer renders these
+/// directly instead of recomputing order flow from raw trades.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerivedDelta {
+    pub timeframe: String,
+    pub bar_start: i64,
+    pub bar_end: i64,
+    pub buy_volume: f64,
+    pub sell_volume: f64,
+    pub delta: f64,
+    pub cvd: f64,
+    pub vwap: f64,
+    pub trades: u32,
+    pub max_print: f64,
+    pub is_closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerivedFootprintRow {
+    pub price_low: f64,
+    pub price_high: f64,
+    pub buy: f64,
+    pub sell: f64,
+    pub buy_count: u32,
+    pub sell_count: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerivedFootprint {
+    pub timeframe: String,
+    pub bar_start: i64,
+    pub bar_end: i64,
+    pub rows: Vec<DerivedFootprintRow>,
+    pub poc: Option<f64>,
+    pub delta: f64,
+    pub total_volume: f64,
+    pub is_closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct DerivedProfile {
+    pub timeframe: String,
+    pub window_start: i64,
+    pub window_end: i64,
+    pub rows: Vec<DerivedFootprintRow>,
+    pub poc: Option<f64>,
+    pub vah: Option<f64>,
+    pub val: Option<f64>,
+    pub total_volume: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DerivedFlowEvent {
+    Delta(DerivedDelta),
+    Footprint(DerivedFootprint),
+    Profile(DerivedProfile),
+}
+
+#[derive(Default)]
+struct DerivedState {
+    bars: BTreeMap<i64, FlowBar>,
+    cvd: BTreeMap<i64, f64>,
+    profile: Vec<DerivedFootprintRow>,
+    partial: bool,
+}
+
+impl DerivedState {
+    fn ingest(&mut self, event: &DerivedFlowEvent) {
+        match event {
+            DerivedFlowEvent::Delta(delta) => {
+                let bar = self.bars.entry(delta.bar_start).or_insert(FlowBar {
+                    timestamp: delta.bar_start,
+                    ..FlowBar::default()
+                });
+                bar.buy_volume = delta.buy_volume;
+                bar.sell_volume = delta.sell_volume;
+                bar.trades = delta.trades;
+                self.cvd.insert(delta.bar_start, delta.cvd);
+            }
+            DerivedFlowEvent::Footprint(footprint) => {
+                let bar = self.bars.entry(footprint.bar_start).or_insert(FlowBar {
+                    timestamp: footprint.bar_start,
+                    ..FlowBar::default()
+                });
+                bar.buy_volume = 0.0;
+                bar.sell_volume = 0.0;
+                bar.price_rows.clear();
+                for row in &footprint.rows {
+                    let key = (row.price_low * 1_000_000.0).round() as i64;
+                    let volume = row.buy + row.sell;
+                    let price_row = bar.price_rows.entry(key).or_insert(PriceFlow {
+                        price: (row.price_low + row.price_high) / 2.0,
+                        ..PriceFlow::default()
+                    });
+                    price_row.buy_volume += row.buy;
+                    price_row.sell_volume += row.sell;
+                    let _ = volume;
+                    bar.buy_volume += row.buy;
+                    bar.sell_volume += row.sell;
+                    bar.trades += row.buy_count + row.sell_count;
+                }
+            }
+            DerivedFlowEvent::Profile(profile) => {
+                self.profile = profile.rows.clone();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> OrderFlowSnapshot {
+        let bars: Vec<FlowBar> = self.bars.values().cloned().collect();
+        let mut cvd = Vec::with_capacity(bars.len());
+        let mut running = 0.0;
+        for bar in &bars {
+            if let Some(value) = self.cvd.get(&bar.timestamp) {
+                running = *value;
+            } else {
+                running += bar.delta();
+            }
+            cvd.push((bar.timestamp, running));
+        }
+        OrderFlowSnapshot {
+            bars,
+            cvd,
+            total_delta: running,
+            partial: self.partial,
+        }
+    }
+}
+
+/// Feed that consumes derived Level 3 events from the backend.
+pub struct DerivedFlowFeed {
+    inner: Arc<Mutex<DerivedState>>,
+    version: Arc<AtomicU64>,
+    cancel: CancellationToken,
+    _task: JoinHandle<()>,
+}
+
+impl DerivedFlowFeed {
+    pub fn new(receiver: broadcast::Receiver<Arc<DerivedFlowEvent>>) -> Self {
+        let inner = Arc::new(Mutex::new(DerivedState::default()));
+        let version = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+
+        let task_inner = Arc::clone(&inner);
+        let task_version = Arc::clone(&version);
+        let task_cancel = cancel.clone();
+        let task = tokio_runtime().spawn(async move {
+            let mut receiver = receiver;
+            loop {
+                tokio::select! {
+                    _ = task_cancel.cancelled() => break,
+                    message = receiver.recv() => {
+                        match message {
+                            Ok(event) => {
+                                if let Ok(mut state) = task_inner.lock() {
+                                    state.ingest(&event);
+                                }
+                                task_version.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                if let Ok(mut state) = task_inner.lock() {
+                                    state.partial = true;
+                                }
+                                task_version.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            inner,
+            version,
+            cancel,
+            _task: task,
+        }
+    }
+
+    pub fn snapshot_with_version(&self) -> (u64, OrderFlowSnapshot) {
+        let value = self
+            .inner
+            .lock()
+            .map(|state| state.snapshot())
+            .unwrap_or_default();
+        (self.version.load(Ordering::Relaxed), value)
+    }
+
+    pub fn snapshot(&self) -> OrderFlowSnapshot {
+        self.snapshot_with_version().1
+    }
+
+    pub fn version_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.version)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|state| state.bars.is_empty())
+            .unwrap_or(true)
+    }
+}
+
+impl Drop for DerivedFlowFeed {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn trade(id: &str, side: TradeSide, price: f64, amount: f64, ts: i64) -> UnifiedTick {
@@ -328,5 +541,57 @@ mod tests {
         assert_eq!(snapshot.bars.len(), 2);
         assert_eq!(snapshot.bars[0].timestamp, 0);
         assert_eq!(snapshot.bars[1].timestamp, 300_000);
+    }
+
+    #[test]
+    fn derived_events_populate_display_snapshot() {
+        let mut state = DerivedState::default();
+        state.ingest(&DerivedFlowEvent::Delta(DerivedDelta {
+            timeframe: "1m".into(),
+            bar_start: 60_000,
+            bar_end: 120_000,
+            buy_volume: 3.0,
+            sell_volume: 1.0,
+            delta: 2.0,
+            cvd: 2.0,
+            vwap: 100.0,
+            trades: 4,
+            max_print: 200.0,
+            is_closed: false
+        }));
+        state.ingest(&DerivedFlowEvent::Footprint(DerivedFootprint {
+            timeframe: "1m".into(),
+            bar_start: 60_000,
+            bar_end: 120_000,
+            rows: vec![
+                DerivedFootprintRow {
+                    price_low: 100.0,
+                    price_high: 100.0,
+                    buy: 2.0,
+                    sell: 1.0,
+                    buy_count: 2,
+                    sell_count: 1
+                },
+                DerivedFootprintRow {
+                    price_low: 101.0,
+                    price_high: 101.0,
+                    buy: 1.0,
+                    sell: 0.0,
+                    buy_count: 1,
+                    sell_count: 0
+                }
+            ],
+            poc: Some(100.0),
+            delta: 2.0,
+            total_volume: 4.0,
+            is_closed: false
+        }));
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.bars.len(), 1);
+        assert_eq!(snapshot.bars[0].price_rows.len(), 2);
+        assert!((snapshot.bars[0].buy_volume - 3.0).abs() < f64::EPSILON);
+        assert!((snapshot.bars[0].sell_volume - 1.0).abs() < f64::EPSILON);
+        assert!((snapshot.cvd[0].1 - 2.0).abs() < f64::EPSILON);
     }
 }

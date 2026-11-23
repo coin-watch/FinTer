@@ -1989,9 +1989,10 @@ impl PaneGridRenderer {
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
                                         bridge_config.timeframe = timeframe.clone();
-                                        bridge_config.trades = true;
-                                        bridge_config.trade_limit = 5000;
-                                        bridge_config.trade_since_current_bar = true;
+                                        bridge_config.trades = false;
+                                        bridge_config.delta = true;
+                                        bridge_config.footprint = true;
+                                        bridge_config.profile = true;
                                         bridge_config.orderbook = true;
                                         bridge_config.orderbook_depth = 50;
                                         bridge_config.ticker = true;
@@ -2008,12 +2009,12 @@ impl PaneGridRenderer {
                                             Ok(bridge) => {
                                                 let rx = bridge.subscribe_ohlcv();
                                                 let tick_rx = bridge.subscribe();
-                                                let trade_rx = bridge.subscribe_trades();
+                                                let derived_rx = bridge.subscribe_derived_flow();
                                                 let book_rx = bridge.subscribe_orderbook();
-                                                let orderflow = crate::data::orderflow_feed::OrderFlowFeed::new(
-                                                    trade_rx,
-                                                    crate::data::bridge::BridgeConfig::timeframe_to_ms(&timeframe),
-                                                );
+                                                let orderflow =
+                                                    crate::data::orderflow_feed::DerivedFlowFeed::new(
+                                                        derived_rx,
+                                                    );
                                                 let liquidity = crate::data::liquidity_feed::LiquidityFeed::new(book_rx);
                                                 let feed = crate::data::candle_feed::CandleFeed::new(rx, Some(tick_rx), Some(timeframe.clone()));
                                                 if !crate::data::client::is_api_url_configured() {
