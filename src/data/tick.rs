@@ -61,6 +61,10 @@ pub struct UnifiedTick {
     pub side: TradeSide,
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: TimestampMs,
+    /// Exchange trade id when the venue provides one. Used to dedupe
+    /// reconnect snapshots and retried stream frames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
     /// Rolling 24-hour ticker statistics; absent on individual trades.
     #[serde(default)]
     pub change_24h_percent: Option<f64>,
@@ -91,6 +95,7 @@ impl UnifiedTick {
             amount,
             side,
             timestamp_ms,
+            trade_id: None,
             change_24h_percent: None,
             quote_volume_24h: None,
             open_24h: None,

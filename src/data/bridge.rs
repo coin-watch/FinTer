@@ -1,15 +1,19 @@
-/// CoinWatch WebSocket gateway client.
+/// CoinWatch realtime gateway client.
 ///
-/// Connects to the CoinWatch WebSocket facade (`wss://<api-origin>/ws`) and
-/// subscribes to market channels:
+/// Connects to CoinWatch's `/ws` facade and negotiates the same v2 protocol the
+/// web dashboard uses (`hello` / `sub` / `snapshot` / `delta` / `hb`). Both the
+/// native client and the browser share one endpoint; there is no legacy
+/// `?legacy=1` path.
 ///
+/// Channels:
 /// - `ticker`    → [`UnifiedTick`] stream (real-time price updates)
-/// - `trades`    → [`UnifiedTick`] stream
+/// - `trades`    → [`UnifiedTick`] stream (may arrive as batches)
 /// - `orderbook` → [`OrderBook`] snapshot stream
-/// - `kline`     → [`OhlcvCandle`] stream (server pushes ~every 2 s)
+/// - `ohlcv`     → [`OhlcvCandle`] stream
 ///
-/// OHLCV history (200 candles) is fetched once via REST at startup so the
-/// chart has data immediately; live kline updates then merge on top.
+/// OHLCV history is still fetched once via REST on the first connection so the
+/// chart has more context than the gateway's snapshot; live candle updates then
+/// merge on top. Ticker, book, and trade snapshots come from the gateway.
 ///
 /// Dropping the handle cancels the supervision loop and closes the connection.
 use std::collections::HashMap;
@@ -204,10 +208,7 @@ pub struct BridgeConfig {
     pub trades: bool,
     pub orderbook: bool,
     pub kline: bool,
-    pub fetch_history: bool,
-    /// Optional initial REST snapshot channel and its CoinWatch dashboard limit.
-    pub snapshot: Option<(&'static str, u32, &'static str)>,
-}
+    pub fetch_history: bool,}
 
 impl BridgeConfig {
     pub fn default_dev(exchange: &str, symbol: &str) -> Self {
@@ -224,7 +225,6 @@ impl BridgeConfig {
             orderbook: true,
             kline: true,
             fetch_history: true,
-            snapshot: None,
         }
     }
 
@@ -248,14 +248,6 @@ impl BridgeConfig {
                 format!("wss://{base}/ws")
             }
         })
-    }
-
-    /// Gateway expects punctuation-delimited symbols as dashes, not slash pairs.
-    fn ws_symbol(&self) -> String {
-        self.symbol
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect()
     }
 
     /// REST URL for the initial 200-candle history fetch.
@@ -477,7 +469,7 @@ async fn supervision_loop(
     last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
-    let mut initial_snapshot_done = false;
+    let mut history_fetched = false;
     loop {
         if cancel_token.is_cancelled() {
             info!("gateway: supervision loop cancelled");
@@ -511,14 +503,14 @@ async fn supervision_loop(
             &history_cache,
             &last_tick_cache,
             &last_ob_cache,
-            !initial_snapshot_done,
+            !history_fetched,
         )
         .await
         {
             Ok(_) => info!("gateway: WebSocket closed cleanly"),
             Err(e) => error!("gateway: WebSocket error: {e}"),
         }
-        initial_snapshot_done = true;
+        history_fetched = true;
 
         if cancel_token.is_cancelled() {
             return;
@@ -536,18 +528,151 @@ async fn supervision_loop(
 // WebSocket connection + message loop
 // ---------------------------------------------------------------------------
 
-/// Outbound subscribe message.
+/// Outbound protocol frames for the realtime-ondemand gateway.
 #[derive(serde::Serialize)]
-struct SubscribeMsg<'a> {
-    action: &'a str,
-    channel: &'a str,
-    exchange: &'a str,
-    symbol: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeframe: Option<&'a str>,
+struct HelloFrame {
+    op: &'static str,
+    protocol: u8,
+    caps: [&'static str; 4],
 }
 
-/// Top-level envelope for every message from the gateway.
+#[derive(serde::Serialize)]
+struct SubscribeFrame<'a> {
+    op: &'static str,
+    id: &'a str,
+    requirement: Requirement<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Requirement<'a> {
+    Ticker {
+        exchange: &'a str,
+        symbol: &'a str,
+    },
+    Trades {
+        exchange: &'a str,
+        symbol: &'a str,
+        limit: u32,
+    },
+    Orderbook {
+        exchange: &'a str,
+        symbol: &'a str,
+        depth: u32,
+    },
+    Ohlcv {
+        exchange: &'a str,
+        symbol: &'a str,
+        timeframe: &'a str,
+        lookback: u32,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct HeartbeatFrame {
+    op: &'static str,
+    ts: i64,
+}
+
+#[derive(serde::Serialize)]
+struct ResyncFrame<'a> {
+    op: &'static str,
+    id: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamChannel {
+    Ticker,
+    Trades,
+    Orderbook,
+    Ohlcv,
+}
+
+impl StreamChannel {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Ticker => "ticker",
+            Self::Trades => "trades",
+            Self::Orderbook => "orderbook",
+            Self::Ohlcv => "kline",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "ticker" => Some(Self::Ticker),
+            "trades" | "tape" => Some(Self::Trades),
+            "orderbook" | "book" => Some(Self::Orderbook),
+            "kline" | "ohlcv" | "chart" => Some(Self::Ohlcv),
+            _ => None,
+        }
+    }
+}
+
+fn channel_for_feed(feed: &str) -> Option<StreamChannel> {
+    if feed.starts_with("ticker:") {
+        Some(StreamChannel::Ticker)
+    } else if feed.starts_with("trades:") {
+        Some(StreamChannel::Trades)
+    } else if feed.starts_with("book:") {
+        Some(StreamChannel::Orderbook)
+    } else if feed.starts_with("ohlcv:") || feed.starts_with("candles:") {
+        Some(StreamChannel::Ohlcv)
+    } else {
+        None
+    }
+}
+
+/// A parsed v2 gateway frame. The client only needs the fields it acts on.
+#[derive(Debug, Default)]
+struct GatewayFrame {
+    op: Option<String>,
+    id: Option<String>,
+    feed: Option<String>,
+    seq: Option<u64>,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+    data: Option<serde_json::Value>,
+    message: Option<String>,
+    code: Option<String>,
+    stale: Option<bool>,
+}
+
+impl GatewayFrame {
+    fn parse(text: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object()?;
+        Some(Self {
+            op: object
+                .get("op")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            id: object
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            feed: object
+                .get("feed")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            seq: object.get("seq").and_then(|v| v.as_u64()),
+            first_seq: object.get("first_seq").and_then(|v| v.as_u64()),
+            last_seq: object.get("last_seq").and_then(|v| v.as_u64()),
+            data: object.get("data").cloned(),
+            message: object
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            code: object
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            stale: object.get("stale").and_then(|v| v.as_bool()),
+        })
+    }
+}
+
+/// Top-level envelope for the internal dispatch path.
 #[derive(Debug)]
 struct GatewayMessage {
     /// Set on subscription ack: `"info"` / `"data"`.
@@ -618,11 +743,13 @@ pub struct GatewayTrade {
     )]
     pub timestamp: i64,
     #[serde(default, alias = "s", alias = "S")]
-    pub side: String,
+    pub side: Option<String>,
     #[serde(default, alias = "p", alias = "px")]
     pub price: f64,
     #[serde(default, alias = "q", alias = "qty", alias = "size", alias = "sz")]
     pub amount: f64,
+    #[serde(default, alias = "cost", alias = "notional")]
+    pub cost: Option<f64>,
 }
 
 /// Order book payload in an `orderbook` data push.
@@ -637,6 +764,8 @@ struct GatewayOrderBook {
     /// both cannot trigger a duplicate-field error.
     #[serde(default)]
     exchange_ts: Option<i64>,
+    #[serde(default)]
+    nonce: Option<u64>,
 }
 
 async fn connect_and_stream(
@@ -649,12 +778,12 @@ async fn connect_and_stream(
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
-    should_fetch_initial_snapshot: bool,
+    fetch_history_once: bool,
 ) -> anyhow::Result<()> {
     // Only chart and ticker panes ask CoinWatch for an OHLCV REST snapshot.
     // Other panes are stream-only; requesting chart history for each of them
     // produced traffic (and credit deductions) the web dashboard never makes.
-    if config.fetch_history && should_fetch_initial_snapshot {
+    if config.fetch_history && fetch_history_once {
         info!(
             "gateway: fetching {} historical candles for {} {} {}",
             config.ohlcv_limit, config.exchange, config.symbol, config.timeframe
@@ -675,145 +804,6 @@ async fn connect_and_stream(
         }
     }
 
-    // REST seeds a bridge once, not once per socket connection. In particular,
-    // trades reconnects must not replay a paid limit-60 snapshot into the tape.
-    if should_fetch_initial_snapshot {
-        if let Some((channel, limit, module)) = config.snapshot {
-            match channel {
-            "ticker" => {
-                if let Some(data) = fetch_ticker_snapshot(config, module).await {
-                    let envelope = serde_json::json!({
-                        "type": "data",
-                        "channel": "ticker",
-                        "exchange": config.exchange,
-                        "symbol": config.symbol,
-                        "data": data,
-                    });
-                    handle_message(
-                        &envelope.to_string(),
-                        config,
-                        tick_tx,
-                        trade_tx,
-                        ob_tx,
-                        ohlcv_tx,
-                        history_cache,
-                        last_tick_cache,
-                        last_ob_cache,
-                    );
-                }
-            }
-            "orderbook" => {
-                let url = format!("{}/api/v1/orderbook?exchange={}&symbol={}&limit={}&module={}&source=native",
-                    config.rest_base_url,
-                    urlencoding::encode(&config.exchange.to_lowercase()),
-                    urlencoding::encode(&config.symbol),
-                    limit,
-                    urlencoding::encode(&format!("{} · {} (limit {})", module, config.symbol, limit)),
-                );
-                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
-                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
-                if let Some(t) = token { req = req.bearer_auth(t); }
-                if let Ok(resp) = req.send().await {
-                    let status = resp.status();
-                    if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-                            let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
-                            let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-                            crate::data::credits::CreditStore::record(
-                                "OrderBook",
-                                msg,
-                                balance,
-                                required,
-                                Some(&config.rest_base_url),
-                            );
-                        } else {
-                            let bids = val.get("bids").and_then(|v| v.as_array()).map(|arr| {
-                                arr.iter().filter_map(|row| {
-                                    let r = row.as_array()?;
-                                    Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
-                                }).collect()
-                            }).unwrap_or_default();
-                            let asks = val.get("asks").and_then(|v| v.as_array()).map(|arr| {
-                                arr.iter().filter_map(|row| {
-                                    let r = row.as_array()?;
-                                    Some(PriceLevel::new(r.get(0)?.as_f64()?, r.get(1)?.as_f64()?))
-                                }).collect()
-                            }).unwrap_or_default();
-                            let book = Arc::new(OrderBook::new(
-                                config.exchange.clone(),
-                                config.symbol.clone(),
-                                bids,
-                                asks,
-                                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
-                            ));
-                            if let Ok(mut cache) = last_ob_cache.lock() {
-                                *cache = Some(Arc::clone(&book));
-                            }
-                            if let Some(mid) = book.mid_price() {
-                                if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
-                                    if store.get_mark_price(&config.symbol).is_none() {
-                                        store.set_mark_price(&config.symbol, mid);
-                                    }
-                                }
-                            }
-                            let _ = ob_tx.send(book);
-                        }
-                    }
-                }
-            }
-            "trades" => {
-                let url = format!("{}/api/v1/trades?exchange={}&symbol={}&limit={}&module={}&source=native",
-                    config.rest_base_url,
-                    urlencoding::encode(&config.exchange.to_lowercase()),
-                    urlencoding::encode(&config.symbol),
-                    limit,
-                    urlencoding::encode(&format!("{} · {} (limit {})", module, config.symbol, limit)),
-                );
-                let token = crate::data::session_store::load_session().ok().flatten().map(|s| s.access_token).or_else(|| config.access_token.clone());
-                let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
-                if let Some(t) = token { req = req.bearer_auth(t); }
-                if let Ok(resp) = req.send().await {
-                    let status = resp.status();
-                    if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-                            let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
-                            let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-                            crate::data::credits::CreditStore::record(
-                                "Trades",
-                                msg,
-                                balance,
-                                required,
-                                Some(&config.rest_base_url),
-                            );
-                        } else {
-                            let trades = val.get("trades").and_then(|v| v.as_array()).or_else(|| val.as_array());
-                            if let Some(arr) = trades {
-                                for item in arr.iter().rev() {
-                                    if let (Some(p), Some(a)) = (
-                                        item.get("price").and_then(|v| v.as_f64()),
-                                        item.get("amount").and_then(|v| v.as_f64()),
-                                    ) {
-                                        let raw_side = item.get("side").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                        let side = if raw_side.contains("buy") { TradeSide::Buy } else if raw_side.contains("sell") { TradeSide::Sell } else { TradeSide::Unknown };
-                                        let ts = item.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-                                        let tick = UnifiedTick::new(&config.exchange, &config.symbol, p, a, side, ts);
-                                        if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
-                                            store.set_mark_price(&tick.symbol, tick.price);
-                                        }
-                                        let _ = trade_tx.send(Arc::new(tick));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-                _ => {}
-            }
-        }
-    }
     let url = config.ws_url();
     if url.trim().is_empty() {
         anyhow::bail!("No API service URL configured");
@@ -823,60 +813,83 @@ async fn connect_and_stream(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Gateway handles subscription control messages serially. Sending several
-    // messages before it acknowledges each one silently drops later channels.
-    let ws_symbol = config.ws_symbol();
-    let mut subscriptions = Vec::new();
+    // One protocol, negotiated in-band. CoinWatch relays the same frames from
+    // web and native clients; there is no legacy `?legacy=1` path anymore.
+    let hello = HelloFrame {
+        op: "hello",
+        protocol: 2,
+        caps: ["trade_batch", "seq", "status", "strict_side"],
+    };
+    write
+        .send(Message::Text(serde_json::to_string(&hello)?))
+        .await?;
+
     if config.ticker {
-        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "ticker", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Ticker.id(),
+            requirement: Requirement::Ticker {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
     }
     if config.kline {
-        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "kline", exchange: &config.exchange, symbol: &ws_symbol, timeframe: Some(&config.timeframe) });
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Ohlcv.id(),
+            requirement: Requirement::Ohlcv {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                timeframe: &config.timeframe,
+                lookback: config.ohlcv_limit,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
     }
     if config.orderbook {
-        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "orderbook", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Orderbook.id(),
+            requirement: Requirement::Orderbook {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                depth: 20,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
     }
     if config.trades {
-        subscriptions.push(SubscribeMsg { action: "subscribe", channel: "trades", exchange: &config.exchange, symbol: &ws_symbol, timeframe: None });
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Trades.id(),
+            requirement: Requirement::Trades {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                limit: 100,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
     }
-    for msg in subscriptions {
-        write.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-        loop {
-            match read.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let ack: serde_json::Value = serde_json::from_str(&text)?;
-                    let is_info = ack.get("type").and_then(serde_json::Value::as_str) == Some("info");
-                    let is_sub = ack.get("action").and_then(serde_json::Value::as_str) == Some("subscribed");
-                    let is_ok = ack.get("status").and_then(serde_json::Value::as_str) == Some("ok");
-                    if is_info || is_sub || is_ok {
-                        break;
-                    }
-                    if ack.get("type").and_then(serde_json::Value::as_str) == Some("error") || ack.get("error").is_some() {
-                        let err_msg = ack.get("message")
-                            .or_else(|| ack.get("error"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown error");
-                        if err_msg.to_lowercase().contains("credit") || err_msg.to_lowercase().contains("insufficient") {
-                            crate::data::credits::CreditStore::record(
-                                "Stream",
-                                err_msg,
-                                0,
-                                1,
-                                Some(&config.rest_base_url),
-                            );
-                        }
-                        anyhow::bail!("gateway subscription failed: {}", err_msg);
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
-                None => anyhow::bail!("gateway closed while waiting for subscription acknowledgement"),
-            }
-        }
-    }
-    debug!("gateway: subscriptions acknowledged (ticker, kline/{}, orderbook, trades)", config.timeframe);
+    debug!(
+        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={})",
+        config.ticker, config.kline, config.orderbook, config.trades
+    );
 
-    // Heartbeat ticker to keep the connection alive (matching CoinWatch client interval).
+    let mut feed_channels: HashMap<String, StreamChannel> = HashMap::new();
+    let mut feed_ids: HashMap<String, String> = HashMap::new();
+    let mut last_seq: HashMap<String, u64> = HashMap::new();
+
+    // Heartbeat ticker to keep the connection and its demand leases alive.
     let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
     heartbeat_interval.tick().await; // consume immediate first tick
 
@@ -887,12 +900,9 @@ async fn connect_and_stream(
                 if !config.ticker && !config.kline && !config.orderbook && !config.trades {
                     continue;
                 }
-                let heartbeat = SubscribeMsg {
-                    action: "subscribe",
-                    channel: if config.ticker { "ticker" } else if config.kline { "kline" } else if config.orderbook { "orderbook" } else { "trades" },
-                    exchange: &config.exchange,
-                    symbol: &ws_symbol,
-                    timeframe: if config.kline && !config.ticker { Some(&config.timeframe) } else { None },
+                let heartbeat = HeartbeatFrame {
+                    op: "hb",
+                    ts: now_ms(),
                 };
                 if let Ok(json) = serde_json::to_string(&heartbeat) {
                     if let Err(e) = write.send(Message::Text(json)).await {
@@ -904,9 +914,12 @@ async fn connect_and_stream(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_message(
+                        if let Some(resync_id) = handle_gateway_frame(
                             &text,
                             config,
+                            &mut feed_channels,
+                            &mut feed_ids,
+                            &mut last_seq,
                             tick_tx,
                             trade_tx,
                             ob_tx,
@@ -914,7 +927,19 @@ async fn connect_and_stream(
                             history_cache,
                             last_tick_cache,
                             last_ob_cache,
-                        );
+                        ) {
+                            let frame = ResyncFrame {
+                                op: "resync",
+                                id: &resync_id,
+                            };
+                            if let Ok(json) = serde_json::to_string(&frame) {
+                                if let Err(e) = write.send(Message::Text(json)).await {
+                                    warn!("gateway: failed to send resync: {e}");
+                                    break;
+                                }
+                                info!("gateway: requested resync for {resync_id}");
+                            }
+                        }
                     }
                     Some(Ok(Message::Close(_))) => {
                         info!("gateway: received close frame");
@@ -940,6 +965,206 @@ async fn connect_and_stream(
     }
 
     Ok(())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Translate one v2 gateway frame into the existing internal dispatch shape.
+///
+/// Returns a pane id when a sequence gap means the caller must send `resync`.
+fn handle_gateway_frame(
+    text: &str,
+    config: &BridgeConfig,
+    feed_channels: &mut HashMap<String, StreamChannel>,
+    feed_ids: &mut HashMap<String, String>,
+    last_seq: &mut HashMap<String, u64>,
+    tick_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    ob_tx: &broadcast::Sender<Arc<OrderBook>>,
+    ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
+) -> Option<String> {
+    let Some(frame) = GatewayFrame::parse(text) else {
+        warn!(
+            "gateway: could not parse frame: {}",
+            &text[..text.len().min(200)]
+        );
+        return None;
+    };
+
+    match frame.op.as_deref() {
+        Some("hello") => None,
+        Some("pong") => None,
+        Some("ack") => {
+            if let (Some(feed), Some(id)) = (frame.feed, frame.id) {
+                if let Some(channel) = StreamChannel::from_id(&id) {
+                    feed_channels.insert(feed.clone(), channel);
+                    feed_ids.insert(feed, id);
+                }
+            }
+            None
+        }
+        Some("snapshot") => {
+            let Some(feed) = frame.feed else { return None };
+            if !feed_channels.contains_key(&feed) {
+                let channel = frame
+                    .id
+                    .as_deref()
+                    .and_then(StreamChannel::from_id)
+                    .or_else(|| channel_for_feed(&feed));
+                if let Some(channel) = channel {
+                    feed_channels.insert(feed.clone(), channel);
+                    if let Some(id) = frame.id.as_deref() {
+                        feed_ids.insert(feed.clone(), id.to_string());
+                    } else {
+                        feed_ids.insert(feed.clone(), channel.id().to_string());
+                    }
+                }
+            }
+            if let Some(seq) = frame.seq {
+                last_seq.insert(feed.clone(), seq);
+            }
+            if let (Some(channel), Some(data)) = (feed_channels.get(&feed), frame.data) {
+                dispatch_new_data(
+                    *channel,
+                    data,
+                    config,
+                    tick_tx,
+                    trade_tx,
+                    ob_tx,
+                    ohlcv_tx,
+                    history_cache,
+                    last_tick_cache,
+                    last_ob_cache,
+                );
+            }
+            None
+        }
+        Some("delta") => {
+            let Some(feed) = frame.feed else { return None };
+            let Some(channel) = feed_channels
+                .get(&feed)
+                .copied()
+                .or_else(|| channel_for_feed(&feed))
+            else {
+                debug!("gateway: delta for unknown feed {feed}");
+                return None;
+            };
+            feed_channels.entry(feed.clone()).or_insert(channel);
+
+            let first = frame.first_seq.or(frame.seq);
+            if let (Some(last), Some(first)) = (last_seq.get(&feed).copied(), first) {
+                if first > last.saturating_add(1) {
+                    warn!("gateway: sequence gap on {feed} ({last} -> {first}); resyncing");
+                    return Some(
+                        feed_ids
+                            .get(&feed)
+                            .cloned()
+                            .unwrap_or_else(|| channel.id().to_string()),
+                    );
+                }
+            }
+            if let Some(seq) = frame.last_seq.or(frame.seq) {
+                last_seq.insert(feed, seq);
+            }
+
+            if let Some(data) = frame.data {
+                dispatch_new_data(
+                    channel,
+                    data,
+                    config,
+                    tick_tx,
+                    trade_tx,
+                    ob_tx,
+                    ohlcv_tx,
+                    history_cache,
+                    last_tick_cache,
+                    last_ob_cache,
+                );
+            }
+            None
+        }
+        Some("status") => {
+            if frame.stale == Some(true) {
+                warn!(
+                    "gateway: feed {} is stale{}",
+                    frame.feed.as_deref().unwrap_or("?"),
+                    frame
+                        .message
+                        .map(|m| format!(": {m}"))
+                        .unwrap_or_default()
+                );
+            }
+            None
+        }
+        Some("error") => {
+            let message = frame.message.unwrap_or_else(|| "gateway error".to_string());
+            if message.to_lowercase().contains("credit")
+                || message.to_lowercase().contains("insufficient")
+            {
+                crate::data::credits::CreditStore::record(
+                    "Stream",
+                    &message,
+                    0,
+                    1,
+                    Some(&config.rest_base_url),
+                );
+            }
+            warn!(
+                "gateway: server error{}: {message}",
+                frame
+                    .code
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default()
+            );
+            None
+        }
+        other => {
+            debug!("gateway: ignoring frame op {:?}", other);
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_new_data(
+    channel: StreamChannel,
+    data: serde_json::Value,
+    config: &BridgeConfig,
+    tick_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
+    ob_tx: &broadcast::Sender<Arc<OrderBook>>,
+    ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
+    last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
+    last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
+) {
+    let envelope = serde_json::json!({
+        "type": "data",
+        "channel": channel.id(),
+        "exchange": config.exchange,
+        "symbol": config.symbol,
+        "timeframe": if channel == StreamChannel::Ohlcv { Some(config.timeframe.as_str()) } else { None },
+        "data": data,
+    });
+    handle_message(
+        &envelope.to_string(),
+        config,
+        tick_tx,
+        trade_tx,
+        ob_tx,
+        ohlcv_tx,
+        history_cache,
+        last_tick_cache,
+        last_ob_cache,
+    );
 }
 
 fn handle_message(
@@ -1074,9 +1299,11 @@ fn handle_message(
                         }
                     });
                 let volume_24h = target
-                    .get("quoteVolume")
+                    .get("quote_volume")
+                    .or_else(|| target.get("quoteVolume"))
                     .or_else(|| target.get("q"))
                     .or_else(|| target.get("volume"))
+                    .or_else(|| target.get("base_volume"))
                     .or_else(|| target.get("v"))
                     .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
 
@@ -1116,7 +1343,7 @@ fn handle_message(
                 if trade.price <= 0.0 || trade.amount <= 0.0 {
                     continue;
                 }
-                let raw_side = trade.side.to_lowercase();
+                let raw_side = trade.side.as_deref().unwrap_or("").to_lowercase();
                 let side = if raw_side.contains("buy") || raw_side == "b" || raw_side == "bid" {
                     TradeSide::Buy
                 } else if raw_side.contains("sell") || raw_side == "s" || raw_side == "ask" {
@@ -1128,14 +1355,16 @@ fn handle_message(
                 let raw_ts = trade.timestamp;
                 let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
 
-                ticks.push(Arc::new(UnifiedTick::new(
+                let mut tick = UnifiedTick::new(
                     msg.exchange.as_deref().unwrap_or(&config.exchange),
                     msg.symbol.as_deref().unwrap_or(&config.symbol),
                     trade.price,
                     trade.amount,
                     side,
                     ts,
-                )));
+                );
+                tick.trade_id = trade.id;
+                ticks.push(Arc::new(tick));
             }
 
             if !ticks.is_empty() {
@@ -1171,7 +1400,9 @@ fn handle_message(
                     });
                     let exchange = msg.exchange.unwrap_or_else(|| config.exchange.clone());
                     let symbol = msg.symbol.unwrap_or_else(|| config.symbol.clone());
-                    let book = Arc::new(OrderBook::new(exchange, symbol, bids, asks, ts));
+                    let mut book = OrderBook::new(exchange, symbol, bids, asks, ts);
+                    book.nonce = raw.nonce;
+                    let book = Arc::new(book);
                     if let Ok(mut cache) = last_ob_cache.lock() {
                         *cache = Some(Arc::clone(&book));
                     }
@@ -1265,7 +1496,8 @@ fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
     }
 
     if let Some(obj) = val.as_object() {
-        let t_val = obj.get("t")
+        let t_val = obj.get("open_time")
+            .or_else(|| obj.get("t"))
             .or_else(|| obj.get("timestamp"))
             .or_else(|| obj.get("time"))?;
         let o_val = obj.get("o").or_else(|| obj.get("open"))?;
@@ -1602,7 +1834,6 @@ mod tests {
             orderbook: true,
             kline: true,
             fetch_history: true,
-            snapshot: None,
         }
     }
 
@@ -1614,6 +1845,83 @@ mod tests {
         assert!(!cfg.sandbox);
         assert_eq!(cfg.timeframe, "1m");
         assert_eq!(cfg.ohlcv_limit, 500);
+    }
+
+    #[tokio::test]
+    async fn v2_frames_dispatch_ticker_trades_candles_and_detect_gaps() {
+        let cfg = base_cfg();
+        let (ticks, mut tick_rx) = broadcast::channel(16);
+        let (trades, mut trade_rx) = broadcast::channel(16);
+        let (books, _) = broadcast::channel(16);
+        let (candles, mut candle_rx) = broadcast::channel(16);
+        let history = Arc::new(std::sync::Mutex::new(None));
+        let last_tick = Arc::new(std::sync::Mutex::new(None));
+        let last_book = Arc::new(std::sync::Mutex::new(None));
+        let mut feed_channels = HashMap::new();
+        let mut feed_ids = HashMap::new();
+        let mut last_seq = HashMap::new();
+
+        let mut frame = |text: &str| {
+            handle_gateway_frame(
+                text,
+                &cfg,
+                &mut feed_channels,
+                &mut feed_ids,
+                &mut last_seq,
+                &ticks,
+                &trades,
+                &books,
+                &candles,
+                &history,
+                &last_tick,
+                &last_book,
+            )
+        };
+
+        assert_eq!(
+            frame(r#"{"op":"ack","id":"ticker","feed":"ticker:binance:BTC/USDT","seq":1}"#),
+            None
+        );
+        assert_eq!(
+            frame(r#"{"op":"delta","feed":"ticker:binance:BTC/USDT","seq":2,"data":{"last":110,"open":100,"high":120,"low":90,"quote_volume":1234,"percentage":10}}"#),
+            None
+        );
+        let tick = tick_rx.try_recv().expect("ticker tick");
+        assert!((tick.price - 110.0).abs() < f64::EPSILON);
+        assert_eq!(tick.open_24h, Some(100.0));
+        assert_eq!(tick.quote_volume_24h, Some(1234.0));
+
+        assert_eq!(
+            frame(r#"{"op":"ack","id":"trades","feed":"trades:binance:BTC/USDT","seq":2}"#),
+            None
+        );
+        assert_eq!(
+            frame(r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":4,"first_seq":3,"last_seq":4,"data":[{"trade_id":"t1","exchange_ts":1700000000000,"side":"buy","price":110,"amount":1},{"trade_id":"t2","exchange_ts":1700000000001,"side":null,"price":111,"amount":2}]}"#),
+            None
+        );
+        let first = trade_rx.try_recv().expect("trade 1");
+        let second = trade_rx.try_recv().expect("trade 2");
+        assert_eq!(first.trade_id.as_deref(), Some("t1"));
+        assert_eq!(first.side, TradeSide::Buy);
+        assert_eq!(second.side, TradeSide::Unknown);
+
+        assert_eq!(
+            frame(r#"{"op":"ack","id":"kline","feed":"ohlcv:binance:BTC/USDT:1m","seq":4}"#),
+            None
+        );
+        assert_eq!(
+            frame(r#"{"op":"delta","feed":"ohlcv:binance:BTC/USDT:1m","seq":5,"data":{"open_time":1700000060000,"open":110,"high":115,"low":109,"close":114,"volume":12,"timeframe":"1m","is_closed":false,"source":"exchange"}}"#),
+            None
+        );
+        let candle = candle_rx.try_recv().expect("candle");
+        assert_eq!(candle[0].timestamp, 1_700_000_060_000);
+        assert!((candle[0].close - 114.0).abs() < f64::EPSILON);
+
+        // A missing sequence returns the pane id that must be resynced.
+        assert_eq!(
+            frame(r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":9,"first_seq":9,"last_seq":9,"data":[]}"#),
+            Some("trades".to_string())
+        );
     }
 
     #[test]
@@ -1665,82 +1973,6 @@ mod tests {
         let url = base_cfg().ohlcv_history_url(Some(1_600_000_000_000));
         assert!(!url.contains("&since="), "url={url}");
         assert!(url.contains("&until=1600000000000"), "url={url}");
-    }
-
-    #[tokio::test]
-    async fn ticker_bootstrap_seeds_feed_and_is_skipped_on_reconnect() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut cfg = base_cfg();
-        cfg.rest_base_url = format!("http://{}", listener.local_addr().unwrap());
-        cfg.fetch_history = false;
-        cfg.snapshot = Some(("ticker", 0, "Watchlist"));
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            let n = socket.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /api/v1/ticker?"));
-            let body = r#"{"last":110,"open":100,"high":120,"low":90,"quoteVolume":1234,"percentage":10}"#;
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
-            drop(socket);
-            // Close incoming WebSocket attempts immediately; connect_and_stream fails cleanly
-            if let Ok((socket, _)) = listener.accept().await {
-                drop(socket);
-            }
-        });
-        let (ticks, mut rx) = broadcast::channel(8);
-        let (trades, _) = broadcast::channel(8);
-        let (books, _) = broadcast::channel(8);
-        let (candles, _) = broadcast::channel(8);
-        let cache = Arc::new(std::sync::Mutex::new(None));
-        let last_tick_cache = Arc::new(std::sync::Mutex::new(None));
-        let last_ob_cache = Arc::new(std::sync::Mutex::new(None));
-        let cancel = CancellationToken::new();
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, true).await;
-        server.await.unwrap();
-        let tick = rx.try_recv().expect("REST response must seed the watchlist feed");
-        assert_eq!(tick.price, 110.0);
-        assert_eq!(tick.open_24h, Some(100.0));
-        assert_eq!(tick.high_24h, Some(120.0));
-        assert_eq!(tick.low_24h, Some(90.0));
-        assert_eq!(tick.quote_volume_24h, Some(1234.0));
-        assert_eq!(tick.change_24h_percent, Some(10.0));
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, false).await;
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn ticker_bootstrap_failure_continues_to_ws() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut cfg = base_cfg();
-        cfg.rest_base_url = format!("http://{}", listener.local_addr().unwrap());
-        cfg.fetch_history = false;
-        cfg.snapshot = Some(("ticker", 0, "Watchlist"));
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            let n = socket.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /api/v1/ticker?"));
-            let body = r#"{"error":"service_unavailable"}"#;
-            socket.write_all(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
-            drop(socket);
-            if let Ok((socket, _)) = listener.accept().await {
-                drop(socket);
-            }
-        });
-        let (ticks, mut rx) = broadcast::channel(8);
-        let (trades, _) = broadcast::channel(8);
-        let (books, _) = broadcast::channel(8);
-        let (candles, _) = broadcast::channel(8);
-        let cache = Arc::new(std::sync::Mutex::new(None));
-        let last_tick_cache = Arc::new(std::sync::Mutex::new(None));
-        let last_ob_cache = Arc::new(std::sync::Mutex::new(None));
-        let cancel = CancellationToken::new();
-        let _ = connect_and_stream(&cfg, &ticks, &trades, &books, &candles, &cancel, &cache, &last_tick_cache, &last_ob_cache, true).await;
-        server.await.unwrap();
-        // Since REST returned 500, no tick was seeded from REST, but connect_and_stream finished without panicking
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1796,7 +2028,7 @@ mod tests {
             serde_json::from_value(msg.data.unwrap()).expect("parse data");
         assert_eq!(trades.len(), 1);
         assert!((trades[0].price - 67_000.5).abs() < f64::EPSILON);
-        assert_eq!(trades[0].side, "buy");
+        assert_eq!(trades[0].side.as_deref(), Some("buy"));
     }
 
     #[test]
@@ -1813,7 +2045,7 @@ mod tests {
             serde_json::from_value(msg.data.unwrap()).expect("parse data");
         assert_eq!(trades[0].timestamp, 1_795_095_253_528);
         assert_eq!(trades[0].id.as_deref(), Some("6880359509"));
-        assert_eq!(trades[0].side, "sell");
+        assert_eq!(trades[0].side.as_deref(), Some("sell"));
     }
 
     #[test]

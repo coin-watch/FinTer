@@ -1992,7 +1992,6 @@ impl PaneGridRenderer {
                                         bridge_config.trades = false;
                                         bridge_config.orderbook = false;
                                         bridge_config.ticker = true;
-                                        bridge_config.snapshot = Some(("ticker", 0, "Chart"));
                                         if timeframe == "1s" {
                                             bridge_config.fetch_history = false;
                                             bridge_config.kline = false;
@@ -2141,7 +2140,6 @@ impl PaneGridRenderer {
                                         bridge_config.trades = false;
                                         bridge_config.kline = false;
                                         bridge_config.fetch_history = false;
-                                        bridge_config.snapshot = Some(("orderbook", limit as u32, "OrderBook"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -2211,7 +2209,6 @@ impl PaneGridRenderer {
                                         bridge_config.orderbook = false;
                                         bridge_config.kline = false;
                                         bridge_config.fetch_history = false;
-                                         bridge_config.snapshot = Some(("trades", 60, "Trades"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }
@@ -2283,7 +2280,6 @@ impl PaneGridRenderer {
                                         bridge_config.orderbook = false;
                                         bridge_config.kline = false;
                                         bridge_config.fetch_history = false;
-                                        bridge_config.snapshot = Some(("ticker", 0, "Trade Desk"));
                                         if let Ok(Some(session)) = crate::data::session_store::load_session() {
                                             bridge_config.access_token = Some(session.access_token);
                                         }

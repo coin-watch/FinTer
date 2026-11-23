@@ -54,6 +54,10 @@ pub struct OrderBook {
     pub asks: Vec<PriceLevel>,
     /// Unix timestamp in milliseconds.
     pub timestamp_ms: TimestampMs,
+    /// Exchange book nonce/sequence when the venue provides one. A gap means
+    /// the client must discard the snapshot and wait for the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
 }
 
 impl OrderBook {
@@ -71,6 +75,7 @@ impl OrderBook {
             bids,
             asks,
             timestamp_ms,
+            nonce: None,
         }
     }
 

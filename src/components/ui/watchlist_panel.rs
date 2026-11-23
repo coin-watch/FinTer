@@ -849,7 +849,6 @@ async fn run_watchlist_syncer(entries: Arc<Mutex<Vec<WatchlistEntry>>>, tracked:
             config.orderbook = false;
             config.kline = false;
             config.fetch_history = false;
-            config.snapshot = Some(("ticker", 0, "Watchlist"));
             if let Ok(Some(session)) = crate::data::session_store::load_session() {
                 config.access_token = Some(session.access_token);
             }

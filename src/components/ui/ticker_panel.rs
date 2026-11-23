@@ -56,7 +56,6 @@ impl TickerPanel {
         // The explicit task below owns this snapshot; do not fetch it again as
         // a side effect of starting the ticker's WebSocket bridge.
         config.fetch_history = false;
-        config.snapshot = Some(("ticker", 0, "Ticker"));
         if let Ok(Some(session)) = crate::data::session_store::load_session() {
             config.access_token = Some(session.access_token);
         }
