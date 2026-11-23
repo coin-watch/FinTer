@@ -1477,6 +1477,63 @@ impl Render for ChartPanel {
                 }
             }
 
+            let orderflow_lines: Vec<&IndicatorLineSpec> = indicator_lines
+                .iter()
+                .filter(|line| line.instance_id.starts_with("orderflow-"))
+                .collect();
+            if let Some(first) = orderflow_lines.first() {
+                let color: gpui::Hsla = gpui::rgba(0x00F0FFFF).into();
+                let mut row = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(color)
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("ORDER FLOW"),
+                    );
+                for line in &orderflow_lines {
+                    let val = match line
+                        .series
+                        .binary_search_by_key(&active_timestamp, |&(ts, _)| ts)
+                    {
+                        Ok(idx) => line.series[idx].1,
+                        Err(_) => f64::NAN,
+                    };
+                    let val_str = if val.is_nan() {
+                        "--".to_string()
+                    } else {
+                        format!("{val:.4}")
+                    };
+                    row = row.child(
+                        div()
+                            .flex()
+                            .gap(px(4.0))
+                            .child(div().text_color(color).child(format!("{}:", line.name)))
+                            .child(div().text_color(color).child(val_str)),
+                    );
+                }
+                if let PaneTarget::Subpane(idx) = first.pane {
+                    let mut y0 = candle_h + 2.0;
+                    for j in 0..idx {
+                        y0 += avail * subpane_ratios[j] + 2.0;
+                    }
+                    y0 += 8.0;
+                    let y0 = if full_h > 0.0 {
+                        y0
+                    } else {
+                        200.0 + idx as f32 * 50.0
+                    };
+                    subpane_legends_map
+                        .entry(idx)
+                        .or_insert_with(|| (y0, Vec::new()))
+                        .1
+                        .push(row.into_any_element());
+                }
+            }
+
             for (_idx, (y0, rows)) in subpane_legends_map {
                 let container = gpui::div()
                     .absolute()
