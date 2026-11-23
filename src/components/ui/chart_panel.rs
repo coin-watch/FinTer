@@ -1079,6 +1079,40 @@ impl ChartPanel {
             return (Vec::new(), Vec::new());
         }
 
+        if !orderflow.profile_rows.is_empty() {
+            let max_volume = orderflow
+                .profile_rows
+                .iter()
+                .map(|row| row.buy + row.sell)
+                .fold(0.0, f64::max);
+            if max_volume > 0.0 {
+                let bars: Vec<ProfileBarSpec> = orderflow
+                    .profile_rows
+                    .iter()
+                    .filter(|row| row.buy + row.sell > 0.0)
+                    .map(|row| ProfileBarSpec {
+                        price_low: row.price_low,
+                        price_high: row.price_high,
+                        width_fraction: ((row.buy + row.sell) / max_volume).clamp(0.0, 1.0)
+                            as f32
+                            * 0.18,
+                        color: color.opacity(0.30)
+                    })
+                    .collect();
+                let mut lines = Vec::new();
+                for price in [orderflow.profile_poc, orderflow.profile_vah, orderflow.profile_val]
+                    .into_iter()
+                    .flatten()
+                {
+                    lines.push(ProfileLineSpec {
+                        price,
+                        color: color.opacity(0.55)
+                    });
+                }
+                return (bars, lines);
+            }
+        }
+
         let mut min_price = f64::INFINITY;
         let mut max_price = f64::NEG_INFINITY;
         for candle in candles {

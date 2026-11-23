@@ -69,6 +69,11 @@ pub struct OrderFlowSnapshot {
     pub total_delta: f64,
     /// True when the bridge lagged and the tape may have holes.
     pub partial: bool,
+    /// Backend-derived session profile rows, when subscribed.
+    pub profile_rows: Vec<DerivedFootprintRow>,
+    pub profile_poc: Option<f64>,
+    pub profile_vah: Option<f64>,
+    pub profile_val: Option<f64>,
 }
 
 #[derive(Default)]
@@ -152,6 +157,10 @@ impl State {
             cvd,
             total_delta: running,
             partial: self.partial,
+            profile_rows: Vec::new(),
+            profile_poc: None,
+            profile_vah: None,
+            profile_val: None,
         }
     }
 }
@@ -331,6 +340,9 @@ struct DerivedState {
     bars: BTreeMap<i64, FlowBar>,
     cvd: BTreeMap<i64, f64>,
     profile: Vec<DerivedFootprintRow>,
+    profile_poc: Option<f64>,
+    profile_vah: Option<f64>,
+    profile_val: Option<f64>,
     partial: bool,
 }
 
@@ -372,6 +384,9 @@ impl DerivedState {
             }
             DerivedFlowEvent::Profile(profile) => {
                 self.profile = profile.rows.clone();
+                self.profile_poc = profile.poc;
+                self.profile_vah = profile.vah;
+                self.profile_val = profile.val;
             }
         }
     }
@@ -393,6 +408,10 @@ impl DerivedState {
             cvd,
             total_delta: running,
             partial: self.partial,
+            profile_rows: self.profile.clone(),
+            profile_poc: self.profile_poc,
+            profile_vah: self.profile_vah,
+            profile_val: self.profile_val,
         }
     }
 }
