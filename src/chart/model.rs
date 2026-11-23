@@ -34,6 +34,13 @@ pub struct ChartLayout {
     pub pane_ratios: BTreeMap<String, f64>,
     #[serde(default)]
     pub library_geometry: Option<WindowGeometry>,
+    /// Show the order-flow delta/CVD subpane.
+    #[serde(default = "default_show_delta")]
+    pub show_delta: bool,
+}
+
+fn default_show_delta() -> bool {
+    true
 }
 
 impl ChartLayout {
@@ -54,6 +61,7 @@ impl ChartLayout {
             drawings: vec![],
             pane_ratios: BTreeMap::new(),
             library_geometry: None,
+            show_delta: true,
         }
     }
 }

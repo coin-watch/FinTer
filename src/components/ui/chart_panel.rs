@@ -60,10 +60,11 @@ use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
+use crate::data::orderflow_feed::{OrderFlowFeed, OrderFlowSnapshot};
 use crate::data::price_format::format_price;
 use crate::klinechart;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -134,6 +135,11 @@ pub struct ChartPanel {
     is_loading_more: bool,
     load_more_attempts: u8,
     show_main_series: bool,
+
+    /// Optional order-flow feed (trades) for delta/CVD and future footprint.
+    orderflow_feed: Option<OrderFlowFeed>,
+    /// Show the delta/CVD subpane when order-flow data is available.
+    show_delta: bool,
 
     // Parameterized Indicators
     pub indicators: Vec<IndicatorInstance>,
@@ -302,6 +308,8 @@ impl ChartPanel {
             is_loading_more: false,
             load_more_attempts: 0,
             show_main_series: true,
+            orderflow_feed: None,
+            show_delta: true,
 
             // Parameterized indicators & cache
             indicators: Vec::new(),
@@ -357,6 +365,35 @@ impl ChartPanel {
 
         panel.load_layout();
         panel
+    }
+
+    /// Attach the order-flow feed and wake the panel when new trades arrive.
+    pub fn set_orderflow_feed(&mut self, feed: OrderFlowFeed, cx: &mut Context<Self>) {
+        let version = feed.version_handle();
+        self.orderflow_feed = Some(feed);
+        cx.spawn(async move |this, cx| {
+            let mut last = u64::MAX;
+            loop {
+                let changed = this
+                    .update(cx, |panel, cx| {
+                        let current = version.load(std::sync::atomic::Ordering::Relaxed);
+                        if current != last {
+                            last = current;
+                            if panel.show_delta {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .is_err();
+                if changed {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     /// Set exchange and symbol context for layout persistence.
@@ -462,6 +499,7 @@ impl ChartPanel {
         }
         self.drawings = layout.drawings;
         self.show_horizontal_grid = layout.show_grid;
+        self.show_delta = layout.show_delta;
         if let Some(geom) = layout.library_geometry {
             self.library_x = geom.x;
             self.library_y = geom.y;
@@ -483,6 +521,7 @@ impl ChartPanel {
             CandleType::HeikinAshi => "heikin_ashi".into(),
         };
         layout.show_grid = self.show_horizontal_grid;
+        layout.show_delta = self.show_delta;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
@@ -693,6 +732,7 @@ impl ChartPanel {
         &mut self,
         candles: &[OhlcvCandle],
         feed_version: u64,
+        orderflow: Option<&OrderFlowSnapshot>,
     ) -> (Vec<IndicatorLineSpec>, usize) {
         let mut lines = Vec::new();
         let has_vol = self.indicators.iter().any(|i| i.kind == IndicatorKind::Vol && i.visible);
@@ -750,6 +790,50 @@ impl ChartPanel {
                     style,
                     pane,
                 });
+            }
+        }
+
+        if self.show_delta {
+            if let Some(orderflow) = orderflow {
+                if !orderflow.bars.is_empty() {
+                    let candle_ts: HashSet<i64> =
+                        candles.iter().map(|candle| candle.timestamp).collect();
+                    let delta_series: Vec<(i64, f64)> = orderflow
+                        .bars
+                        .iter()
+                        .filter(|bar| candle_ts.contains(&bar.timestamp))
+                        .map(|bar| (bar.timestamp, bar.delta()))
+                        .collect();
+                    let cvd_series: Vec<(i64, f64)> = orderflow
+                        .cvd
+                        .iter()
+                        .copied()
+                        .filter(|(timestamp, _)| candle_ts.contains(timestamp))
+                        .collect();
+                    if !delta_series.is_empty() {
+                        let delta_pane = PaneTarget::Subpane(subpane_idx);
+                        subpane_idx += 1;
+                        let delta_color = gpui::rgba(0x00F0FFFF).into();
+                        lines.push(IndicatorLineSpec {
+                            instance_id: "orderflow-delta".into(),
+                            kind: IndicatorKind::Other("Delta".into()),
+                            name: "Delta".into(),
+                            series: delta_series,
+                            color: delta_color,
+                            style: IndicatorStyle::Histogram,
+                            pane: delta_pane,
+                        });
+                        lines.push(IndicatorLineSpec {
+                            instance_id: "orderflow-cvd".into(),
+                            kind: IndicatorKind::Other("CVD".into()),
+                            name: "CVD".into(),
+                            series: cvd_series,
+                            color: delta_color,
+                            style: IndicatorStyle::Line,
+                            pane: delta_pane,
+                        });
+                    }
+                }
             }
         }
 
@@ -868,6 +952,10 @@ impl Render for ChartPanel {
         self.check_debounced_save();
 
         let (candles_snap, feed_version) = self.feed.snapshot_with_version();
+        let orderflow_snapshot = self
+            .orderflow_feed
+            .as_ref()
+            .map(|feed| feed.snapshot());
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
         if current_oldest > 0 && current_oldest != self.oldest_loaded_ts {
             if self.oldest_loaded_ts > 0 {
@@ -1023,7 +1111,7 @@ impl Render for ChartPanel {
 
         // Compute parameterized indicators with versioned cache
         let (indicator_lines, subpane_count) =
-            self.compute_indicators_for_chart(&candles, feed_version);
+            self.compute_indicators_for_chart(&candles, feed_version, orderflow_snapshot.as_ref());
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;

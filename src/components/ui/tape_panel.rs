@@ -21,7 +21,7 @@ use gpui_component::theme::ActiveTheme;
 use gpui_component::{h_flex, v_flex};
 
 use crate::data::feed::TickFeed;
-use crate::data::tick::UnifiedTick;
+use crate::data::tick::{TradeSide, UnifiedTick};
 use crate::data::terminal_audio::{AudioStatus, TerminalAudio, Tone};
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,11 @@ impl TapePanel {
 /// normal buy/sell ticks. Input order preserves equal-timestamp executions.
 fn classify_audio_batch(ticks: &[Arc<UnifiedTick>]) -> Option<Tone> {
     if ticks.iter().any(|tick| tick.notional() >= MEGA_THRESHOLD_USD) { return Some(Tone::Whale); }
-    ticks.first().map(|tick| if tick.side.is_buy() { Tone::Buy } else { Tone::Sell })
+    ticks.iter().find_map(|tick| match tick.side {
+        TradeSide::Buy => Some(Tone::Buy),
+        TradeSide::Sell => Some(Tone::Sell),
+        TradeSide::Unknown => None,
+    })
 }
 
 impl Render for TapePanel {
@@ -222,10 +226,10 @@ impl Render for TapePanel {
 
         for t in &raw_ticks {
             let val = t.notional();
-            if t.side.is_buy() {
-                buy_vol += val;
-            } else {
-                sell_vol += val;
+            match t.side {
+                TradeSide::Buy => buy_vol += val,
+                TradeSide::Sell => sell_vol += val,
+                TradeSide::Unknown => {}
             }
         }
 
@@ -242,8 +246,8 @@ impl Render for TapePanel {
             .into_iter()
             .filter(|t| match self.filter {
                 TradeFilter::All => true,
-                TradeFilter::Buys => t.side.is_buy(),
-                TradeFilter::Sells => !t.side.is_buy(),
+                TradeFilter::Buys => matches!(t.side, TradeSide::Buy),
+                TradeFilter::Sells => matches!(t.side, TradeSide::Sell),
                 TradeFilter::Whales => t.notional() >= WHALE_THRESHOLD_USD,
             })
             .take(MAX_VISIBLE_ROWS)
@@ -623,7 +627,8 @@ impl TapePanel {
         is_narrow: bool,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let is_buy = tick.side.is_buy();
+        let is_buy = matches!(tick.side, TradeSide::Buy);
+        let is_sell = matches!(tick.side, TradeSide::Sell);
         let colors = &cx.theme().colors;
 
         let row_bg = if idx.is_multiple_of(2) {
@@ -634,13 +639,21 @@ impl TapePanel {
 
         let side_color = if is_buy {
             colors.bullish
-        } else {
+        } else if is_sell {
             colors.bearish
+        } else {
+            colors.muted_foreground
         };
 
         let price_str = Self::fmt_price(tick.price);
         let amount_str = Self::fmt_amount(tick.amount);
-        let side_str = if is_buy { "BUY" } else { "SELL" };
+        let side_str = if is_buy {
+            "BUY"
+        } else if is_sell {
+            "SELL"
+        } else {
+            "—"
+        };
 
         let notional = tick.notional();
         let notional_str = Self::fmt_usd(notional);

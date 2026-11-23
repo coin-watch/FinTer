@@ -208,7 +208,12 @@ pub struct BridgeConfig {
     pub trades: bool,
     pub orderbook: bool,
     pub kline: bool,
-    pub fetch_history: bool,}
+    pub fetch_history: bool,
+    /// Trade snapshot size requested at subscribe time.
+    pub trade_limit: u32,
+    /// Request the trade snapshot from the current bar's open when connecting.
+    pub trade_since_current_bar: bool,
+}
 
 impl BridgeConfig {
     pub fn default_dev(exchange: &str, symbol: &str) -> Self {
@@ -225,6 +230,8 @@ impl BridgeConfig {
             orderbook: true,
             kline: true,
             fetch_history: true,
+            trade_limit: 100,
+            trade_since_current_bar: false,
         }
     }
 
@@ -554,6 +561,8 @@ enum Requirement<'a> {
         exchange: &'a str,
         symbol: &'a str,
         limit: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        since: Option<i64>,
     },
     Orderbook {
         exchange: &'a str,
@@ -824,6 +833,14 @@ async fn connect_and_stream(
         .send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
 
+    let trade_since = if config.trade_since_current_bar {
+        let frame_ms = BridgeConfig::timeframe_to_ms(&config.timeframe).max(1_000);
+        let now = now_ms();
+        Some(now - now.rem_euclid(frame_ms))
+    } else {
+        None
+    };
+
     if config.ticker {
         let frame = SubscribeFrame {
             op: "sub",
@@ -873,7 +890,8 @@ async fn connect_and_stream(
             requirement: Requirement::Trades {
                 exchange: &config.exchange,
                 symbol: &config.symbol,
-                limit: 100,
+                limit: config.trade_limit,
+                since: trade_since,
             },
         };
         write
@@ -1834,6 +1852,8 @@ mod tests {
             orderbook: true,
             kline: true,
             fetch_history: true,
+            trade_limit: 100,
+            trade_since_current_bar: false,
         }
     }
 

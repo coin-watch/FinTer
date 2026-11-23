@@ -1989,7 +1989,9 @@ impl PaneGridRenderer {
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
                                         bridge_config.timeframe = timeframe.clone();
-                                        bridge_config.trades = false;
+                                        bridge_config.trades = true;
+                                        bridge_config.trade_limit = 5000;
+                                        bridge_config.trade_since_current_bar = true;
                                         bridge_config.orderbook = false;
                                         bridge_config.ticker = true;
                                         if timeframe == "1s" {
@@ -2005,6 +2007,11 @@ impl PaneGridRenderer {
                                             Ok(bridge) => {
                                                 let rx = bridge.subscribe_ohlcv();
                                                 let tick_rx = bridge.subscribe();
+                                                let trade_rx = bridge.subscribe_trades();
+                                                let orderflow = crate::data::orderflow_feed::OrderFlowFeed::new(
+                                                    trade_rx,
+                                                    crate::data::bridge::BridgeConfig::timeframe_to_ms(&timeframe),
+                                                );
                                                 let feed = crate::data::candle_feed::CandleFeed::new(rx, Some(tick_rx), Some(timeframe.clone()));
                                                 if !crate::data::client::is_api_url_configured() {
                                                     feed.set_error("No API service URL configured. Configure in Settings to stream data.".to_string());
@@ -2051,6 +2058,7 @@ impl PaneGridRenderer {
 
                                                 let chart_panel = cx.new(|cx| {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
+                                                    panel.set_orderflow_feed(orderflow, cx);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
                                                     panel.set_size(content_w, content_h);

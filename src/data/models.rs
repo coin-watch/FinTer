@@ -124,6 +124,15 @@ pub struct SymbolInfo {
     /// Precision for price (number of decimal places)
     #[serde(default)]
     pub precision: Option<PrecisionInfo>,
+    /// Minimum price increment from the catalog, when provided.
+    #[serde(rename = "tickSize", default)]
+    pub tick_size: Option<f64>,
+    /// Decimal places for price from the catalog, when provided.
+    #[serde(rename = "pricePrecision", default)]
+    pub price_precision: Option<i32>,
+    /// Decimal places for amount from the catalog, when provided.
+    #[serde(rename = "amountPrecision", default)]
+    pub amount_precision: Option<i32>,
 }
 
 impl SymbolInfo {
@@ -141,10 +150,24 @@ impl SymbolInfo {
             symbol_type: "spot".to_string(),
             active: true,
             precision: None,
+            tick_size: None,
+            price_precision: None,
+            amount_precision: None,
         }
     }
 
     pub fn normalized(mut self) -> Self {
+        if self.precision.is_none()
+            && (self.tick_size.is_some()
+                || self.price_precision.is_some()
+                || self.amount_precision.is_some())
+        {
+            self.precision = Some(PrecisionInfo {
+                price: self.price_precision,
+                amount: self.amount_precision,
+                tick_size: self.tick_size,
+            });
+        }
         if self.base.is_empty() || self.quote.is_empty() {
             let mut parts = self.symbol.split('/');
             if self.base.is_empty() {
