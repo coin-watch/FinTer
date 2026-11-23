@@ -366,17 +366,16 @@ impl DerivedState {
                 });
                 bar.buy_volume = 0.0;
                 bar.sell_volume = 0.0;
+                bar.trades = 0;
                 bar.price_rows.clear();
                 for row in &footprint.rows {
                     let key = (row.price_low * 1_000_000.0).round() as i64;
-                    let volume = row.buy + row.sell;
                     let price_row = bar.price_rows.entry(key).or_insert(PriceFlow {
                         price: (row.price_low + row.price_high) / 2.0,
                         ..PriceFlow::default()
                     });
                     price_row.buy_volume += row.buy;
                     price_row.sell_volume += row.sell;
-                    let _ = volume;
                     bar.buy_volume += row.buy;
                     bar.sell_volume += row.sell;
                     bar.trades += row.buy_count + row.sell_count;

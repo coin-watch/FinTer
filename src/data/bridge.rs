@@ -606,13 +606,11 @@ enum Requirement<'a> {
         exchange: &'a str,
         symbol: &'a str,
         timeframe: &'a str,
-        lookback: u32,
     },
     Footprint {
         exchange: &'a str,
         symbol: &'a str,
         timeframe: &'a str,
-        lookback: u32,
         rows: u32,
     },
     Profile {
@@ -968,7 +966,6 @@ async fn connect_and_stream(
                 exchange: &config.exchange,
                 symbol: &config.symbol,
                 timeframe: &config.timeframe,
-                lookback: 500,
             },
         };
         write
@@ -983,7 +980,6 @@ async fn connect_and_stream(
                 exchange: &config.exchange,
                 symbol: &config.symbol,
                 timeframe: &config.timeframe,
-                lookback: 300,
                 rows: 40,
             },
         };
