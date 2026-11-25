@@ -33,58 +33,6 @@ pub struct PositionOverlaySpec {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct HeatmapCellSpec {
-    pub start_ms: i64,
-    pub end_ms: i64,
-    pub price_low: f64,
-    pub price_high: f64,
-    pub color: Hsla,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FootprintCellSpec {
-    pub timestamp_ms: i64,
-    pub price_low: f64,
-    pub price_high: f64,
-    /// Bid/sell-side volume text.
-    pub left_text: SharedString,
-    /// Ask/buy-side volume text.
-    pub right_text: SharedString,
-    /// Delta or volume text shown when the cell is too narrow for two columns.
-    pub single_text: SharedString,
-    pub left_color: Hsla,
-    pub right_color: Hsla,
-    pub single_color: Hsla,
-    pub background: Hsla,
-    pub is_poc: bool,
-    pub is_vah: bool,
-    pub is_val: bool,
-    /// `1` = ask-side / aggressive-buy imbalance, `-1` = bid-side /
-    /// aggressive-sell imbalance, `0` = none. Ask wins when both match.
-    pub imbalance: i8,
-    pub is_live: bool,
-    pub is_hovered: bool,
-    pub is_selected: bool,
-    /// Responsive text size for this cell.
-    pub font_size: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProfileLineSpec {
-    pub price: f64,
-    pub color: Hsla,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProfileBarSpec {
-    pub price_low: f64,
-    pub price_high: f64,
-    /// Fraction of the plot width, measured from the right edge.
-    pub width_fraction: f32,
-    pub color: Hsla,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct OrderOverlaySpec {
     pub id: String,
     pub symbol: String,
@@ -209,14 +157,6 @@ where
     order_overlays: Vec<OrderOverlaySpec>,
     /// Saved price-alert levels (dashed line + Y-axis pill).
     alert_overlays: Vec<AlertOverlaySpec>,
-    /// Optional right-aligned volume-profile bars.
-    profile_bars: Vec<ProfileBarSpec>,
-    /// Optional POC/VAH/VAL profile lines.
-    profile_lines: Vec<ProfileLineSpec>,
-    /// Optional resting-liquidity heatmap cells.
-    heatmap_cells: Vec<HeatmapCellSpec>,
-    /// Optional bid x ask footprint cells.
-    footprint_cells: Vec<FootprintCellSpec>,
 }
 
 impl<T, Y> CandlestickChart<T, Y>
@@ -250,10 +190,6 @@ where
             position_overlays: Vec::new(),
             order_overlays: Vec::new(),
             alert_overlays: Vec::new(),
-            profile_bars: Vec::new(),
-            profile_lines: Vec::new(),
-            heatmap_cells: Vec::new(),
-            footprint_cells: Vec::new(),
         }
     }
 
@@ -389,26 +325,6 @@ where
     /// Attach saved price-alert levels (dashed lines + Y-axis pills).
     pub fn alert_overlays(mut self, overlays: Vec<AlertOverlaySpec>) -> Self {
         self.alert_overlays = overlays;
-        self
-    }
-
-    pub fn profile_bars(mut self, bars: Vec<ProfileBarSpec>) -> Self {
-        self.profile_bars = bars;
-        self
-    }
-
-    pub fn profile_lines(mut self, lines: Vec<ProfileLineSpec>) -> Self {
-        self.profile_lines = lines;
-        self
-    }
-
-    pub fn heatmap_cells(mut self, cells: Vec<HeatmapCellSpec>) -> Self {
-        self.heatmap_cells = cells;
-        self
-    }
-
-    pub fn footprint_cells(mut self, cells: Vec<FootprintCellSpec>) -> Self {
-        self.footprint_cells = cells;
         self
     }
 }
@@ -780,228 +696,6 @@ where
         let crosshair_bg = cx.theme().foreground;
         let crosshair_fg = cx.theme().background;
         let candle_type = self.candle_type;
-
-        // Resting-liquidity heatmap, behind profile/candles.
-        if !self.heatmap_cells.is_empty() {
-            let heat_first = *timestamps.first().unwrap_or(&0) as f64;
-            let heat_last = *timestamps.last().unwrap_or(&0) as f64;
-            let heat_span = (heat_last - heat_first).max(1.0);
-            for cell in &self.heatmap_cells {
-                if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
-                    continue;
-                }
-                let x0_raw = chart_w * ((cell.start_ms as f64 - heat_first) / heat_span) as f32;
-                let x1_raw = chart_w * ((cell.end_ms as f64 - heat_first) / heat_span) as f32;
-                // Fully off-screen cells are skipped; only partially visible
-                // cells are clipped to the plot. Clamping every off-screen cell
-                // would smear a band along the plot edge while panning.
-                if x1_raw <= 0.0 || x0_raw >= chart_w || x1_raw <= x0_raw {
-                    continue;
-                }
-                let x0 = x0_raw.max(0.0);
-                let x1 = x1_raw.min(chart_w).max(x0 + 1.0);
-                let y_top = origin.y + px(y_scale.scale(cell.price_high));
-                let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
-                let bounds = Bounds::from_corners(
-                    gpui::point(origin.x + px(x0), y_top.min(y_bottom)),
-                    gpui::point(origin.x + px(x1), y_top.max(y_bottom)),
-                );
-                window.paint_quad(fill(bounds, cell.color));
-            }
-        }
-
-        // Right-aligned volume profile. Drawn before candles so price action
-        // remains readable through the translucent bars.
-        for bar in &self.profile_bars {
-            if !bar.price_low.is_finite()
-                || !bar.price_high.is_finite()
-                || bar.price_high <= bar.price_low
-                || bar.width_fraction <= 0.0
-            {
-                continue;
-            }
-            let y_top = origin.y + px(y_scale.scale(bar.price_high));
-            let y_bottom = origin.y + px(y_scale.scale(bar.price_low));
-            let width = (chart_w * bar.width_fraction.clamp(0.0, 1.0)).max(1.0);
-            let x_right = origin.x + px(chart_w);
-            let x_left = x_right - px(width);
-            let bounds = Bounds::from_corners(
-                gpui::point(x_left, y_top.min(y_bottom)),
-                gpui::point(x_right, y_top.max(y_bottom)),
-            );
-            window.paint_quad(fill(bounds, bar.color));
-        }
-
-        for line in &self.profile_lines {
-            if !line.price.is_finite() {
-                continue;
-            }
-            let y = origin.y + px(y_scale.scale(line.price));
-            let mut path = PathBuilder::stroke(px(1.0));
-            path.move_to(gpui::point(origin.x, y));
-            path.line_to(gpui::point(origin.x + px(chart_w), y));
-            if let Ok(path) = path.build() {
-                window.paint_path(path, line.color);
-            }
-        }
-
-        // Bid x ask footprint cells. Numeric columns are dropped before the
-        // text can overflow; narrow cells fall back to a single delta/volume.
-        if !self.footprint_cells.is_empty() {
-            let cell_w = (slot_w * 0.96).max(1.0);
-            let poc_color: Hsla = gpui::rgb(0xf0b90b).into();
-            for cell in &self.footprint_cells {
-                if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
-                    continue;
-                }
-                let Some(&center_x) = ts_to_x.get(&cell.timestamp_ms) else {
-                    continue;
-                };
-                if center_x < -slot_w || center_x > chart_w + slot_w {
-                    continue;
-                }
-                let y_top = origin.y + px(y_scale.scale(cell.price_high));
-                let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
-                let top = y_top.min(y_bottom);
-                let bottom = y_top.max(y_bottom);
-                let cell_h = (bottom - top).as_f32();
-                // Zoom may produce sub-pixel rows when many prices traded. Skip
-                // them unless they carry a marker the user needs to see.
-                if cell_h < 0.5
-                    && !(cell.is_poc
-                        || cell.is_vah
-                        || cell.is_val
-                        || cell.is_hovered
-                        || cell.is_selected)
-                {
-                    continue;
-                }
-                let x_left = origin.x + px(center_x - cell_w / 2.0);
-                let x_right = origin.x + px(center_x + cell_w / 2.0);
-                let bounds = Bounds::from_corners(
-                    gpui::point(x_left, top),
-                    gpui::point(x_right, bottom),
-                );
-                window.paint_quad(fill(bounds, cell.background));
-
-                if cell.is_poc {
-                    let mut border = PathBuilder::stroke(px(1.0));
-                    border.move_to(bounds.origin);
-                    border.line_to(gpui::point(bounds.origin.x + bounds.size.width, bounds.origin.y));
-                    border.line_to(gpui::point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y + bounds.size.height,
-                    ));
-                    border.line_to(gpui::point(bounds.origin.x, bounds.origin.y + bounds.size.height));
-                    border.close();
-                    if let Ok(path) = border.build() {
-                        window.paint_path(path, poc_color);
-                    }
-                }
-
-                if cell.is_selected || cell.is_hovered {
-                    let stroke = if cell.is_selected { 1.5 } else { 1.0 };
-                    let color = if cell.is_selected {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().primary.opacity(0.75)
-                    };
-                    let mut border = PathBuilder::stroke(px(stroke));
-                    border.move_to(bounds.origin);
-                    border.line_to(gpui::point(bounds.origin.x + bounds.size.width, bounds.origin.y));
-                    border.line_to(gpui::point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y + bounds.size.height,
-                    ));
-                    border.line_to(gpui::point(bounds.origin.x, bounds.origin.y + bounds.size.height));
-                    border.close();
-                    if let Ok(path) = border.build() {
-                        window.paint_path(path, color);
-                    }
-                }
-
-                if cell.is_vah || cell.is_val {
-                    let y = if cell.is_vah {
-                        bounds.origin.y
-                    } else {
-                        bounds.origin.y + bounds.size.height - px(1.0)
-                    };
-                    let mut line = PathBuilder::stroke(px(1.0));
-                    line.move_to(gpui::point(x_left, y));
-                    line.line_to(gpui::point(x_right, y));
-                    if let Ok(path) = line.build() {
-                        window.paint_path(path, cx.theme().muted_foreground.opacity(0.8));
-                    }
-                }
-
-                if cell.imbalance != 0 {
-                    let stripe_w = px(2.0);
-                    // `imbalance > 0` is ask-side / aggressive buying, so the
-                    // stripe sits on the ask (right) side in bullish colour.
-                    let stripe_x = if cell.imbalance > 0 {
-                        x_right - stripe_w
-                    } else {
-                        x_left
-                    };
-                    let stripe = Bounds::from_corners(
-                        gpui::point(stripe_x, top),
-                        gpui::point(stripe_x + stripe_w, bottom),
-                    );
-                    let color = if cell.imbalance > 0 {
-                        bullish_color
-                    } else {
-                        bearish_color
-                    };
-                    window.paint_quad(fill(stripe, color.opacity(0.9)));
-                }
-
-                let font_size = cell.font_size.max(6.0);
-                let text_y = top + px((cell_h - font_size).max(0.0) * 0.5);
-                // Conservative width estimate so two numeric columns never
-                // overflow their cell on the default UI font.
-                let char_w = font_size * 0.62;
-                let left_w = cell.left_text.len() as f32 * char_w;
-                let right_w = cell.right_text.len() as f32 * char_w;
-                let single_w = cell.single_text.len() as f32 * char_w;
-                let gap = 3.0;
-                let can_draw_text = cell_h >= font_size + 1.0;
-                let show_two = can_draw_text
-                    && !cell.left_text.is_empty()
-                    && !cell.right_text.is_empty()
-                    && left_w + right_w + gap + 4.0 <= cell_w;
-
-                if show_two {
-                    paint_text_line_sized(
-                        cell.left_text.clone(),
-                        gpui::point(x_left + px(2.0), text_y),
-                        cell.left_color,
-                        font_size,
-                        window,
-                        cx,
-                    );
-                    paint_text_line_sized(
-                        cell.right_text.clone(),
-                        gpui::point(x_right - px(right_w + 2.0), text_y),
-                        cell.right_color,
-                        font_size,
-                        window,
-                        cx,
-                    );
-                } else if can_draw_text
-                    && !cell.single_text.is_empty()
-                    && single_w + gap + 2.0 <= cell_w
-                {
-                    paint_text_line_centered_sized(
-                        cell.single_text.clone(),
-                        cell.single_color,
-                        bounds,
-                        font_size,
-                        window,
-                        cx,
-                    );
-                }
-            }
-        }
 
         let mut period_high_f = f64::NEG_INFINITY;
         let mut period_low_f = f64::INFINITY;
@@ -2628,74 +2322,6 @@ pub fn paint_text_line_centered(
     cx: &mut App,
 ) {
     let font_size = px(TIP_FONT);
-    let mut font = window.text_style().font();
-    font.weight = gpui::FontWeight::BOLD;
-    let text_run = gpui::TextRun {
-        len: text.len(),
-        font,
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-
-    if let Ok(shaped) = window
-        .text_system()
-        .shape_text(text, font_size, &[text_run], None, None)
-    {
-        let bottom_right = bounds.corner(Corner::BottomRight);
-        let center_x = (bounds.origin.x + bottom_right.x).as_f32() / 2.0;
-        let center_y = (bounds.origin.y + bottom_right.y).as_f32() / 2.0;
-
-        for line in shaped {
-            let line_size = line.size(font_size);
-            let origin = gpui::point(
-                px(center_x - line_size.width.as_f32() / 2.0),
-                px(center_y - font_size.as_f32() / 2.0),
-            );
-            let _ = line.paint(origin, font_size, TextAlign::Left, None, window, cx);
-        }
-    }
-}
-
-/// Draw a single line of text at a responsive size.
-fn paint_text_line_sized(
-    text: SharedString,
-    origin: gpui::Point<Pixels>,
-    color: Hsla,
-    font_size: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    use gpui::TextRun;
-    let font_size = px(font_size.max(6.0));
-    let text_run = TextRun {
-        len: text.len(),
-        font: window.text_style().font(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    if let Ok(shaped) = window
-        .text_system()
-        .shape_text(text, font_size, &[text_run], None, None)
-    {
-        for line in shaped {
-            let _ = line.paint(origin, font_size, TextAlign::Left, None, window, cx);
-        }
-    }
-}
-
-fn paint_text_line_centered_sized(
-    text: SharedString,
-    color: Hsla,
-    bounds: Bounds<Pixels>,
-    font_size: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let font_size = px(font_size.max(6.0));
     let mut font = window.text_style().font();
     font.weight = gpui::FontWeight::BOLD;
     let text_run = gpui::TextRun {

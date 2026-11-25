@@ -4,33 +4,17 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
-## Chart order flow
+## Chart order flow removed
 
-The five separate order-flow toolbar buttons are now one **Order flow** menu with grouped footprint, profile, Delta/CVD, liquidity, L1, and analytics sections. Every toggle has one mutation path, shared by the menu and the `V`/`D`/`P`/`H`/`B` shortcuts; choosing a footprint mode no longer silently forces the footprint open.
+Order-flow functionality was removed from the chart and data layers. The chart no longer renders a footprint grid, Delta/CVD sub-panes, a volume profile, L1 best-bid/ask step lines, or a resting-liquidity heatmap, and the **Order flow** toolbar menu and its `V`/`D`/`P`/`H`/`B` shortcuts are gone. The derived `delta`/`footprint`/`profile` gateway subscriptions, the historical L2/L1 book routes, and the raw-trade history replay used only by those overlays were removed with their modules.
 
-Four pure analytics now render on the legacy chart path without touching the vendored chart crate:
+Existing layout files still load: the removed order-flow fields are simply ignored on read, and the `schema_version` and price-scale fields are unchanged, so no migration is required.
 
-- **Absorption** places a direction-coloured diamond on bars with top-decile volume but below-median range and a non-zero delta.
-- **Delta divergence** draws a dashed line between consecutive price/CVD swing highs or lows plus a `BEAR`/`BULL` label.
-- **Imbalance stacks** outline runs of at least three consecutive footprint imbalances at the bar's x position.
-- **CVD regime** adds a `CVD RISING/FALLING/FLAT` badge to the Delta/CVD pane legend.
-
-The analytics are cached by order-flow feed version (plus the row multiplier/imbalance ratio that shape stacks), not recomputed per frame, and never run on bars without real trade rows. The v2 engine still renders candles only; these overlays remain on the legacy path.
-
-The footprint, Delta/CVD, volume profile, and liquidity overlays were tightened without changing the backend wire contract:
-
-- Footprint rows now use the backend `row_size` (or the symbol tick / inferred source gaps) and are anchored to absolute prices, so panning and zooming cannot re-bucket prints. The footprint menu offers **Row size 1×/2×/4×/8×**; `1×` keeps backend rows 1:1, and merged rows split volume by price overlap.
-- Value area expands contiguously from the POC, and ask/bid imbalances compare the correct diagonal neighbour with a positive opposite side required.
-- Delta and CVD render in separate, independently scaled sub-panes with their own legends and a faint zero line. The volume profile follows the visible bars (VPVR); the backend session profile is used only when the visible range has no order-flow rows.
-- The liquidity heatmap uses the visible time window and no longer clamps off-screen cells to the plot edge.
-- Historical liquidity now backfills from CoinWatch's `GET /api/v1/orderbook/history` (change-only 1s L2 samples) behind a live ring bucketed to 1 second (the 10 Hz broadcast keeps the latest snapshot per bucket, so heatmap/L1 resolution matches history and the ring holds 15 minutes of each). The chart derives L1 best bid/ask from the same L2 top levels rather than spending a second ticker-history request. One pre-window (`carried`) sample seeds the left edge, and every heatmap cell is capped at 5s so the last historical sample cannot smear across the 1h lag seam. History pages fill up to 15 minutes behind the server's 1h-lagged cutoff; queued backfills retry five times, guest/401 shows `Sign in for historical depth`, and 402 surfaces the credit state. Layouts, settings, and credentials are never uploaded by this path.
-- The new **L1** toolbar toggle (`B`) draws 1px best-bid/best-ask step lines from the same book feed over the candles. The step line breaks when consecutive samples are more than 5s apart, so the 1h history/live seam is not bridged by a long diagonal.
-
-Order flow remains **live-session authoritative**. Historical candles do not fabricate footprint rows; the chart shows an `Order flow: live session` note when the viewport extends before the first live order-flow bar and no history has been loaded. The **Order flow → Load order-flow history** action replays CoinWatch's `GET /api/v1/trades/history` for the visible window (or the last 30 minutes when the chart is empty), aggregates the prints into exact-price `FlowBar`s, and merges only bars strictly older than the oldest live bar. The live seam bar is never duplicated; CVD and total delta are recomputed across the merged series. Raw trades are retained for 14 days and each load is capped at 12 pages × 20,000 rows (240,000 trades). The route is metered (3 credits) and only runs on explicit user action; guest/402/partial states surface as a note. Rendering changes are documented in `gpui-component-patched/FINTER-PATCHES.md`. No update/checksum behavior changed.
+The standalone **Depth of Market** (order book) and **Time & Sales** (trade tape) panes are unaffected and continue to stream from the gateway's `orderbook` and `trades` subscriptions. The backend `GET /api/v1/trades/history` contract is unchanged; the desktop client no longer calls it.
 
 ## Chart core (experimental, opt-in)
 
-A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, footprint hover/pin, history paging and the L1/L2/liquidity-history overlays. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.
+A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, indicators, volume, and history paging. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.
 
 ## Release workflow
 

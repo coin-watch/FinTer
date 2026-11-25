@@ -27,15 +27,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::data::book_history::{parse_orderbook_history, OrderbookHistory};
 use crate::data::client::{service_base_url, tokio_runtime};
 use crate::data::models::OhlcvCandle;
 use crate::data::orderbook::{OrderBook, PriceLevel};
-use crate::data::orderflow_feed::{
-    DerivedDelta, DerivedFlowEvent, DerivedFootprint, DerivedProfile
-};
 use crate::data::tick::{TradeSide, UnifiedTick};
-use crate::data::trade_history::{TradeHistoryError, TradeHistoryPage, parse_trade_history};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,57 +59,6 @@ static HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, HistoryCacheEntry>>
 
 fn history_request_cache() -> &'static Mutex<HashMap<String, HistoryCacheEntry>> {
     HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Historical L2/L1 responses are larger than candle pages, so keep a smaller
-/// bounded cache than the OHLCV one.
-const BOOK_HISTORY_CACHE_MAX_ENTRIES: usize = 100;
-
-#[derive(Clone)]
-struct BookHistoryCacheEntry {
-    history: OrderbookHistory,
-    expires_at: Instant,
-}
-
-static BOOK_HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, BookHistoryCacheEntry>>> =
-    OnceLock::new();
-
-fn book_history_request_cache() -> &'static Mutex<HashMap<String, BookHistoryCacheEntry>> {
-    BOOK_HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Raw-trade history pages are capped at 20k rows, but still larger than book
-/// samples; keep a bounded per-credential cache like the L2 route.
-const TRADE_HISTORY_CACHE_MAX_ENTRIES: usize = 100;
-
-#[derive(Clone)]
-struct TradeHistoryCacheEntry {
-    page: TradeHistoryPage,
-    expires_at: Instant,
-}
-
-static TRADE_HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, TradeHistoryCacheEntry>>> =
-    OnceLock::new();
-
-fn trade_history_request_cache() -> &'static Mutex<HashMap<String, TradeHistoryCacheEntry>> {
-    TRADE_HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Failure modes the chart needs to distinguish for the liquidity history note.
-#[derive(Clone, Debug, thiserror::Error)]
-pub enum BookHistoryError {
-    /// Missing or expired credentials; the live feed still works.
-    #[error("sign-in required")]
-    Auth,
-    /// The account ran out of credits.
-    #[error("{0}")]
-    Credits(String),
-    /// The whole requested window is inside the server's 1h lag.
-    #[error("data is not available yet")]
-    NotAvailable,
-    /// Network, configuration, parse, or other failure.
-    #[error("{0}")]
-    Other(String),
 }
 
 #[derive(Clone)]
@@ -271,12 +215,6 @@ pub struct BridgeConfig {
     pub trade_since_current_bar: bool,
     /// Order-book depth requested at subscribe time.
     pub orderbook_depth: u32,
-    /// Subscribe to derived delta bars.
-    pub delta: bool,
-    /// Subscribe to derived footprint bars.
-    pub footprint: bool,
-    /// Subscribe to the derived session profile.
-    pub profile: bool,
 }
 
 impl BridgeConfig {
@@ -297,9 +235,6 @@ impl BridgeConfig {
             trade_limit: 100,
             trade_since_current_bar: false,
             orderbook_depth: 20,
-            delta: false,
-            footprint: false,
-            profile: false,
         }
     }
 
@@ -376,108 +311,6 @@ impl BridgeConfig {
         }
         url
     }
-
-    /// Market type used by the history routes to resolve coverage/state.
-    ///
-    /// realtime-ondemand keys historical coverage by `type=spot|swap|future`,
-    /// so a perpetual symbol must not be queried as spot.
-    fn history_market_type(&self) -> &'static str {
-        let exchange = self.exchange.to_ascii_lowercase();
-        if exchange.ends_with("usdm") || self.symbol.contains(':') {
-            "swap"
-        } else if exchange.ends_with("coinm") || exchange.ends_with("futures") {
-            "future"
-        } else {
-            "spot"
-        }
-    }
-
-    /// Historical L2 order-book route (CoinWatch `/api/v1/orderbook/history`).
-    pub fn orderbook_history_url(
-        &self,
-        since: i64,
-        until: i64,
-        depth: u32,
-        sample_ms: i64,
-    ) -> String {
-        self.book_history_url("orderbook", since, until, depth, sample_ms)
-    }
-
-    /// Historical top-of-book route (CoinWatch `/api/v1/ticker/history`).
-    ///
-    /// Exposed for API completeness. The chart derives L1 from the L2 history
-    /// instead of spending a second metered request.
-    pub fn ticker_history_url(
-        &self,
-        since: i64,
-        until: i64,
-        depth: u32,
-        sample_ms: i64,
-    ) -> String {
-        self.book_history_url("ticker", since, until, depth, sample_ms)
-    }
-
-    fn book_history_url(
-        &self,
-        route: &str,
-        since: i64,
-        until: i64,
-        depth: u32,
-        sample_ms: i64,
-    ) -> String {
-        let sample_ms = sample_ms.max(1);
-        let market_type = self.history_market_type();
-        // The server accepts 1..=20000 samples; one 15-minute 1s window is 900.
-        let limit = ((until.saturating_sub(since)).max(0) / sample_ms).clamp(1, 20_000);
-        // The route only supports 20 or 50 levels.
-        let depth = if depth > 20 { 50 } else { 20 };
-        format!(
-            "{}/api/v1/{route}/history?exchange={}&symbol={}&since={since}&until={until}&limit={limit}&depth={depth}&sample_ms={sample_ms}&type={market_type}&module={}&source=native",
-            self.rest_base_url,
-            urlencoding::encode(&self.exchange),
-            urlencoding::encode(&self.symbol),
-            urlencoding::encode(&format!("Chart · {}", self.symbol)),
-        )
-    }
-
-    /// Cursor-paginated raw-trade history (CoinWatch
-    /// `/api/v1/trades/history`).
-    ///
-    /// `cursor` and `since` are mutually exclusive on the backend; when a
-    /// cursor is supplied it already encodes the next page's lower bound, so
-    /// `since` is omitted.
-    pub fn trades_history_url(
-        &self,
-        since: i64,
-        until: i64,
-        limit: usize,
-        order: &str,
-        cursor: Option<&str>,
-    ) -> String {
-        let limit = limit.clamp(1, 20_000);
-        let order = if order.eq_ignore_ascii_case("asc") {
-            "asc"
-        } else {
-            "desc"
-        };
-        let market_type = self.history_market_type();
-        let mut url = format!(
-            "{}/api/v1/trades/history?exchange={}&symbol={}&until={until}&limit={limit}&type={market_type}&order={order}",
-            self.rest_base_url,
-            urlencoding::encode(&self.exchange),
-            urlencoding::encode(&self.symbol),
-        );
-        match cursor.filter(|cursor| !cursor.is_empty()) {
-            Some(cursor) => {
-                url.push_str("&cursor=");
-                url.push_str(&urlencoding::encode(cursor));
-            }
-            None => {
-                url.push_str(&format!("&since={since}"));
-            }
-        }
-        url
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +325,6 @@ pub struct Bridge {
     trade_sender: broadcast::Sender<Arc<UnifiedTick>>,
     ob_sender: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    derived_sender: broadcast::Sender<Arc<DerivedFlowEvent>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
     last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -517,7 +349,6 @@ impl Bridge {
         let (trade_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ob_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let (ohlcv_sender, _) = broadcast::channel(OHLCV_BROADCAST_CAPACITY);
-        let (derived_sender, _) = broadcast::channel(256);
         let cancel_token = CancellationToken::new();
         let last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -530,7 +361,6 @@ impl Bridge {
         let trade_tx = trade_sender.clone();
         let ob_tx = ob_sender.clone();
         let ohlcv_tx = ohlcv_sender.clone();
-        let derived_tx = derived_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
         let tick_cache = Arc::clone(&last_tick);
@@ -543,7 +373,6 @@ impl Bridge {
                 trade_tx,
                 ob_tx,
                 ohlcv_tx,
-                derived_tx,
                 token,
                 history_cache,
                 tick_cache,
@@ -557,7 +386,6 @@ impl Bridge {
             trade_sender,
             ob_sender,
             ohlcv_sender,
-            derived_sender,
             last_ohlcv_history,
             last_tick,
             last_orderbook,
@@ -625,11 +453,6 @@ impl Bridge {
         rx
     }
 
-    /// Subscribe to derived Level 3 order-flow events.
-    pub fn subscribe_derived_flow(&self) -> broadcast::Receiver<Arc<DerivedFlowEvent>> {
-        self.derived_sender.subscribe()
-    }
-
     /// Number of active trade tick subscribers.
     pub fn subscriber_count(&self) -> usize {
         self.tick_sender.receiver_count()
@@ -651,7 +474,6 @@ async fn supervision_loop(
     trade_tx: broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    derived_tx: broadcast::Sender<Arc<DerivedFlowEvent>>,
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -687,7 +509,6 @@ async fn supervision_loop(
             &trade_tx,
             &ob_tx,
             &ohlcv_tx,
-            &derived_tx,
             &cancel_token,
             &history_cache,
             &last_tick_cache,
@@ -757,23 +578,6 @@ enum Requirement<'a> {
         timeframe: &'a str,
         lookback: u32,
     },
-    Delta {
-        exchange: &'a str,
-        symbol: &'a str,
-        timeframe: &'a str,
-    },
-    Footprint {
-        exchange: &'a str,
-        symbol: &'a str,
-        timeframe: &'a str,
-        rows: u32,
-    },
-    Profile {
-        exchange: &'a str,
-        symbol: &'a str,
-        timeframe: &'a str,
-        mode: &'a str,
-    },
 }
 
 #[derive(serde::Serialize)]
@@ -794,9 +598,6 @@ enum StreamChannel {
     Trades,
     Orderbook,
     Ohlcv,
-    Delta,
-    Footprint,
-    Profile,
 }
 
 impl StreamChannel {
@@ -806,9 +607,6 @@ impl StreamChannel {
             Self::Trades => "trades",
             Self::Orderbook => "orderbook",
             Self::Ohlcv => "kline",
-            Self::Delta => "delta",
-            Self::Footprint => "footprint",
-            Self::Profile => "profile",
         }
     }
 
@@ -818,9 +616,6 @@ impl StreamChannel {
             "trades" | "tape" => Some(Self::Trades),
             "orderbook" | "book" => Some(Self::Orderbook),
             "kline" | "ohlcv" | "chart" => Some(Self::Ohlcv),
-            "delta" => Some(Self::Delta),
-            "footprint" => Some(Self::Footprint),
-            "profile" => Some(Self::Profile),
             _ => None,
         }
     }
@@ -835,12 +630,6 @@ fn channel_for_feed(feed: &str) -> Option<StreamChannel> {
         Some(StreamChannel::Orderbook)
     } else if feed.starts_with("ohlcv:") || feed.starts_with("candles:") {
         Some(StreamChannel::Ohlcv)
-    } else if feed.starts_with("delta:") {
-        Some(StreamChannel::Delta)
-    } else if feed.starts_with("footprint:") {
-        Some(StreamChannel::Footprint)
-    } else if feed.starts_with("profile:") {
-        Some(StreamChannel::Profile)
     } else {
         None
     }
@@ -997,7 +786,6 @@ async fn connect_and_stream(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -1113,59 +901,9 @@ async fn connect_and_stream(
             .send(Message::Text(serde_json::to_string(&frame)?))
             .await?;
     }
-    if config.delta {
-        let frame = SubscribeFrame {
-            op: "sub",
-            id: StreamChannel::Delta.id(),
-            requirement: Requirement::Delta {
-                exchange: &config.exchange,
-                symbol: &config.symbol,
-                timeframe: &config.timeframe,
-            },
-        };
-        write
-            .send(Message::Text(serde_json::to_string(&frame)?))
-            .await?;
-    }
-    if config.footprint {
-        let frame = SubscribeFrame {
-            op: "sub",
-            id: StreamChannel::Footprint.id(),
-            requirement: Requirement::Footprint {
-                exchange: &config.exchange,
-                symbol: &config.symbol,
-                timeframe: &config.timeframe,
-                rows: 40,
-            },
-        };
-        write
-            .send(Message::Text(serde_json::to_string(&frame)?))
-            .await?;
-    }
-    if config.profile {
-        let frame = SubscribeFrame {
-            op: "sub",
-            id: StreamChannel::Profile.id(),
-            requirement: Requirement::Profile {
-                exchange: &config.exchange,
-                symbol: &config.symbol,
-                timeframe: &config.timeframe,
-                mode: "session",
-            },
-        };
-        write
-            .send(Message::Text(serde_json::to_string(&frame)?))
-            .await?;
-    }
     debug!(
-        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={}, delta={}, footprint={}, profile={})",
-        config.ticker,
-        config.kline,
-        config.orderbook,
-        config.trades,
-        config.delta,
-        config.footprint,
-        config.profile
+        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={})",
+        config.ticker, config.kline, config.orderbook, config.trades
     );
 
     let mut feed_channels: HashMap<String, StreamChannel> = HashMap::new();
@@ -1184,9 +922,6 @@ async fn connect_and_stream(
                     && !config.kline
                     && !config.orderbook
                     && !config.trades
-                    && !config.delta
-                    && !config.footprint
-                    && !config.profile
                 {
                     continue;
                 }
@@ -1214,7 +949,6 @@ async fn connect_and_stream(
                             trade_tx,
                             ob_tx,
                             ohlcv_tx,
-                            derived_tx,
                             history_cache,
                             last_tick_cache,
                             last_ob_cache,
@@ -1278,7 +1012,6 @@ fn handle_gateway_frame(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
@@ -1332,7 +1065,6 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
-                    derived_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1377,7 +1109,6 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
-                    derived_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1436,39 +1167,10 @@ fn dispatch_new_data(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    derived_tx: &broadcast::Sender<Arc<DerivedFlowEvent>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
-    if matches!(
-        channel,
-        StreamChannel::Delta | StreamChannel::Footprint | StreamChannel::Profile
-    ) {
-        let items = match data.as_array() {
-            Some(rows) => rows.clone(),
-            None => vec![data.clone()]
-        };
-        for item in items {
-            let event = match channel {
-                StreamChannel::Delta => serde_json::from_value::<DerivedDelta>(item)
-                    .ok()
-                    .map(DerivedFlowEvent::Delta),
-                StreamChannel::Footprint => serde_json::from_value::<DerivedFootprint>(item)
-                    .ok()
-                    .map(DerivedFlowEvent::Footprint),
-                StreamChannel::Profile => serde_json::from_value::<DerivedProfile>(item)
-                    .ok()
-                    .map(DerivedFlowEvent::Profile),
-                _ => None
-            };
-            if let Some(event) = event {
-                let _ = derived_tx.send(Arc::new(event));
-            }
-        }
-        return;
-    }
-
     let envelope = serde_json::json!({
         "type": "data",
         "channel": channel.id(),
@@ -2135,354 +1837,6 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
     Ok(candles)
 }
 
-/// Fetch a window of historical L2 book snapshots.
-///
-/// `until` must be at/before the server's 1h-lagged cutoff; an entirely
-/// recent window returns [`BookHistoryError::NotAvailable`]. The chart uses
-/// these samples behind the live book floor and derives L1 from the top
-/// levels.
-pub async fn fetch_orderbook_history(
-    config: &BridgeConfig,
-    since: i64,
-    until: i64,
-    depth: u32,
-    sample_ms: i64,
-) -> Result<OrderbookHistory, BookHistoryError> {
-    if config.rest_base_url.trim().is_empty() {
-        return Err(BookHistoryError::Other(
-            "No API service URL configured".to_string(),
-        ));
-    }
-    if until <= 0 || since >= until {
-        return Err(BookHistoryError::Other(
-            "invalid book-history window".to_string(),
-        ));
-    }
-    let url = config.orderbook_history_url(since, until, depth, sample_ms);
-    fetch_book_history(config, &url, until).await
-}
-
-/// Fetch historical L1 (ticker) samples. Kept for API completeness; the chart
-/// derives L1 from [`fetch_orderbook_history`] to avoid a second metered call.
-pub async fn fetch_l1_history(
-    config: &BridgeConfig,
-    since: i64,
-    until: i64,
-    depth: u32,
-    sample_ms: i64,
-) -> Result<OrderbookHistory, BookHistoryError> {
-    if config.rest_base_url.trim().is_empty() {
-        return Err(BookHistoryError::Other(
-            "No API service URL configured".to_string(),
-        ));
-    }
-    if until <= 0 || since >= until {
-        return Err(BookHistoryError::Other(
-            "invalid ticker-history window".to_string(),
-        ));
-    }
-    let url = config.ticker_history_url(since, until, depth, sample_ms);
-    fetch_book_history(config, &url, until).await
-}
-
-async fn fetch_book_history(
-    config: &BridgeConfig,
-    url: &str,
-    until: i64,
-) -> Result<OrderbookHistory, BookHistoryError> {
-    // Mirrors `fetch_ohlcv_history`: cache per credential so metered responses
-    // are never shared between users, refresh once on 401, and surface 402 to
-    // the credit store.
-    let token = crate::data::session_store::load_session()
-        .ok()
-        .flatten()
-        .map(|session| session.access_token)
-        .or_else(|| config.access_token.clone());
-    let token_digest = token
-        .as_deref()
-        .map(|value| {
-            use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(value.as_bytes()))
-        })
-        .unwrap_or_else(|| "anonymous".to_string());
-    let cache_key = format!("{token_digest}:{url}");
-    if let Ok(mut cache) = book_history_request_cache().lock() {
-        cache.retain(|_, entry| entry.expires_at > Instant::now());
-        if let Some(entry) = cache.get(&cache_key) {
-            return Ok(entry.history.clone());
-        }
-    }
-    debug!("gateway: GET {}", url.split('?').next().unwrap_or(url));
-
-    let response = send_ohlcv_request(config, url, token.as_deref())
-        .await
-        .map_err(|error| BookHistoryError::Other(error.to_string()))?;
-    let (response, cache_key) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        warn!("gateway: book history returned 401 — attempting session refresh");
-        match refresh_session_token(config).await {
-            Some(refreshed) => {
-                let digest = {
-                    use sha2::{Digest, Sha256};
-                    format!("{:x}", Sha256::digest(refreshed.as_bytes()))
-                };
-                let retry_key = format!("{digest}:{url}");
-                let retry = send_ohlcv_request(config, url, Some(&refreshed))
-                    .await
-                    .map_err(|error| BookHistoryError::Other(error.to_string()))?;
-                (retry, retry_key)
-            }
-            None => (response, cache_key),
-        }
-    } else {
-        (response, cache_key)
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error: serde_json::Value = response.json().await.unwrap_or_default();
-        let message = error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Market data request failed");
-        if status.as_u16() == 402
-            || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits")
-        {
-            let balance = error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-            let required = error.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-            crate::data::credits::CreditStore::record(
-                "Chart",
-                message,
-                balance,
-                required,
-                Some(&config.rest_base_url),
-            );
-            return Err(BookHistoryError::Credits(format!(
-                "{} (balance {}, required {})",
-                message, balance, required
-            )));
-        }
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(BookHistoryError::Auth);
-        }
-        if status == reqwest::StatusCode::BAD_REQUEST
-            && (message.to_ascii_lowercase().contains("not available")
-                || error
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|code| code.contains("not_available")))
-        {
-            return Err(BookHistoryError::NotAvailable);
-        }
-        return Err(BookHistoryError::Other(format!(
-            "book history fetch failed: HTTP {}: {}",
-            status, message
-        )));
-    }
-
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| BookHistoryError::Other(error.to_string()))?;
-    if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-        let message = value
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Not enough credits");
-        let balance = value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-        let required = value.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-        crate::data::credits::CreditStore::record(
-            "Chart",
-            message,
-            balance,
-            required,
-            Some(&config.rest_base_url),
-        );
-        return Err(BookHistoryError::Credits(format!(
-            "{} (balance {}, required {})",
-            message, balance, required
-        )));
-    }
-    let history = parse_orderbook_history(value);
-
-    // Windows touching the live edge can change while an async backfill runs,
-    // so cache them briefly; older windows are immutable enough for a minute.
-    let near_live_edge = until > now_ms() - 3 * 60 * 60 * 1000;
-    let ttl = if near_live_edge {
-        Duration::from_secs(15)
-    } else {
-        Duration::from_secs(60)
-    };
-    if let Ok(mut cache) = book_history_request_cache().lock() {
-        if cache.len() >= BOOK_HISTORY_CACHE_MAX_ENTRIES {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
-            }
-        }
-        cache.insert(
-            cache_key,
-            BookHistoryCacheEntry {
-                history: history.clone(),
-                expires_at: Instant::now() + ttl,
-            },
-        );
-    }
-    Ok(history)
-}
-
-/// Fetch one page of persisted raw trades.
-///
-/// Mirrors [`fetch_book_history`]: cache per credential, refresh once on 401,
-/// surface 402 to the credit store, and map the relay's "not available" 400 to
-/// [`TradeHistoryError::NotAvailable`]. Callers must treat this as metered and
-/// only invoke it on an explicit user action.
-pub async fn fetch_trades_history_page(
-    config: &BridgeConfig,
-    url: &str,
-) -> Result<TradeHistoryPage, TradeHistoryError> {
-    let token = crate::data::session_store::load_session()
-        .ok()
-        .flatten()
-        .map(|session| session.access_token)
-        .or_else(|| config.access_token.clone());
-    let token_digest = token
-        .as_deref()
-        .map(|value| {
-            use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(value.as_bytes()))
-        })
-        .unwrap_or_else(|| "anonymous".to_string());
-    let cache_key = format!("{token_digest}:{url}");
-    if let Ok(mut cache) = trade_history_request_cache().lock() {
-        cache.retain(|_, entry| entry.expires_at > Instant::now());
-        if let Some(entry) = cache.get(&cache_key) {
-            return Ok(entry.page.clone());
-        }
-    }
-    debug!("gateway: GET {}", url.split('?').next().unwrap_or(url));
-
-    let response = send_ohlcv_request(config, url, token.as_deref())
-        .await
-        .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
-    let (response, cache_key) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        warn!("gateway: trades history returned 401 — attempting session refresh");
-        match refresh_session_token(config).await {
-            Some(refreshed) => {
-                let digest = {
-                    use sha2::{Digest, Sha256};
-                    format!("{:x}", Sha256::digest(refreshed.as_bytes()))
-                };
-                let retry_key = format!("{digest}:{url}");
-                let retry = send_ohlcv_request(config, url, Some(&refreshed))
-                    .await
-                    .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
-                (retry, retry_key)
-            }
-            None => (response, cache_key),
-        }
-    } else {
-        (response, cache_key)
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error: serde_json::Value = response.json().await.unwrap_or_default();
-        let message = error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Market data request failed");
-        if status.as_u16() == 402
-            || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits")
-        {
-            let balance = error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-            let required = error.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-            crate::data::credits::CreditStore::record(
-                "Chart",
-                message,
-                balance,
-                required,
-                Some(&config.rest_base_url),
-            );
-            return Err(TradeHistoryError::Credits(format!(
-                "{} (balance {}, required {})",
-                message, balance, required
-            )));
-        }
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(TradeHistoryError::Auth);
-        }
-        if status == reqwest::StatusCode::BAD_REQUEST
-            && (message.to_ascii_lowercase().contains("not available")
-                || error
-                    .get("error")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|code| code.contains("not_available")))
-        {
-            return Err(TradeHistoryError::NotAvailable);
-        }
-        return Err(TradeHistoryError::Other(format!(
-            "trade history fetch failed: HTTP {}: {}",
-            status, message
-        )));
-    }
-
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
-    if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-        let message = value
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Not enough credits");
-        let balance = value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
-        let required = value.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
-        crate::data::credits::CreditStore::record(
-            "Chart",
-            message,
-            balance,
-            required,
-            Some(&config.rest_base_url),
-        );
-        return Err(TradeHistoryError::Credits(format!(
-            "{} (balance {}, required {})",
-            message, balance, required
-        )));
-    }
-    let page = parse_trade_history(value);
-
-    // Windows touching the live edge can change while the sink catches up;
-    // older windows are immutable enough for a minute.
-    let near_live_edge = page.until > now_ms() - 3 * 60 * 60 * 1000;
-    let ttl = if near_live_edge {
-        Duration::from_secs(15)
-    } else {
-        Duration::from_secs(60)
-    };
-    if let Ok(mut cache) = trade_history_request_cache().lock() {
-        if cache.len() >= TRADE_HISTORY_CACHE_MAX_ENTRIES {
-            if let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
-            }
-        }
-        cache.insert(
-            cache_key,
-            TradeHistoryCacheEntry {
-                page: page.clone(),
-                expires_at: Instant::now() + ttl,
-            },
-        );
-    }
-    Ok(page)
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -2508,9 +1862,6 @@ mod tests {
             trade_limit: 100,
             trade_since_current_bar: false,
             orderbook_depth: 20,
-            delta: false,
-            footprint: false,
-            profile: false,
         }
     }
 
@@ -2524,111 +1875,6 @@ mod tests {
         assert_eq!(cfg.ohlcv_limit, 500);
     }
 
-    #[test]
-    fn book_history_urls_match_the_coinwatch_contract() {
-        let cfg = base_cfg();
-        let url = cfg.orderbook_history_url(1_700_000_000_000, 1_700_000_900_000, 20, 1_000);
-        assert!(url.starts_with("https://coinwat.ch/api/v1/orderbook/history?"));
-        assert!(url.contains("exchange=binance"));
-        assert!(url.contains("symbol=BTC%2FUSDT"));
-        assert!(url.contains("since=1700000000000"));
-        assert!(url.contains("until=1700000900000"));
-        assert!(url.contains("limit=900"));
-        assert!(url.contains("depth=20"));
-        assert!(url.contains("sample_ms=1000"));
-        assert!(url.contains("type=spot"));
-        assert!(url.contains("source=native"));
-
-        // Depth is normalised to the two supported values and a one-second
-        // window asks for one sample.
-        let l1 = cfg.ticker_history_url(1_700_000_000_000, 1_700_000_001_000, 50, 1_000);
-        assert!(l1.starts_with("https://coinwat.ch/api/v1/ticker/history?"));
-        assert!(l1.contains("type=spot"));
-        assert!(l1.contains("depth=50"));
-        assert!(l1.contains("limit=1"));
-
-        let mut perp = base_cfg();
-        perp.exchange = "binanceusdm".to_string();
-        let perp_url =
-            perp.orderbook_history_url(1_700_000_000_000, 1_700_000_900_000, 50, 1_000);
-        assert!(perp_url.contains("type=swap"));
-
-        let mut colon_perp = base_cfg();
-        colon_perp.symbol = "BTC/USDT:USDT".to_string();
-        let colon_url =
-            colon_perp.orderbook_history_url(1_700_000_000_000, 1_700_000_900_000, 50, 1_000);
-        assert!(colon_url.contains("type=swap"));
-
-        let mut futures = base_cfg();
-        futures.exchange = "krakenfutures".to_string();
-        let futures_url =
-            futures.orderbook_history_url(1_700_000_000_000, 1_700_000_900_000, 50, 1_000);
-        assert!(futures_url.contains("type=future"));
-        // The route path stays the same for every market type.
-        assert!(futures_url.contains("/api/v1/orderbook/history?"));
-    }
-
-    #[test]
-    fn trades_history_url_matches_the_coinwatch_contract() {
-        let cfg = base_cfg();
-        let url =
-            cfg.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 20_000, "desc", None);
-        assert!(url.starts_with("https://coinwat.ch/api/v1/trades/history?"));
-        assert!(url.contains("exchange=binance"));
-        assert!(url.contains("symbol=BTC%2FUSDT"));
-        assert!(url.contains("since=1700000000000"));
-        assert!(url.contains("until=1700000900000"));
-        assert!(url.contains("limit=20000"));
-        assert!(url.contains("type=spot"));
-        assert!(url.contains("order=desc"));
-
-        // A cursor page must not carry `since`: the relay rejects both.
-        let cursor_url = cfg.trades_history_url(
-            1_700_000_000_000,
-            1_700_000_900_000,
-            20_000,
-            "desc",
-            Some("MTcwMDAwMDAwMDAwMDp0cmFkZS0x"),
-        );
-        assert!(cursor_url.contains("cursor=MTcwMDAwMDAwMDAwMDp0cmFkZS0x"));
-        assert!(!cursor_url.contains("since="));
-
-        let mut perp = base_cfg();
-        perp.exchange = "binanceusdm".to_string();
-        let perp_url =
-            perp.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 20_000, "desc", None);
-        assert!(perp_url.contains("type=swap"));
-
-        // Limits are clamped to the relay's 1..=20000 range and order is
-        // normalised.
-        let clamped =
-            cfg.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 999_999, "ASC", None);
-        assert!(clamped.contains("limit=20000"));
-        assert!(clamped.contains("order=asc"));
-    }
-
-    #[test]
-    fn book_history_payload_parses_canonical_and_legacy() {
-        let canonical = serde_json::json!({
-            "depth": 50,
-            "sample_ms": 1000,
-            "queued": false,
-            "partial": false,
-            "data": [{"ts": 1_700_000_000_000i64, "bids": [[100.0, 1.0]], "asks": [[101.0, 1.0]]}]
-        });
-        let history = crate::data::book_history::parse_orderbook_history(canonical);
-        assert_eq!(history.data.len(), 1);
-        assert_eq!(history.depth, 50);
-
-        let legacy = serde_json::json!({
-            "success": true,
-            "data": [{"ts": 1_700_000_000, "bids": [[10.0, 2.0]], "asks": []}]
-        });
-        let history = crate::data::book_history::parse_orderbook_history(legacy);
-        assert_eq!(history.data[0].ts, 1_700_000_000_000);
-        assert_eq!(history.data[0].best_bid(), Some(10.0));
-    }
-
     #[tokio::test]
     async fn v2_frames_dispatch_ticker_trades_candles_and_detect_gaps() {
         let cfg = base_cfg();
@@ -2636,7 +1882,6 @@ mod tests {
         let (trades, mut trade_rx) = broadcast::channel(16);
         let (books, _) = broadcast::channel(16);
         let (candles, mut candle_rx) = broadcast::channel(16);
-        let (derived, _) = broadcast::channel(16);
         let history = Arc::new(std::sync::Mutex::new(None));
         let last_tick = Arc::new(std::sync::Mutex::new(None));
         let last_book = Arc::new(std::sync::Mutex::new(None));
@@ -2655,7 +1900,6 @@ mod tests {
                 &trades,
                 &books,
                 &candles,
-                &derived,
                 &history,
                 &last_tick,
                 &last_book,
@@ -2926,7 +2170,6 @@ mod tests {
         let (trade_tx, _) = broadcast::channel(16);
         let (ob_tx, _) = broadcast::channel(16);
         let (ohlcv_tx, _) = broadcast::channel(16);
-        let (derived_tx, _) = broadcast::channel(16);
 
         let cached_tick = Arc::new(UnifiedTick::new("binance", "BTC/USDT", 68500.0, 1.0, TradeSide::Buy, 1000));
         let cached_book = Arc::new(OrderBook::new(
@@ -2942,7 +2185,6 @@ mod tests {
             trade_sender: trade_tx,
             ob_sender: ob_tx,
             ohlcv_sender: ohlcv_tx,
-            derived_sender: derived_tx,
             last_ohlcv_history: Arc::new(std::sync::Mutex::new(None)),
             last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
             last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),

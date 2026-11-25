@@ -24,8 +24,8 @@ those internals or reimplementing them in FinTer, so it is kept here for now.
 
 FinTer opts in with `FINTER_CHART_V2=1`. When unset, the legacy
 `CandlestickChart` path runs unchanged, including its viewport clamping. The v2
-path is experimental and does not yet render drawings, alerts, footprints or
-L1/L2 overlays; those remain on the legacy path.
+path is experimental and does not yet render drawings, alerts, or position and
+order overlays; those remain on the legacy path.
 
 Promotion to a first-party `src/chart/engine` module is a follow-up. Until then,
 changes to these files are fork patches and should be listed here.
@@ -40,31 +40,13 @@ change was reverted in the merge commit; `clamp_offset` keeps its original
 
 ## `src/chart/candlestick_chart.rs`
 
-Order-flow rendering fixes only; non-order-flow chart behaviour is unchanged.
-
 - **Subpane zero line.** `draw_lines` paints a faint zero baseline for any pane
-  whose auto-scaled domain includes zero (all histogram panes, and CVD panes
-  that turn negative). The existing 1.5px CVD line width is preserved.
-- **Footprint sub-pixel rows.** Rows shorter than 0.5px are skipped unless they
-  carry POC/VA/hover/selection markers. Zoom changes text painting and this
-  overdraw guard, not the row aggregation (which is done in FinTer's
-  `src/chart/footprint.rs`).
-- **Footprint text fit.** The conservative character-width estimate is
-  `font_size * 0.62` and the two-column/one-column tests reserve horizontal
-  padding, so bid/ask numbers cannot overflow a narrow cell. Cells too short
-  for text still keep their background and markers.
-- **Ask/bid stripe mapping.** `imbalance > 0` is now documented and painted as
-  ask-side / aggressive buying: stripe on the right in the bullish colour;
-  `imbalance < 0` is bid-side / aggressive selling on the left in the bearish
-  colour.
-- **Heatmap clipping.** Fully off-screen heatmap cells are skipped before
-  clamping. Only partially visible cells are clipped to the plot, so panning no
-  longer smears a liquidity band along the edge.
+  whose auto-scaled domain includes zero (for example histogram indicator
+  panes). This is otherwise unchanged chart behaviour.
 
 Manual checks on desktop where possible:
 
-- Enable Delta/CVD: two subpanes, independent scales, faint zero lines, a
-  legend row and crosshair value in each pane.
-- Enable Footprint: pan/zoom repeatedly; a given print stays in the same price
-  row, text never overflows, and POC/VA/imbalance markers remain visible.
-- Enable Liquidity: pan left and right; no persistent band at either plot edge.
+- Add a histogram indicator (for example MACD): its subpane draws a faint zero
+  baseline and independently scaled bars.
+- Pan, zoom, and toggle candle types; drawings, alerts, and position/order
+  overlays still render.

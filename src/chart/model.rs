@@ -20,69 +20,6 @@ impl Default for WindowGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FootprintMode {
-    #[default]
-    BidAsk,
-    Delta,
-    Volume,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_imbalance_ratio() -> f64 {
-    3.0
-}
-
-fn default_min_row_height() -> f32 {
-    12.0
-}
-
-fn default_row_multiplier() -> u32 {
-    1
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FootprintSettings {
-    #[serde(default)]
-    pub mode: FootprintMode,
-    #[serde(default = "default_true")]
-    pub show_poc: bool,
-    #[serde(default = "default_true")]
-    pub show_value_area: bool,
-    #[serde(default = "default_true")]
-    pub show_imbalance: bool,
-    #[serde(default = "default_true")]
-    pub show_summary: bool,
-    #[serde(default = "default_imbalance_ratio")]
-    pub imbalance_ratio: f64,
-    #[serde(default = "default_min_row_height")]
-    pub min_row_height: f32,
-    /// Merge this many backend/source price rows into one rendered footprint
-    /// row. `1` keeps the backend row size 1:1. Allowed values are 1/2/4/8;
-    /// other values are treated as the next power of two (clamped).
-    #[serde(default = "default_row_multiplier")]
-    pub row_multiplier: u32,
-}
-
-impl Default for FootprintSettings {
-    fn default() -> Self {
-        Self {
-            mode: FootprintMode::BidAsk,
-            show_poc: true,
-            show_value_area: true,
-            show_imbalance: true,
-            show_summary: true,
-            imbalance_ratio: default_imbalance_ratio(),
-            min_row_height: default_min_row_height(),
-            row_multiplier: default_row_multiplier(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChartLayout {
     pub schema_version: u32,
@@ -97,36 +34,6 @@ pub struct ChartLayout {
     pub pane_ratios: BTreeMap<String, f64>,
     #[serde(default)]
     pub library_geometry: Option<WindowGeometry>,
-    /// Show the order-flow delta/CVD subpane.
-    #[serde(default = "default_show_delta")]
-    pub show_delta: bool,
-    /// Show the right-aligned volume profile.
-    #[serde(default)]
-    pub show_profile: bool,
-    /// Render the chart as a bid x ask footprint.
-    #[serde(default)]
-    pub show_footprint: bool,
-    /// Footprint display mode and analytics.
-    #[serde(default)]
-    pub footprint: FootprintSettings,
-    /// Show resting-liquidity bands behind candles.
-    #[serde(default)]
-    pub show_liquidity: bool,
-    /// Show L1 best bid/ask step lines.
-    #[serde(default)]
-    pub show_l1: bool,
-    /// Mark bars whose heavy aggressive volume failed to move price.
-    #[serde(default)]
-    pub show_absorption: bool,
-    /// Draw price/CVD swing divergences.
-    #[serde(default)]
-    pub show_divergence: bool,
-    /// Outline runs of stacked footprint imbalances.
-    #[serde(default)]
-    pub show_imbalance_stacks: bool,
-    /// Show the rising/falling/flat CVD regime badge in the order-flow legend.
-    #[serde(default)]
-    pub show_cvd_regime: bool,
     /// Price scale mode: `linear`, `log`, `percent`, or `inverted`.
     #[serde(default = "default_price_scale_mode")]
     pub price_scale_mode: String,
@@ -140,10 +47,6 @@ pub struct ChartLayout {
 
 fn default_price_scale_mode() -> String {
     "linear".to_string()
-}
-
-fn default_show_delta() -> bool {
-    true
 }
 
 impl ChartLayout {
@@ -164,16 +67,6 @@ impl ChartLayout {
             drawings: vec![],
             pane_ratios: BTreeMap::new(),
             library_geometry: None,
-            show_delta: true,
-            show_profile: false,
-            show_footprint: false,
-            footprint: FootprintSettings::default(),
-            show_liquidity: false,
-            show_l1: false,
-            show_absorption: false,
-            show_divergence: false,
-            show_imbalance_stacks: false,
-            show_cvd_regime: false,
             price_scale_mode: default_price_scale_mode(),
             manual_price_range: None,
             percent_anchor: None,
@@ -470,71 +363,28 @@ mod tests {
     }
 
     #[test]
-    fn chart_layout_show_l1_defaults_off_and_round_trips() {
-        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
+    fn layout_with_legacy_orderflow_fields_still_loads() {
+        // Layouts written while the chart had order-flow overlays must keep
+        // loading after the feature was removed: serde ignores unknown fields.
+        let layout = ChartLayout::new("binance", "BTC/USDT", "1m");
         let mut value = serde_json::to_value(&layout).unwrap();
-        // Older layout files predate the L1 toggle.
-        value.as_object_mut().unwrap().remove("show_l1");
-        let decoded: ChartLayout = serde_json::from_value(value).unwrap();
-        assert!(!decoded.show_l1);
-
-        layout.show_l1 = true;
-        let encoded = serde_json::to_vec(&layout).unwrap();
-        let decoded: ChartLayout = serde_json::from_slice(&encoded).unwrap();
-        assert!(decoded.show_l1);
-    }
-
-    #[test]
-    fn chart_layout_analytics_defaults_off_and_round_trip() {
-        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
-        let mut value = serde_json::to_value(&layout).unwrap();
-        // Layouts written before the order-flow analytics existed must load.
         let object = value.as_object_mut().unwrap();
-        for field in [
-            "show_absorption",
-            "show_divergence",
-            "show_imbalance_stacks",
-            "show_cvd_regime",
-        ] {
-            object.remove(field);
-        }
-        let decoded: ChartLayout = serde_json::from_value(value).unwrap();
-        assert!(!decoded.show_absorption);
-        assert!(!decoded.show_divergence);
-        assert!(!decoded.show_imbalance_stacks);
-        assert!(!decoded.show_cvd_regime);
-        // The schema does not change for additive toggles.
-        assert_eq!(decoded.schema_version, 2);
-
-        layout.show_absorption = true;
-        layout.show_divergence = true;
-        layout.show_imbalance_stacks = true;
-        layout.show_cvd_regime = true;
-        let encoded = serde_json::to_vec(&layout).unwrap();
-        let decoded: ChartLayout = serde_json::from_slice(&encoded).unwrap();
-        assert!(decoded.show_absorption);
-        assert!(decoded.show_divergence);
-        assert!(decoded.show_imbalance_stacks);
-        assert!(decoded.show_cvd_regime);
-    }
-
-    #[test]
-    fn footprint_row_multiplier_defaults_and_round_trips() {
-        // Settings written before the control existed must load at 1x.
-        let legacy: FootprintSettings = serde_json::from_str(
-            r#"{"mode":"bid_ask","show_poc":true,"show_value_area":true,"show_imbalance":true,"show_summary":true,"imbalance_ratio":3.0,"min_row_height":12.0}"#,
-        )
-        .unwrap();
-        assert_eq!(legacy.row_multiplier, 1);
-
-        let settings = FootprintSettings {
-            row_multiplier: 4,
-            ..FootprintSettings::default()
-        };
-        let encoded = serde_json::to_string(&settings).unwrap();
-        let decoded: FootprintSettings = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, settings);
-        assert_eq!(decoded.row_multiplier, 4);
+        object.insert("show_delta".into(), serde_json::json!(true));
+        object.insert("show_profile".into(), serde_json::json!(true));
+        object.insert("show_footprint".into(), serde_json::json!(true));
+        object.insert("show_liquidity".into(), serde_json::json!(true));
+        object.insert("show_l1".into(), serde_json::json!(true));
+        object.insert("show_absorption".into(), serde_json::json!(true));
+        object.insert("show_divergence".into(), serde_json::json!(true));
+        object.insert("show_imbalance_stacks".into(), serde_json::json!(true));
+        object.insert("show_cvd_regime".into(), serde_json::json!(true));
+        object.insert(
+            "footprint".into(),
+            serde_json::json!({"mode": "delta", "row_multiplier": 4}),
+        );
+        let parsed: ChartLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.schema_version, 2);
+        assert_eq!(parsed.price_scale_mode, "linear");
     }
 
     #[test]
@@ -546,14 +396,11 @@ mod tests {
         object.remove("price_scale_mode");
         object.remove("manual_price_range");
         object.remove("percent_anchor");
-        // v1 layouts also predate the L1 toggle.
-        object.remove("show_l1");
         let parsed: ChartLayout = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.price_scale_mode, "linear");
         assert_eq!(parsed.manual_price_range, None);
         assert_eq!(parsed.percent_anchor, None);
-        assert!(!parsed.show_l1);
     }
 
     #[test]

@@ -1989,12 +1989,10 @@ impl PaneGridRenderer {
                                     if needs_recreate {
                                         let mut bridge_config = crate::data::bridge::BridgeConfig::default_dev(&exchange, &symbol);
                                         bridge_config.timeframe = timeframe.clone();
+                                        // The chart pane only renders candles and ticks; the
+                                        // order book is owned by the DOM pane.
                                         bridge_config.trades = false;
-                                        bridge_config.delta = true;
-                                        bridge_config.footprint = true;
-                                        bridge_config.profile = true;
-                                        bridge_config.orderbook = true;
-                                        bridge_config.orderbook_depth = 50;
+                                        bridge_config.orderbook = false;
                                         bridge_config.ticker = true;
                                         if timeframe == "1s" {
                                             bridge_config.fetch_history = false;
@@ -2009,66 +2007,12 @@ impl PaneGridRenderer {
                                             Ok(bridge) => {
                                                 let rx = bridge.subscribe_ohlcv();
                                                 let tick_rx = bridge.subscribe();
-                                                let derived_rx = bridge.subscribe_derived_flow();
-                                                let book_rx = bridge.subscribe_orderbook();
-                                                let orderflow =
-                                                    crate::data::orderflow_feed::DerivedFlowFeed::new(
-                                                        derived_rx,
-                                                    );
-                                                let liquidity = crate::data::liquidity_feed::LiquidityFeed::new(book_rx);
                                                 let feed = crate::data::candle_feed::CandleFeed::new(rx, Some(tick_rx), Some(timeframe.clone()));
                                                 if !crate::data::client::is_api_url_configured() {
                                                     feed.set_error("No API service URL configured. Configure in Settings to stream data.".to_string());
                                                 }
                                                 let title = format!("{} {}", exchange.to_uppercase(), symbol);
                                                 let tf = timeframe.clone();
-
-                                                let bc_liquidity = bridge_config_clone.clone();
-                                                let liquidity_history_feed = liquidity.clone();
-                                                let history_depth = bridge_config_clone.orderbook_depth.max(20);
-                                                let load_liquidity_history: std::sync::Arc<dyn Fn(i64, i64, std::sync::mpsc::Sender<crate::data::liquidity_feed::LiquidityHistoryOutcome>) + Send + Sync> = std::sync::Arc::new(move |since: i64, until: i64, done: std::sync::mpsc::Sender<crate::data::liquidity_feed::LiquidityHistoryOutcome>| {
-                                                    let bc = bc_liquidity.clone();
-                                                    let feed = liquidity_history_feed.clone();
-                                                    crate::data::client::tokio_runtime().spawn(async move {
-                                                        use crate::data::bridge::BookHistoryError;
-                                                        use crate::data::liquidity_feed::{LiquidityHistoryOutcome, LiquiditySample};
-                                                        let outcome = match crate::data::bridge::fetch_orderbook_history(&bc, since, until, history_depth, 1_000).await {
-                                                            Ok(history) => {
-                                                                // L1 is derived from the same L2 samples; no second metered ticker-history call.
-                                                                let samples: Vec<LiquiditySample> = history
-                                                                    .data
-                                                                    .iter()
-                                                                    .filter_map(LiquiditySample::from_history_sample)
-                                                                    .collect();
-                                                                feed.merge_history(&samples, history.partial);
-                                                                if history.queued {
-                                                                    LiquidityHistoryOutcome::Queued
-                                                                } else {
-                                                                    LiquidityHistoryOutcome::Loaded {
-                                                                        partial: history.partial,
-                                                                        samples: samples.len(),
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(BookHistoryError::Auth) => LiquidityHistoryOutcome::AuthRequired,
-                                                            Err(BookHistoryError::Credits(message)) => LiquidityHistoryOutcome::Credits(message),
-                                                            Err(BookHistoryError::NotAvailable) => LiquidityHistoryOutcome::NotAvailable,
-                                                            Err(BookHistoryError::Other(message)) => LiquidityHistoryOutcome::Error(message),
-                                                        };
-                                                        let _ = done.send(outcome);
-                                                    });
-                                                });
-
-                                                // Explicit raw-trade history for the Order flow menu. The closure spends
-                                                // credits only when the user picks "Load order-flow history".
-                                                let bc_trade_history = bridge_config_clone.clone();
-                                                let load_trade_history: crate::components::ui::chart_panel::TradeHistoryLoader = std::sync::Arc::new(move |since: i64, until: i64, timeframe_ms: i64, done: std::sync::mpsc::Sender<crate::data::trade_history::TradeHistoryOutcome>| {
-                                                    let bc = bc_trade_history.clone();
-                                                    crate::data::client::tokio_runtime().spawn(async move {
-                                                        let outcome = crate::data::trade_history::load_trade_history(&bc, since, until, timeframe_ms).await;
-                                                        let _ = done.send(outcome);
-                                                    });
-                                                });
 
                                                 let bc = bridge_config_clone.clone();
                                                 let feed_clone = feed.clone();
@@ -2109,10 +2053,6 @@ impl PaneGridRenderer {
 
                                                 let chart_panel = cx.new(|cx| {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
-                                                    panel.set_orderflow_feed(orderflow, cx);
-                                                    panel.set_liquidity_feed(liquidity, cx);
-                                                    panel.on_load_liquidity_history = Some(load_liquidity_history);
-                                                    panel.on_load_trade_history = Some(load_trade_history);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
                                                     panel.set_size(content_w, content_h);

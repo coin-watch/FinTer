@@ -179,7 +179,7 @@ mod tests {
         let root = root();
         let mut layout = ChartLayout::new("binance", "BTC/USDT", "1h");
         layout.schema_version = 1;
-        layout.show_l1 = true;
+        layout.price_scale_mode = "linear".into();
         let path = layout_path(&root, "binance", "BTC/USDT", "1h");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let encoded = serde_json::to_vec(&layout).unwrap();
@@ -187,8 +187,31 @@ mod tests {
 
         let loaded = load_layout(&root, "binance", "BTC/USDT", "1h");
         assert_eq!(loaded.schema_version, 1);
-        assert!(loaded.show_l1);
         assert_eq!(loaded.price_scale_mode, "linear");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_orderflow_fields_in_file_are_ignored() {
+        let root = root();
+        let layout = ChartLayout::new("binance", "BTC/USDT", "1h");
+        let mut value = serde_json::to_value(&layout).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("show_delta".into(), serde_json::json!(true));
+        object.insert("show_profile".into(), serde_json::json!(true));
+        object.insert("show_footprint".into(), serde_json::json!(true));
+        object.insert("show_liquidity".into(), serde_json::json!(true));
+        object.insert("show_l1".into(), serde_json::json!(true));
+        object.insert(
+            "footprint".into(),
+            serde_json::json!({"mode": "volume", "show_poc": true}),
+        );
+        let path = layout_path(&root, "binance", "BTC/USDT", "1h");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = load_layout(&root, "binance", "BTC/USDT", "1h");
+        assert_eq!(loaded, layout);
         fs::remove_dir_all(root).unwrap();
     }
 

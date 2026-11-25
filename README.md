@@ -40,7 +40,7 @@ Most market tools ask you to choose between a browser tab that eats your RAM and
 
 | **Charting** | **Market data** |
 | --- | --- |
-| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. Order-flow tools include a bid × ask footprint with POC/value area/imbalance, separate Delta and CVD sub-panes, a viewport-bound volume profile, L1 best bid/ask step lines, and a resting-liquidity heatmap with historical L2 backfill. | Live OHLCV over WebSocket with history and reconnect handling, order books, trade tape, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
+| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. | Live OHLCV over WebSocket with history and reconnect handling, a Depth of Market order book pane, a Time & Sales trade tape pane, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
 
 | **Workspace** | **Account & updates** |
 | --- | --- |
@@ -54,17 +54,9 @@ Studies route to the main chart or to their own resizable sub-pane.
 | --- | --- | --- | --- |
 | MA, EMA, SMA, BBI, SAR, TRIX | MACD, KDJ, RSI, WR, CCI, ROC, MTM, BIAS, PSY | BOLL, AVP | VOL, OBV, PVT |
 
-### Order flow
+### Order book & trade tape
 
-The footprint, Delta/CVD, volume profile, and liquidity overlays use the backend's authoritative derived events. They live under one **Order flow** toolbar menu: footprint (mode, **Row size 1×/2×/4×/8×**, POC, value area, imbalance + ratio, summary), volume profile, Delta + CVD, liquidity heatmap, L1 bid/ask, and an analytics section. Footprint rows are anchored to absolute prices, so panning and zooming never move a print between rows; the default row size keeps backend rows 1:1, and the active effective row size appears in the footprint summary and tooltip. The same toggles remain on the keyboard: `V` footprint, `D` Delta/CVD, `P` volume profile, `H` liquidity, `B` L1.
-
-The analytics section adds four pure, session-window signals on the legacy chart path. **Absorption** marks heavy aggressive bars whose price failed to progress, coloured by the absorbing side; **delta divergence** draws a dashed line between the two swing points with a `BULL`/`BEAR` label; **imbalance stacks** outline three or more consecutive footprint imbalances in the stack's price range; and **CVD regime** shows a `CVD RISING/FALLING/FLAT` badge in the Delta/CVD legend. Signals are computed once per order-flow feed version, never per frame, and only from bars that carry real trade rows.
-
-Liquidity history comes from CoinWatch's `GET /api/v1/orderbook/history` route (change-only 1s L2 samples) and merges strictly behind a live ring bucketed to 1 second (latest 10 Hz snapshot wins per bucket); L1 bid/ask lines are derived from the same L2 top levels. The endpoint clamps `until` to the 1h-lagged hour boundary, so panes entirely inside that lag show `History available up to HH:MM · live depth from now`, and history cells are capped at 5s so the seam to live never smears. Backfill pages cover up to 15 minutes, `queued` responses poll up to five times, and the chart distinguishes guest/401 (`Sign in for historical depth`) from credit exhaustion. The L1 overlay is toggled from the toolbar or `B` and breaks across gaps longer than 5s; layouts stay local and are never uploaded.
-
-Order flow is **live-session only** unless you explicitly load history from the **Order flow** menu. `Load order-flow history` replays raw trades from CoinWatch's `GET /api/v1/trades/history` for the visible candle range (or the last 30 minutes when the chart is empty) and aggregates them into the same exact-price bars the live feed uses. The request is metered and never runs automatically: it is a deliberate menu action, and `402`/guest states show as a credit or sign-in note instead of retrying.
-
-Loaded history is stitched **behind** the live derived-flow window. Only bars strictly older than the oldest live bar are inserted, so the seam bar belongs to the live path and is never counted twice; CVD and total delta are recomputed over the merged series. The backend retains 14 days of raw trades, so older windows are clamped and marked partial. A single load is capped at 12 pages × 20,000 rows (240,000 trades); hitting the cap, the retention edge, or a mid-load failure produces a `partial` note. Live-session bars remain authoritative for the current window, and the volume profile follows the viewport (VPVR); it falls back to the backend session profile only when the visible range has no order-flow rows.
+The **Depth of Market** pane renders the live order book, and the **Time & Sales** pane streams executed trades. Both are standalone panes backed by the gateway's `orderbook` and `trades` subscriptions, with reconnect and staleness handling; neither depends on the chart.
 
 ## Quick start
 
@@ -121,7 +113,7 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | `FINTER_CAP_WS_URL` | Market-cap WebSocket; defaults to `wss://<api-origin>/ws/market-caps`. |
 | `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel, and users can switch channels in Settings → Updates. |
 | `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
-| `FINTER_CHART_V2` | Set (any value) to render the experimental scene-based chart engine. Unset by default; the legacy renderer keeps drawings, alerts, footprint and L1/L2 overlays. |
+| `FINTER_CHART_V2` | Set (any value) to render the experimental scene-based chart engine. Unset by default; the legacy renderer keeps drawings, alerts, positions, orders, and indicators. |
 
 <details>
 <summary><strong>Authentication, storage &amp; data separation</strong></summary>
