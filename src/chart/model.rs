@@ -20,18 +20,13 @@ impl Default for WindowGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FootprintMode {
+    #[default]
     BidAsk,
     Delta,
     Volume,
-}
-
-impl Default for FootprintMode {
-    fn default() -> Self {
-        Self::BidAsk
-    }
 }
 
 fn default_true() -> bool {
@@ -44,6 +39,10 @@ fn default_imbalance_ratio() -> f64 {
 
 fn default_min_row_height() -> f32 {
     12.0
+}
+
+fn default_row_multiplier() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -62,6 +61,11 @@ pub struct FootprintSettings {
     pub imbalance_ratio: f64,
     #[serde(default = "default_min_row_height")]
     pub min_row_height: f32,
+    /// Merge this many backend/source price rows into one rendered footprint
+    /// row. `1` keeps the backend row size 1:1. Allowed values are 1/2/4/8;
+    /// other values are treated as the next power of two (clamped).
+    #[serde(default = "default_row_multiplier")]
+    pub row_multiplier: u32,
 }
 
 impl Default for FootprintSettings {
@@ -74,6 +78,7 @@ impl Default for FootprintSettings {
             show_summary: true,
             imbalance_ratio: default_imbalance_ratio(),
             min_row_height: default_min_row_height(),
+            row_multiplier: default_row_multiplier(),
         }
     }
 }
@@ -107,6 +112,9 @@ pub struct ChartLayout {
     /// Show resting-liquidity bands behind candles.
     #[serde(default)]
     pub show_liquidity: bool,
+    /// Show L1 best bid/ask step lines.
+    #[serde(default)]
+    pub show_l1: bool,
 }
 
 fn default_show_delta() -> bool {
@@ -136,6 +144,7 @@ impl ChartLayout {
             show_footprint: false,
             footprint: FootprintSettings::default(),
             show_liquidity: false,
+            show_l1: false,
         }
     }
 }
@@ -426,6 +435,40 @@ mod tests {
         });
         let b = serde_json::to_vec(&l).unwrap();
         assert_eq!(serde_json::from_slice::<ChartLayout>(&b).unwrap(), l);
+    }
+
+    #[test]
+    fn chart_layout_show_l1_defaults_off_and_round_trips() {
+        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
+        let mut value = serde_json::to_value(&layout).unwrap();
+        // Older layout files predate the L1 toggle.
+        value.as_object_mut().unwrap().remove("show_l1");
+        let decoded: ChartLayout = serde_json::from_value(value).unwrap();
+        assert!(!decoded.show_l1);
+
+        layout.show_l1 = true;
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        let decoded: ChartLayout = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.show_l1);
+    }
+
+    #[test]
+    fn footprint_row_multiplier_defaults_and_round_trips() {
+        // Settings written before the control existed must load at 1x.
+        let legacy: FootprintSettings = serde_json::from_str(
+            r#"{"mode":"bid_ask","show_poc":true,"show_value_area":true,"show_imbalance":true,"show_summary":true,"imbalance_ratio":3.0,"min_row_height":12.0}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.row_multiplier, 1);
+
+        let settings = FootprintSettings {
+            row_multiplier: 4,
+            ..FootprintSettings::default()
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let decoded: FootprintSettings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, settings);
+        assert_eq!(decoded.row_multiplier, 4);
     }
 
     #[test]

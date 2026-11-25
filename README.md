@@ -40,7 +40,7 @@ Most market tools ask you to choose between a browser tab that eats your RAM and
 
 | **Charting** | **Market data** |
 | --- | --- |
-| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. | Live OHLCV over WebSocket with history and reconnect handling, order books, trade tape, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
+| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. Order-flow tools include a bid × ask footprint with POC/value area/imbalance, separate Delta and CVD sub-panes, a viewport-bound volume profile, L1 best bid/ask step lines, and a resting-liquidity heatmap with historical L2 backfill. | Live OHLCV over WebSocket with history and reconnect handling, order books, trade tape, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
 
 | **Workspace** | **Account & updates** |
 | --- | --- |
@@ -53,6 +53,14 @@ Studies route to the main chart or to their own resizable sub-pane.
 | Trend | Momentum | Volatility | Volume |
 | --- | --- | --- | --- |
 | MA, EMA, SMA, BBI, SAR, TRIX | MACD, KDJ, RSI, WR, CCI, ROC, MTM, BIAS, PSY | BOLL, AVP | VOL, OBV, PVT |
+
+### Order flow
+
+The footprint, Delta/CVD, volume profile, and liquidity overlays use the backend's authoritative derived events. Footprint rows are anchored to absolute prices, so panning and zooming never move a print between rows. Use the footprint menu's **Row size 1×/2×/4×/8×** control to merge adjacent backend rows; the default keeps them 1:1, and the active effective row size appears in the footprint summary and tooltip.
+
+Liquidity history comes from CoinWatch's `GET /api/v1/orderbook/history` route (change-only 1s L2 samples) and merges strictly behind a live ring bucketed to 1 second (latest 10 Hz snapshot wins per bucket); L1 bid/ask lines are derived from the same L2 top levels. The endpoint clamps `until` to the 1h-lagged hour boundary, so panes entirely inside that lag show `History available up to HH:MM · live depth from now`, and history cells are capped at 5s so the seam to live never smears. Backfill pages cover up to 15 minutes, `queued` responses poll up to five times, and the chart distinguishes guest/401 (`Sign in for historical depth`) from credit exhaustion. The L1 overlay is toggled from the toolbar or `B` and breaks across gaps longer than 5s; layouts stay local and are never uploaded.
+
+Order flow is **live-session only**. When the viewport reaches candles older than the first order-flow bar, the chart says `Order flow: live session` and draws only the bars that have real rows rather than inventing history. The volume profile follows the viewport (VPVR); it falls back to the backend session profile only when the visible range has no order-flow rows.
 
 ## Quick start
 

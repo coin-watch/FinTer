@@ -4,6 +4,19 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Chart order flow
+
+The footprint, Delta/CVD, volume profile, and liquidity overlays were tightened without changing the backend wire contract:
+
+- Footprint rows now use the backend `row_size` (or the symbol tick / inferred source gaps) and are anchored to absolute prices, so panning and zooming cannot re-bucket prints. The footprint menu offers **Row size 1×/2×/4×/8×**; `1×` keeps backend rows 1:1, and merged rows split volume by price overlap.
+- Value area expands contiguously from the POC, and ask/bid imbalances compare the correct diagonal neighbour with a positive opposite side required.
+- Delta and CVD render in separate, independently scaled sub-panes with their own legends and a faint zero line. The volume profile follows the visible bars (VPVR); the backend session profile is used only when the visible range has no order-flow rows.
+- The liquidity heatmap uses the visible time window and no longer clamps off-screen cells to the plot edge.
+- Historical liquidity now backfills from CoinWatch's `GET /api/v1/orderbook/history` (change-only 1s L2 samples) behind a live ring bucketed to 1 second (the 10 Hz broadcast keeps the latest snapshot per bucket, so heatmap/L1 resolution matches history and the ring holds 15 minutes of each). The chart derives L1 best bid/ask from the same L2 top levels rather than spending a second ticker-history request. One pre-window (`carried`) sample seeds the left edge, and every heatmap cell is capped at 5s so the last historical sample cannot smear across the 1h lag seam. History pages fill up to 15 minutes behind the server's 1h-lagged cutoff; queued backfills retry five times, guest/401 shows `Sign in for historical depth`, and 402 surfaces the credit state. Layouts, settings, and credentials are never uploaded by this path.
+- The new **L1** toolbar toggle (`B`) draws 1px best-bid/best-ask step lines from the same book feed over the candles. The step line breaks when consecutive samples are more than 5s apart, so the 1h history/live seam is not bridged by a long diagonal.
+
+Order flow remains **live-session only**. Historical candles do not fabricate footprint rows; the chart shows an `Order flow: live session` note when the viewport extends before the first order-flow bar. Rendering changes are documented in `gpui-component-patched/FINTER-PATCHES.md`. No update/checksum behavior changed.
+
 ## Release workflow
 
 The included GitHub Actions workflow builds and tests platform binaries. On pushes to `alpha`, `beta`, or matching version tags (`v*`), it runs the `release` job to publish verified binaries to public Backblaze B2 using `scripts/publish_updates.py`.

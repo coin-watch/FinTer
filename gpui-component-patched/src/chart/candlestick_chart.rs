@@ -59,7 +59,8 @@ pub struct FootprintCellSpec {
     pub is_poc: bool,
     pub is_vah: bool,
     pub is_val: bool,
-    /// `1` = bid imbalance, `-1` = ask imbalance, `0` = none.
+    /// `1` = ask-side / aggressive-buy imbalance, `-1` = bid-side /
+    /// aggressive-sell imbalance, `0` = none. Ask wins when both match.
     pub imbalance: i8,
     pub is_live: bool,
     pub is_hovered: bool,
@@ -789,13 +790,16 @@ where
                 if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
                     continue;
                 }
-                let x0 = chart_w * ((cell.start_ms as f64 - heat_first) / heat_span) as f32;
-                let x1 = chart_w * ((cell.end_ms as f64 - heat_first) / heat_span) as f32;
-                if x1 < 0.0 || x0 > chart_w {
+                let x0_raw = chart_w * ((cell.start_ms as f64 - heat_first) / heat_span) as f32;
+                let x1_raw = chart_w * ((cell.end_ms as f64 - heat_first) / heat_span) as f32;
+                // Fully off-screen cells are skipped; only partially visible
+                // cells are clipped to the plot. Clamping every off-screen cell
+                // would smear a band along the plot edge while panning.
+                if x1_raw <= 0.0 || x0_raw >= chart_w || x1_raw <= x0_raw {
                     continue;
                 }
-                let x0 = x0.clamp(0.0, chart_w);
-                let x1 = x1.clamp(0.0, chart_w).max(x0 + 1.0);
+                let x0 = x0_raw.max(0.0);
+                let x1 = x1_raw.min(chart_w).max(x0 + 1.0);
                 let y_top = origin.y + px(y_scale.scale(cell.price_high));
                 let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
                 let bounds = Bounds::from_corners(
@@ -860,6 +864,18 @@ where
                 let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
                 let top = y_top.min(y_bottom);
                 let bottom = y_top.max(y_bottom);
+                let cell_h = (bottom - top).as_f32();
+                // Zoom may produce sub-pixel rows when many prices traded. Skip
+                // them unless they carry a marker the user needs to see.
+                if cell_h < 0.5
+                    && !(cell.is_poc
+                        || cell.is_vah
+                        || cell.is_val
+                        || cell.is_hovered
+                        || cell.is_selected)
+                {
+                    continue;
+                }
                 let x_left = origin.x + px(center_x - cell_w / 2.0);
                 let x_right = origin.x + px(center_x + cell_w / 2.0);
                 let bounds = Bounds::from_corners(
@@ -920,10 +936,12 @@ where
 
                 if cell.imbalance != 0 {
                     let stripe_w = px(2.0);
+                    // `imbalance > 0` is ask-side / aggressive buying, so the
+                    // stripe sits on the ask (right) side in bullish colour.
                     let stripe_x = if cell.imbalance > 0 {
-                        x_left
-                    } else {
                         x_right - stripe_w
+                    } else {
+                        x_left
                     };
                     let stripe = Bounds::from_corners(
                         gpui::point(stripe_x, top),
@@ -937,10 +955,11 @@ where
                     window.paint_quad(fill(stripe, color.opacity(0.9)));
                 }
 
-                let cell_h = (bottom - top).as_f32();
                 let font_size = cell.font_size.max(6.0);
                 let text_y = top + px((cell_h - font_size).max(0.0) * 0.5);
-                let char_w = font_size * 0.55;
+                // Conservative width estimate so two numeric columns never
+                // overflow their cell on the default UI font.
+                let char_w = font_size * 0.62;
                 let left_w = cell.left_text.len() as f32 * char_w;
                 let right_w = cell.right_text.len() as f32 * char_w;
                 let single_w = cell.single_text.len() as f32 * char_w;
@@ -949,7 +968,7 @@ where
                 let show_two = can_draw_text
                     && !cell.left_text.is_empty()
                     && !cell.right_text.is_empty()
-                    && left_w + right_w + gap <= cell_w;
+                    && left_w + right_w + gap + 4.0 <= cell_w;
 
                 if show_two {
                     paint_text_line_sized(
@@ -970,7 +989,7 @@ where
                     );
                 } else if can_draw_text
                     && !cell.single_text.is_empty()
-                    && single_w + gap <= cell_w
+                    && single_w + gap + 2.0 <= cell_w
                 {
                     paint_text_line_centered_sized(
                         cell.single_text.clone(),
@@ -1258,11 +1277,24 @@ where
             grouped_lines.entry(line.3).or_default().push(line);
         }
 
+        let zero_line_color: Hsla = cx.theme().border.opacity(0.35);
         let draw_lines = |window: &mut gpui::Window, pane_y0: f32, pane_h: f32, lines: &[&(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)], min_val: f64, max_val: f64| {
             let scale_y = |val: f64| {
                 if (max_val - min_val).abs() < f64::EPSILON { pane_y0 + pane_h / 2.0 }
                 else { pane_y0 + pane_h * (1.0 - (val - min_val) / (max_val - min_val)) as f32 }
             };
+
+            // Faint zero line for histogram panes and any pane whose domain
+            // straddles zero (for example a CVD pane that turns negative).
+            if min_val <= 0.0 && max_val >= 0.0 {
+                let zero_y = scale_y(0.0);
+                let mut zero = gpui::PathBuilder::stroke(gpui::px(1.0));
+                zero.move_to(gpui::point(origin.x, origin.y + px(zero_y)));
+                zero.line_to(gpui::point(origin.x + px(chart_w), origin.y + px(zero_y)));
+                if let Ok(path) = zero.build() {
+                    window.paint_path(path, zero_line_color);
+                }
+            }
 
             for (series, color, style, _) in lines {
                 if *style == IndicatorStyle::Line {

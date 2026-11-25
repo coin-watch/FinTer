@@ -85,6 +85,9 @@ pub struct OrderFlowSnapshot {
     pub profile_poc: Option<f64>,
     pub profile_vah: Option<f64>,
     pub profile_val: Option<f64>,
+    /// Backend session-profile window. `0, 0` means "whole session".
+    pub profile_window_start: i64,
+    pub profile_window_end: i64,
 }
 
 #[derive(Default)]
@@ -104,17 +107,17 @@ impl State {
             return;
         }
 
-        if let Some(id) = trade.trade_id.as_ref() {
-            if !id.is_empty() {
-                if !self.seen.insert(id.clone()) {
-                    return;
-                }
-                self.seen_order.push_back(id.clone());
-                if self.seen_order.len() > MAX_SEEN_TRADE_IDS {
-                    if let Some(oldest) = self.seen_order.pop_front() {
-                        self.seen.remove(&oldest);
-                    }
-                }
+        if let Some(id) = trade.trade_id.as_ref()
+            && !id.is_empty()
+        {
+            if !self.seen.insert(id.clone()) {
+                return;
+            }
+            self.seen_order.push_back(id.clone());
+            if self.seen_order.len() > MAX_SEEN_TRADE_IDS
+                && let Some(oldest) = self.seen_order.pop_front()
+            {
+                self.seen.remove(&oldest);
             }
         }
 
@@ -186,6 +189,8 @@ impl State {
             profile_poc: None,
             profile_vah: None,
             profile_val: None,
+            profile_window_start: 0,
+            profile_window_end: 0,
         }
     }
 }
@@ -372,6 +377,8 @@ struct DerivedState {
     profile_poc: Option<f64>,
     profile_vah: Option<f64>,
     profile_val: Option<f64>,
+    profile_window_start: i64,
+    profile_window_end: i64,
     partial: bool,
 }
 
@@ -383,10 +390,24 @@ impl DerivedState {
                     timestamp: delta.bar_start,
                     ..FlowBar::default()
                 });
-                bar.buy_volume = delta.buy_volume;
-                bar.sell_volume = delta.sell_volume;
+                // A footprint event is authoritative for the price ladder. A
+                // delta event can arrive later; overwriting the bar volumes from
+                // it would then disagree with `price_rows`. Keep the row-derived
+                // totals when rows exist and only refresh the live metadata.
+                if bar.price_rows.is_empty() {
+                    bar.buy_volume = delta.buy_volume;
+                    bar.sell_volume = delta.sell_volume;
+                    bar.total_volume = delta.buy_volume + delta.sell_volume;
+                } else {
+                    let buy: f64 = bar.price_rows.iter().map(|row| row.buy_volume).sum();
+                    let sell: f64 = bar.price_rows.iter().map(|row| row.sell_volume).sum();
+                    if buy + sell > 0.0 {
+                        bar.buy_volume = buy;
+                        bar.sell_volume = sell;
+                        bar.total_volume = buy + sell;
+                    }
+                }
                 bar.trades = delta.trades;
-                bar.total_volume = delta.buy_volume + delta.sell_volume;
                 bar.is_closed = delta.is_closed;
                 self.cvd.insert(delta.bar_start, delta.cvd);
             }
@@ -428,6 +449,8 @@ impl DerivedState {
                 self.profile_poc = profile.poc;
                 self.profile_vah = profile.vah;
                 self.profile_val = profile.val;
+                self.profile_window_start = profile.window_start;
+                self.profile_window_end = profile.window_end;
             }
         }
     }
@@ -453,6 +476,8 @@ impl DerivedState {
             profile_poc: self.profile_poc,
             profile_vah: self.profile_vah,
             profile_val: self.profile_val,
+            profile_window_start: self.profile_window_start,
+            profile_window_end: self.profile_window_end,
         }
     }
 }
@@ -521,6 +546,10 @@ impl DerivedFlowFeed {
         self.snapshot_with_version().1
     }
 
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
     pub fn version_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.version)
     }
@@ -565,10 +594,7 @@ mod tests {
         assert!((snapshot.bars[0].sell_volume - 1.0).abs() < f64::EPSILON);
         assert!((snapshot.bars[0].delta() - 1.0).abs() < f64::EPSILON);
         assert_eq!(snapshot.bars[0].price_rows.len(), 1);
-        let price_row = snapshot.bars[0]
-            .price_rows
-            .first()
-            .expect("price row");
+        let price_row = snapshot.bars[0].price_rows.first().expect("price row");
         assert!((price_row.price - 100.0).abs() < f64::EPSILON);
         assert!((price_row.buy_volume - 2.0).abs() < f64::EPSILON);
         assert!((price_row.sell_volume - 1.0).abs() < f64::EPSILON);
@@ -616,7 +642,7 @@ mod tests {
             vwap: 100.0,
             trades: 4,
             max_print: 200.0,
-            is_closed: false
+            is_closed: false,
         }));
         state.ingest(&DerivedFlowEvent::Footprint(DerivedFootprint {
             timeframe: "1m".into(),
@@ -629,7 +655,7 @@ mod tests {
                     buy: 2.0,
                     sell: 1.0,
                     buy_count: 2,
-                    sell_count: 1
+                    sell_count: 1,
                 },
                 DerivedFootprintRow {
                     price_low: 101.0,
@@ -637,8 +663,8 @@ mod tests {
                     buy: 1.0,
                     sell: 0.0,
                     buy_count: 1,
-                    sell_count: 0
-                }
+                    sell_count: 0,
+                },
             ],
             poc: Some(100.0),
             vah: Some(101.0),
@@ -646,7 +672,7 @@ mod tests {
             delta: 2.0,
             total_volume: 4.0,
             row_size: 1.0,
-            is_closed: false
+            is_closed: false,
         }));
 
         let snapshot = state.snapshot();
@@ -655,5 +681,103 @@ mod tests {
         assert!((snapshot.bars[0].buy_volume - 3.0).abs() < f64::EPSILON);
         assert!((snapshot.bars[0].sell_volume - 1.0).abs() < f64::EPSILON);
         assert!((snapshot.cvd[0].1 - 2.0).abs() < f64::EPSILON);
+    }
+
+    fn footprint_event(bar_start: i64) -> DerivedFlowEvent {
+        DerivedFlowEvent::Footprint(DerivedFootprint {
+            timeframe: "1m".into(),
+            bar_start,
+            bar_end: bar_start + 60_000,
+            rows: vec![
+                DerivedFootprintRow {
+                    price_low: 100.0,
+                    price_high: 100.5,
+                    buy: 2.0,
+                    sell: 1.0,
+                    buy_count: 2,
+                    sell_count: 1,
+                },
+                DerivedFootprintRow {
+                    price_low: 100.5,
+                    price_high: 101.0,
+                    buy: 1.0,
+                    sell: 0.5,
+                    buy_count: 1,
+                    sell_count: 1,
+                },
+            ],
+            poc: Some(100.25),
+            vah: Some(101.0),
+            val: Some(100.0),
+            delta: 1.5,
+            total_volume: 4.5,
+            row_size: 0.5,
+            is_closed: false,
+        })
+    }
+
+    fn delta_event(bar_start: i64) -> DerivedFlowEvent {
+        DerivedFlowEvent::Delta(DerivedDelta {
+            timeframe: "1m".into(),
+            bar_start,
+            bar_end: bar_start + 60_000,
+            buy_volume: 100.0,
+            sell_volume: 50.0,
+            delta: 50.0,
+            cvd: 50.0,
+            vwap: 100.0,
+            trades: 9,
+            max_print: 200.0,
+            is_closed: true,
+        })
+    }
+
+    #[test]
+    fn delta_after_footprint_keeps_rows_and_row_derived_totals() {
+        let mut state = DerivedState::default();
+        state.ingest(&footprint_event(60_000));
+        state.ingest(&delta_event(60_000));
+
+        let snapshot = state.snapshot();
+        let bar = &snapshot.bars[0];
+        assert_eq!(bar.price_rows.len(), 2);
+        assert!((bar.row_size - 0.5).abs() < f64::EPSILON);
+        // The delta event's 100/50 volumes must not overwrite the ladder.
+        assert!((bar.buy_volume - 3.0).abs() < f64::EPSILON);
+        assert!((bar.sell_volume - 1.5).abs() < f64::EPSILON);
+        assert!((bar.total_volume - 4.5).abs() < f64::EPSILON);
+        // Live metadata still comes from the delta event.
+        assert_eq!(bar.trades, 9);
+        assert!(bar.is_closed);
+        assert_eq!(bar.poc, Some(100.25));
+        assert!((snapshot.cvd[0].1 - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn delta_then_footprint_uses_footprint_totals() {
+        let mut state = DerivedState::default();
+        state.ingest(&delta_event(60_000));
+        state.ingest(&footprint_event(60_000));
+
+        let snapshot = state.snapshot();
+        let bar = &snapshot.bars[0];
+        assert_eq!(bar.price_rows.len(), 2);
+        assert!((bar.buy_volume - 3.0).abs() < f64::EPSILON);
+        assert!((bar.sell_volume - 1.5).abs() < f64::EPSILON);
+        // The footprint event is authoritative for the bar total.
+        assert!((bar.total_volume - 4.5).abs() < f64::EPSILON);
+        assert!(!bar.is_closed);
+    }
+
+    #[test]
+    fn delta_without_rows_uses_delta_volumes() {
+        let mut state = DerivedState::default();
+        state.ingest(&delta_event(60_000));
+        let snapshot = state.snapshot();
+        let bar = &snapshot.bars[0];
+        assert!(bar.price_rows.is_empty());
+        assert!((bar.buy_volume - 100.0).abs() < f64::EPSILON);
+        assert!((bar.sell_volume - 50.0).abs() < f64::EPSILON);
+        assert!((bar.total_volume - 150.0).abs() < f64::EPSILON);
     }
 }

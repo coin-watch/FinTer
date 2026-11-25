@@ -2022,7 +2022,43 @@ impl PaneGridRenderer {
                                                 }
                                                 let title = format!("{} {}", exchange.to_uppercase(), symbol);
                                                 let tf = timeframe.clone();
-                                                
+
+                                                let bc_liquidity = bridge_config_clone.clone();
+                                                let liquidity_history_feed = liquidity.clone();
+                                                let history_depth = bridge_config_clone.orderbook_depth.max(20);
+                                                let load_liquidity_history: std::sync::Arc<dyn Fn(i64, i64, std::sync::mpsc::Sender<crate::data::liquidity_feed::LiquidityHistoryOutcome>) + Send + Sync> = std::sync::Arc::new(move |since: i64, until: i64, done: std::sync::mpsc::Sender<crate::data::liquidity_feed::LiquidityHistoryOutcome>| {
+                                                    let bc = bc_liquidity.clone();
+                                                    let feed = liquidity_history_feed.clone();
+                                                    crate::data::client::tokio_runtime().spawn(async move {
+                                                        use crate::data::bridge::BookHistoryError;
+                                                        use crate::data::liquidity_feed::{LiquidityHistoryOutcome, LiquiditySample};
+                                                        let outcome = match crate::data::bridge::fetch_orderbook_history(&bc, since, until, history_depth, 1_000).await {
+                                                            Ok(history) => {
+                                                                // L1 is derived from the same L2 samples; no second metered ticker-history call.
+                                                                let samples: Vec<LiquiditySample> = history
+                                                                    .data
+                                                                    .iter()
+                                                                    .filter_map(LiquiditySample::from_history_sample)
+                                                                    .collect();
+                                                                feed.merge_history(&samples, history.partial);
+                                                                if history.queued {
+                                                                    LiquidityHistoryOutcome::Queued
+                                                                } else {
+                                                                    LiquidityHistoryOutcome::Loaded {
+                                                                        partial: history.partial,
+                                                                        samples: samples.len(),
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(BookHistoryError::Auth) => LiquidityHistoryOutcome::AuthRequired,
+                                                            Err(BookHistoryError::Credits(message)) => LiquidityHistoryOutcome::Credits(message),
+                                                            Err(BookHistoryError::NotAvailable) => LiquidityHistoryOutcome::NotAvailable,
+                                                            Err(BookHistoryError::Other(message)) => LiquidityHistoryOutcome::Error(message),
+                                                        };
+                                                        let _ = done.send(outcome);
+                                                    });
+                                                });
+
                                                 let bc = bridge_config_clone.clone();
                                                 let feed_clone = feed.clone();
                                                 let load_more: std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync> = std::sync::Arc::new(move |until: i64, done: std::sync::mpsc::Sender<()>| {
@@ -2064,6 +2100,7 @@ impl PaneGridRenderer {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
                                                     panel.set_orderflow_feed(orderflow, cx);
                                                     panel.set_liquidity_feed(liquidity, cx);
+                                                    panel.on_load_liquidity_history = Some(load_liquidity_history);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
                                                     panel.set_size(content_w, content_h);

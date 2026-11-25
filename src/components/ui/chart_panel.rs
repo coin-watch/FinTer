@@ -32,45 +32,51 @@
 /// mutations (mouse events) mark the view dirty via `cx.notify()`, which
 /// triggers the next frame immediately.
 use gpui::{
-    App, Context, Corner, ElementId, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, AnyElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, KeyDownEvent, ParentElement, Pixels, Point,
-    Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
-    PathBuilder, prelude::FluentBuilder,
+    AnyElement, App, Context, Corner, ElementId, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::PixelsExt;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::Selectable;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::chart::{
     AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
     FootprintCellSpec, HeatmapCellSpec, IndicatorStyle, OrderOverlaySpec, PaneTarget,
     PositionOverlaySpec, ProfileBarSpec, ProfileLineSpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
+use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::v_flex;
 
+use crate::chart::drawings::{
+    DrawingInstance, DrawingInteractionState, DrawingPoint, DrawingTool, hit_test_drawings,
+};
+use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid, effective_row_size};
+use crate::chart::indicators::{IndicatorCache, validate_params};
+use crate::chart::layout::ChartMetrics;
 use crate::chart::model::{
     ChartLayout, FootprintMode, FootprintSettings, IndicatorCategory, IndicatorInstance,
     IndicatorKind, WindowGeometry,
 };
-use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid};
-use crate::chart::indicators::{validate_params, IndicatorCache};
-use crate::chart::layout::ChartMetrics;
-use crate::chart::drawings::{
-    DrawingInstance, DrawingPoint, DrawingTool, DrawingInteractionState, hit_test_drawings,
+use crate::chart::orderflow::{
+    build_visible_profile, profile_window_overlaps, visible_bar_range, visible_sample_range,
 };
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
-use crate::data::liquidity_feed::{LiquidityFeed, LiquiditySnapshot};
+use crate::data::liquidity_feed::{
+    LiquidityFeed, LiquidityHistoryOutcome, LiquiditySample, LiquiditySnapshot,
+};
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
-use crate::data::orderflow_feed::{DerivedFlowFeed, OrderFlowSnapshot};
+use crate::data::orderflow_feed::{DerivedFlowFeed, FlowBar, OrderFlowSnapshot};
 use crate::data::price_format::format_price;
 use crate::klinechart;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -120,6 +126,12 @@ struct FootprintFocus {
     price: f64,
 }
 
+/// Callback that fetches one `(since, until)` book window and reports the
+/// outcome so the chart can surface queued/auth/credit states.
+pub type LiquidityHistoryLoader = std::sync::Arc<
+    dyn Fn(i64, i64, std::sync::mpsc::Sender<LiquidityHistoryOutcome>) + Send + Sync,
+>;
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -135,7 +147,12 @@ pub struct ChartPanel {
     focus_handle: FocusHandle,
     /// Interactive viewport + crosshair state.
     chart_state: ChartState,
-    pub on_load_more: Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
+    pub on_load_more:
+        Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
+    /// Fetch one historical book window `(since, until)` for the liquidity
+    /// heatmap / L1 lines. The closure merges samples into the feed and reports
+    /// the outcome so the panel can show queued/auth/credit states.
+    pub on_load_liquidity_history: Option<LiquidityHistoryLoader>,
     /// Called shortly after a new live candle appears so the feed can re-fetch
     /// the just-closed bar from the exchange (final OHLCV + volume).
     pub on_refresh_latest: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -165,12 +182,31 @@ pub struct ChartPanel {
     pinned_footprint: Option<FootprintFocus>,
     /// Press origin used to distinguish a click from a pan.
     footprint_press: Option<(FootprintFocus, f32, f32)>,
-    /// Latest order-flow snapshot, cached for hover hit-testing.
+    /// Latest order-flow snapshot, cached for hover hit-testing and overlays.
     orderflow_cache: Option<OrderFlowSnapshot>,
+    /// Feed version that produced `orderflow_cache`.
+    orderflow_cache_version: u64,
     /// Optional book-history feed for the liquidity heatmap.
     liquidity_feed: Option<LiquidityFeed>,
+    /// Latest liquidity snapshot, cached by feed version. `Arc` keeps the L1
+    /// overlay closure from cloning thousands of samples per frame.
+    liquidity_cache: Option<std::sync::Arc<LiquiditySnapshot>>,
+    liquidity_cache_version: u64,
+    /// Effective footprint row size from the last computed grid (price units).
+    footprint_step: Cell<f64>,
     /// Show resting-liquidity bands behind candles.
     show_liquidity: bool,
+    /// Show L1 best bid/ask step lines.
+    show_l1: bool,
+    /// In-flight historical book request.
+    liquidity_history_completion: Option<std::sync::mpsc::Receiver<LiquidityHistoryOutcome>>,
+    liquidity_history_loading: bool,
+    liquidity_history_next_at: Option<Instant>,
+    liquidity_history_queued_attempts: u8,
+    liquidity_history_pages: u8,
+    liquidity_history_note: Option<SharedString>,
+    /// Stop automatic requests after auth/credit/terminal errors.
+    liquidity_history_blocked: bool,
 
     // Parameterized Indicators
     pub indicators: Vec<IndicatorInstance>,
@@ -268,6 +304,125 @@ fn compact_delta(value: f64) -> String {
     }
 }
 
+/// Longest time a single book sample may paint. The live feed is 10 Hz and
+/// history is 1s, so 5s keeps the seam between the last historical sample and
+/// the first live sample from smearing across the 1h lag gap.
+const LIQUIDITY_CELL_MAX_MS: i64 = 5_000;
+
+/// Break the L1 step line when the next sample is more than 5s later. This
+/// keeps the line from drawing across the 1h history/live gap.
+const L1_STEP_GAP_MS: i64 = 5_000;
+
+fn l1_step_break(prev_ts: Option<i64>, ts: i64) -> bool {
+    prev_ts.is_some_and(|prev| ts.saturating_sub(prev) > L1_STEP_GAP_MS)
+}
+
+/// Historical liquidity window, including one pre-window sample for the left
+/// edge. `visible_sample_range` itself keeps its strict tested semantics;
+/// callers that draw a filled band widen the slice by one sample.
+fn liquidity_window_range(
+    samples: &[LiquiditySample],
+    first_ts: i64,
+    end_ts: i64,
+) -> std::ops::Range<usize> {
+    let visible = visible_sample_range(samples, first_ts, end_ts);
+    if visible.start >= samples.len() {
+        return visible.start..visible.start;
+    }
+    let start = visible.start.saturating_sub(1);
+    let end = visible.end.max(start + 1).min(samples.len());
+    start..end
+}
+
+/// Cell bounds for one liquidity sample, capped so a history sample never
+/// paints across the gap to the live ring.
+fn liquidity_cell_bounds(
+    sample_ts: i64,
+    next_ts: Option<i64>,
+    window_start: i64,
+    window_end: i64,
+) -> (i64, i64) {
+    let start = sample_ts.max(window_start);
+    let end = next_ts
+        .unwrap_or(window_end)
+        .min(window_end)
+        .min(start.saturating_add(LIQUIDITY_CELL_MAX_MS))
+        .max(start.saturating_add(1))
+        .min(window_end);
+    (start, end)
+}
+
+/// Lowest/lowest-high price span of the traded ladder in `bars`.
+fn flow_price_span(bars: &[FlowBar]) -> Option<(f64, f64)> {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for bar in bars {
+        for row in &bar.price_rows {
+            let low = if row.price_low.is_finite() {
+                row.price_low
+            } else {
+                row.price
+            };
+            let high = if row.price_high.is_finite() {
+                row.price_high
+            } else {
+                row.price
+            };
+            if low.is_finite() {
+                min = min.min(low);
+            }
+            if high.is_finite() {
+                max = max.max(high);
+            }
+        }
+    }
+    (min.is_finite() && max.is_finite() && max >= min).then_some((min, max))
+}
+
+/// Maps a pure visible-range profile to renderer specs.
+fn profile_specs(
+    profile: &crate::chart::orderflow::VolumeProfile,
+    color: gpui::Hsla,
+    width_fraction: f32,
+) -> (Vec<ProfileBarSpec>, Vec<ProfileLineSpec>) {
+    let max_volume = profile.rows.iter().map(|row| row.total).fold(0.0, f64::max);
+    if max_volume <= 0.0 {
+        return (Vec::new(), Vec::new());
+    }
+    let bars = profile
+        .rows
+        .iter()
+        .filter(|row| row.total > 0.0)
+        .map(|row| ProfileBarSpec {
+            price_low: row.price_low,
+            price_high: row.price_high,
+            width_fraction: (row.total / max_volume).clamp(0.0, 1.0) as f32 * width_fraction,
+            color: if row.delta() >= 0.0 {
+                color.opacity(0.36)
+            } else {
+                color.opacity(0.22)
+            },
+        })
+        .collect();
+    let mut lines = Vec::new();
+    if let Some(price) = profile.poc {
+        lines.push(ProfileLineSpec {
+            price,
+            color: color.opacity(0.75),
+        });
+    }
+    for price in [profile.value_area_high, profile.value_area_low]
+        .into_iter()
+        .flatten()
+    {
+        lines.push(ProfileLineSpec {
+            price,
+            color: color.opacity(0.38),
+        });
+    }
+    (bars, lines)
+}
+
 impl ChartPanel {
     pub fn agent_snapshot(&self) -> serde_json::Value {
         let candles = self.feed.snapshot();
@@ -342,7 +497,11 @@ impl ChartPanel {
 
         let title_str = title.into();
         let tf_str = timeframe.into();
-        let parsed_symbol = title_str.split_whitespace().next().unwrap_or(&title_str).to_string();
+        let parsed_symbol = title_str
+            .split_whitespace()
+            .next()
+            .unwrap_or(&title_str)
+            .to_string();
 
         let mut panel = Self {
             feed,
@@ -362,6 +521,7 @@ impl ChartPanel {
             pane_height: 500.0,
             on_load_more: None,
             on_refresh_latest: None,
+            on_load_liquidity_history: None,
             last_completed_candle_ts: 0,
             history_completion: None,
             history_retry_at: None,
@@ -378,8 +538,20 @@ impl ChartPanel {
             pinned_footprint: None,
             footprint_press: None,
             orderflow_cache: None,
+            orderflow_cache_version: u64::MAX,
             liquidity_feed: None,
+            liquidity_cache: None,
+            liquidity_cache_version: u64::MAX,
+            footprint_step: Cell::new(0.0),
             show_liquidity: false,
+            show_l1: false,
+            liquidity_history_completion: None,
+            liquidity_history_loading: false,
+            liquidity_history_next_at: None,
+            liquidity_history_queued_attempts: 0,
+            liquidity_history_pages: 0,
+            liquidity_history_note: None,
+            liquidity_history_blocked: false,
 
             // Parameterized indicators & cache
             indicators: Vec::new(),
@@ -449,7 +621,7 @@ impl ChartPanel {
                         let current = version.load(std::sync::atomic::Ordering::Relaxed);
                         if current != last {
                             last = current;
-                            if panel.show_delta || panel.show_footprint {
+                            if panel.show_delta || panel.show_profile || panel.show_footprint {
                                 cx.notify();
                             }
                         }
@@ -466,7 +638,8 @@ impl ChartPanel {
         .detach();
     }
 
-    /// Attach the order-book history feed for the liquidity heatmap.
+    /// Attach the order-book history feed for the liquidity heatmap and L1
+    /// step lines.
     pub fn set_liquidity_feed(&mut self, feed: LiquidityFeed, cx: &mut Context<Self>) {
         let version = feed.version_handle();
         self.liquidity_feed = Some(feed);
@@ -478,7 +651,7 @@ impl ChartPanel {
                         let current = version.load(std::sync::atomic::Ordering::Relaxed);
                         if current != last {
                             last = current;
-                            if panel.show_liquidity {
+                            if panel.show_liquidity || panel.show_l1 {
                                 cx.notify();
                             }
                         }
@@ -515,16 +688,238 @@ impl ChartPanel {
     }
 
     fn chart_metrics(&self) -> ChartMetrics {
-        let (plot_width, plot_height) = self
-            .chart_state
-            .candle_plot_size
-            .get()
-            .unwrap_or_else(|| ((self.pane_width - 64.0).max(80.0), (self.pane_height - 34.0).max(80.0)));
+        let (plot_width, plot_height) =
+            self.chart_state.candle_plot_size.get().unwrap_or_else(|| {
+                (
+                    (self.pane_width - 64.0).max(80.0),
+                    (self.pane_height - 34.0).max(80.0),
+                )
+            });
         ChartMetrics::new(self.pane_width, self.pane_height, plot_width, plot_height)
+    }
+
+    /// Refresh the order-flow snapshot only when the feed version changes.
+    /// `render()` holds a reference to the cached copy instead of cloning the
+    /// whole bar/row ladder every frame.
+    fn refresh_orderflow_cache(&mut self) {
+        let needed = self.show_delta || self.show_profile || self.show_footprint;
+        let Some(feed) = self.orderflow_feed.as_ref() else {
+            self.orderflow_cache = None;
+            self.orderflow_cache_version = u64::MAX;
+            return;
+        };
+        if !needed {
+            self.orderflow_cache = None;
+            self.orderflow_cache_version = u64::MAX;
+            return;
+        }
+        let current = feed.version();
+        if self.orderflow_cache.is_none() || current != self.orderflow_cache_version {
+            let (version, snapshot) = feed.snapshot_with_version();
+            self.orderflow_cache = Some(snapshot);
+            self.orderflow_cache_version = version;
+        }
+    }
+
+    /// Refresh the book-history snapshot only on version changes, and only when
+    /// the heatmap or L1 lines are visible.
+    fn refresh_liquidity_cache(&mut self) {
+        let Some(feed) = self.liquidity_feed.as_ref() else {
+            self.liquidity_cache = None;
+            self.liquidity_cache_version = u64::MAX;
+            return;
+        };
+        if !(self.show_liquidity || self.show_l1) {
+            self.liquidity_cache = None;
+            self.liquidity_cache_version = u64::MAX;
+            return;
+        }
+        let current = feed.version();
+        if self.liquidity_cache.is_none() || current != self.liquidity_cache_version {
+            let (version, snapshot) = feed.snapshot_with_version();
+            self.liquidity_cache = Some(std::sync::Arc::new(snapshot));
+            self.liquidity_cache_version = version;
+        }
     }
 
     fn settings_panel_width(&self) -> f32 {
         260.0_f32.min((self.pane_width - 24.0).max(180.0))
+    }
+
+    /// 1h-lagged server cutoff: `floor((now - 1h)/hour)*hour`.
+    fn liquidity_history_cutoff(now_ms: i64) -> i64 {
+        const HOUR_MS: i64 = 60 * 60 * 1000;
+        (now_ms - HOUR_MS).max(0) / HOUR_MS * HOUR_MS
+    }
+
+    fn schedule_liquidity_wake(cx: &mut Context<Self>, delay_ms: u64) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(delay_ms))
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// Drain the in-flight historical book request and update the status note.
+    fn poll_liquidity_history(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.liquidity_history_completion.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                self.liquidity_history_completion = None;
+                self.liquidity_history_loading = false;
+                match outcome {
+                    LiquidityHistoryOutcome::Loaded { partial, samples } => {
+                        self.liquidity_history_pages =
+                            self.liquidity_history_pages.saturating_add(1);
+                        self.liquidity_history_queued_attempts = 0;
+                        if samples == 0 {
+                            // Avoid re-requesting the same empty window: the
+                            // market may simply have no book history there.
+                            self.liquidity_history_note =
+                                Some("liquidity: no older history".into());
+                            self.liquidity_history_blocked = true;
+                        } else {
+                            self.liquidity_history_next_at =
+                                Some(Instant::now() + Duration::from_millis(250));
+                            self.liquidity_history_note = if partial {
+                                Some("liquidity: partial".into())
+                            } else {
+                                None
+                            };
+                        }
+                    }
+                    LiquidityHistoryOutcome::Queued => {
+                        self.liquidity_history_queued_attempts =
+                            self.liquidity_history_queued_attempts.saturating_add(1);
+                        if self.liquidity_history_queued_attempts < 5 {
+                            self.liquidity_history_next_at =
+                                Some(Instant::now() + Duration::from_secs(3));
+                            self.liquidity_history_note = Some("liquidity: loading".into());
+                            Self::schedule_liquidity_wake(cx, 3_200);
+                        } else {
+                            self.liquidity_history_note =
+                                Some("liquidity: partial — backfill still running".into());
+                        }
+                    }
+                    LiquidityHistoryOutcome::NotAvailable => {
+                        self.liquidity_history_note = Some(
+                            "History available up to the 1h lag boundary · live depth from now"
+                                .into(),
+                        );
+                        self.liquidity_history_next_at =
+                            Some(Instant::now() + Duration::from_secs(60));
+                    }
+                    LiquidityHistoryOutcome::AuthRequired => {
+                        self.liquidity_history_note = Some("Sign in for historical depth".into());
+                        self.liquidity_history_blocked = true;
+                    }
+                    LiquidityHistoryOutcome::Credits(message) => {
+                        self.liquidity_history_note =
+                            Some(format!("Historical depth needs credits: {message}").into());
+                        self.liquidity_history_blocked = true;
+                    }
+                    LiquidityHistoryOutcome::Error(message) => {
+                        self.liquidity_history_note =
+                            Some(format!("liquidity: history unavailable ({message})").into());
+                        self.liquidity_history_blocked = true;
+                    }
+                }
+                cx.notify();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.liquidity_history_completion = None;
+                self.liquidity_history_loading = false;
+            }
+        }
+    }
+
+    /// Request older L2 history while the viewport is near the left edge.
+    ///
+    /// Mirrors the candle history gate: only one request in flight, bounded
+    /// pages, and no automatic loop after auth/credit failures.
+    fn maybe_request_liquidity_history(&mut self, oldest_visible_ts: i64, cx: &mut Context<Self>) {
+        if !(self.show_liquidity || self.show_l1) {
+            return;
+        }
+        if self.liquidity_feed.is_none()
+            || self.liquidity_history_blocked
+            || self.liquidity_history_loading
+            || self.liquidity_history_pages >= 20
+            || self.chart_state.viewport_offset > 15.0
+            || oldest_visible_ts <= 0
+        {
+            return;
+        }
+        if self
+            .liquidity_history_next_at
+            .is_some_and(|at| Instant::now() < at)
+        {
+            return;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let cutoff = Self::liquidity_history_cutoff(now_ms);
+        if cutoff <= 0 {
+            return;
+        }
+        if oldest_visible_ts > 0 && oldest_visible_ts >= cutoff {
+            self.liquidity_history_note = Some(
+                format!(
+                    "History available up to {} · live depth from now",
+                    Self::format_timestamp(cutoff, &self.timezone, "%H:%M")
+                )
+                .into(),
+            );
+            return;
+        }
+
+        let Some(load) = self.on_load_liquidity_history.clone() else {
+            return;
+        };
+        let Some(feed) = self.liquidity_feed.as_ref() else {
+            return;
+        };
+        let oldest = self
+            .liquidity_cache
+            .as_deref()
+            .and_then(|snapshot| snapshot.samples.first())
+            .map(|sample| sample.timestamp_ms)
+            .or_else(|| feed.oldest_ts());
+        let until = oldest.map(|ts| ts.min(cutoff)).unwrap_or(cutoff);
+        let loaded_ms = oldest
+            .filter(|ts| *ts < cutoff)
+            .map(|ts| (cutoff - ts).max(0))
+            .unwrap_or(0);
+        // First page is one minute; later pages fill the remainder of the
+        // 15-minute history budget.
+        let span = if loaded_ms > 0 {
+            (15 * 60 * 1000 - loaded_ms).max(0)
+        } else {
+            60_000
+        };
+        let since = until - span;
+        if span <= 0 || since >= until {
+            if loaded_ms > 0 {
+                self.liquidity_history_note = Some("liquidity: 15m history loaded".into());
+            }
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.liquidity_history_loading = true;
+        self.liquidity_history_completion = Some(rx);
+        load(since, until, tx);
+        // Wake even when the response merges no new samples (queued/empty) so
+        // the outcome is drained without waiting for a live book update.
+        Self::schedule_liquidity_wake(cx, 400);
     }
 
     fn set_footprint_mode(&mut self, mode: FootprintMode, cx: &mut Context<Self>) {
@@ -663,6 +1058,7 @@ impl ChartPanel {
         self.show_footprint = layout.show_footprint;
         self.footprint_settings = layout.footprint;
         self.show_liquidity = layout.show_liquidity;
+        self.show_l1 = layout.show_l1;
         if self.show_footprint {
             self.ensure_footprint_density();
         }
@@ -692,6 +1088,7 @@ impl ChartPanel {
         layout.show_footprint = self.show_footprint;
         layout.footprint = self.footprint_settings.clone();
         layout.show_liquidity = self.show_liquidity;
+        layout.show_l1 = self.show_l1;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
@@ -709,7 +1106,11 @@ impl ChartPanel {
     // -----------------------------------------------------------------------
 
     pub fn add_indicator_instance(&mut self, kind: IndicatorKind) -> String {
-        let id = format!("{}-{}", kind.label().to_lowercase(), self.indicators.len() + 1);
+        let id = format!(
+            "{}-{}",
+            kind.label().to_lowercase(),
+            self.indicators.len() + 1
+        );
         let instance = IndicatorInstance::new(&id, kind);
         self.indicators.push(instance);
         self.mark_dirty();
@@ -819,7 +1220,11 @@ impl ChartPanel {
         } else {
             (((rgb.r - rgb.g) / delta) + 4.0) / 6.0
         };
-        let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+        let saturation = if max <= f32::EPSILON {
+            0.0
+        } else {
+            delta / max
+        };
         (hue, saturation, max)
     }
 
@@ -905,7 +1310,10 @@ impl ChartPanel {
         orderflow: Option<&OrderFlowSnapshot>,
     ) -> (Vec<IndicatorLineSpec>, usize) {
         let mut lines = Vec::new();
-        let has_vol = self.indicators.iter().any(|i| i.kind == IndicatorKind::Vol && i.visible);
+        let has_vol = self
+            .indicators
+            .iter()
+            .any(|i| i.kind == IndicatorKind::Vol && i.visible);
         let mut subpane_idx = if has_vol { 1 } else { 0 };
 
         for (ind_idx, ind) in self.indicators.iter().enumerate() {
@@ -933,8 +1341,9 @@ impl ChartPanel {
 
             for spec in computed.iter() {
                 let color = if ind.style.color != "#C4E855" && !ind.style.color.is_empty() {
-                    Self::parse_hex_color(&ind.style.color)
-                        .unwrap_or_else(|| Self::indicator_color(ind.kind.clone(), spec.color_offset + ind_idx))
+                    Self::parse_hex_color(&ind.style.color).unwrap_or_else(|| {
+                        Self::indicator_color(ind.kind.clone(), spec.color_offset + ind_idx)
+                    })
                 } else {
                     Self::indicator_color(ind.kind.clone(), spec.color_offset + ind_idx)
                 };
@@ -963,44 +1372,51 @@ impl ChartPanel {
             }
         }
 
-        if self.show_delta {
-            if let Some(orderflow) = orderflow {
-                if !orderflow.bars.is_empty() {
-                    let candle_ts: HashSet<i64> =
-                        candles.iter().map(|candle| candle.timestamp).collect();
-                    let delta_series: Vec<(i64, f64)> = orderflow
-                        .bars
-                        .iter()
-                        .filter(|bar| candle_ts.contains(&bar.timestamp))
-                        .map(|bar| (bar.timestamp, bar.delta()))
-                        .collect();
-                    let cvd_series: Vec<(i64, f64)> = orderflow
-                        .cvd
-                        .iter()
-                        .copied()
-                        .filter(|(timestamp, _)| candle_ts.contains(timestamp))
-                        .collect();
-                    if !delta_series.is_empty() {
-                        let delta_pane = PaneTarget::Subpane(subpane_idx);
+        if self.show_delta
+            && let Some(orderflow) = orderflow
+        {
+            let range = self.chart_state.visible_range(candles.len());
+            let visible = &candles[range];
+            if let (Some(first), Some(last)) = (visible.first(), visible.last()) {
+                let bar_range = visible_bar_range(&orderflow.bars, first.timestamp, last.timestamp);
+                let delta_series: Vec<(i64, f64)> = orderflow.bars[bar_range]
+                    .iter()
+                    .map(|bar| (bar.timestamp, bar.delta()))
+                    .collect();
+                let cvd_start = orderflow
+                    .cvd
+                    .partition_point(|(timestamp, _)| *timestamp < first.timestamp);
+                let cvd_end = orderflow
+                    .cvd
+                    .partition_point(|(timestamp, _)| *timestamp <= last.timestamp);
+                let cvd_series: Vec<(i64, f64)> = orderflow.cvd[cvd_start..cvd_end].to_vec();
+                if !delta_series.is_empty() {
+                    // Delta and CVD get independent panes and auto-scales;
+                    // a large cumulative CVD must not flatten per-bar delta.
+                    let delta_pane = PaneTarget::Subpane(subpane_idx);
+                    subpane_idx += 1;
+                    let delta_color = gpui::rgba(0x00F0FFFF).into();
+                    let cvd_color = gpui::rgba(0xFFD166FF).into();
+                    lines.push(IndicatorLineSpec {
+                        instance_id: "orderflow-delta".into(),
+                        kind: IndicatorKind::Other("Delta".into()),
+                        name: "Delta".into(),
+                        series: delta_series,
+                        color: delta_color,
+                        style: IndicatorStyle::Histogram,
+                        pane: delta_pane,
+                    });
+                    if !cvd_series.is_empty() {
+                        let cvd_pane = PaneTarget::Subpane(subpane_idx);
                         subpane_idx += 1;
-                        let delta_color = gpui::rgba(0x00F0FFFF).into();
-                        lines.push(IndicatorLineSpec {
-                            instance_id: "orderflow-delta".into(),
-                            kind: IndicatorKind::Other("Delta".into()),
-                            name: "Delta".into(),
-                            series: delta_series,
-                            color: delta_color,
-                            style: IndicatorStyle::Histogram,
-                            pane: delta_pane,
-                        });
                         lines.push(IndicatorLineSpec {
                             instance_id: "orderflow-cvd".into(),
                             kind: IndicatorKind::Other("CVD".into()),
                             name: "CVD".into(),
                             series: cvd_series,
-                            color: delta_color,
+                            color: cvd_color,
                             style: IndicatorStyle::Line,
-                            pane: delta_pane,
+                            pane: cvd_pane,
                         });
                     }
                 }
@@ -1021,6 +1437,9 @@ impl ChartPanel {
         if !self.show_footprint {
             return Vec::new();
         }
+        // Reset first so a viewport without footprint data cannot leave a stale
+        // row-size hint in the summary/tooltip.
+        self.footprint_step.set(0.0);
         let Some(orderflow) = orderflow else {
             return Vec::new();
         };
@@ -1031,6 +1450,18 @@ impl ChartPanel {
         let range = self.chart_state.visible_range(candles.len());
         let visible = &candles[range];
         if visible.is_empty() {
+            return Vec::new();
+        }
+        let (Some(first_visible), Some(last_visible)) = (visible.first(), visible.last()) else {
+            return Vec::new();
+        };
+        let flow_range = visible_bar_range(
+            &orderflow.bars,
+            first_visible.timestamp,
+            last_visible.timestamp,
+        );
+        let flow_bars = &orderflow.bars[flow_range];
+        if flow_bars.is_empty() {
             return Vec::new();
         }
         let timestamps: HashSet<i64> = visible.iter().map(|candle| candle.timestamp).collect();
@@ -1054,22 +1485,34 @@ impl ChartPanel {
             }
         };
 
-        let min_row_h = self.footprint_settings.min_row_height.max(metrics.text_size + 1.0);
-        let max_rows = (metrics.plot_height / min_row_h)
-            .floor()
-            .clamp(10.0, 96.0) as usize;
+        let min_row_h = self
+            .footprint_settings
+            .min_row_height
+            .max(metrics.text_size + 1.0);
+        let max_rows = (metrics.plot_height / min_row_h).floor().clamp(10.0, 96.0) as usize;
 
         let grid = build_footprint_grid(&FootprintBuildInput {
-            bars: &orderflow.bars,
+            bars: flow_bars,
             timestamps: &timestamps,
             price_min,
             price_max,
             max_rows,
-            tick_size: self.precision.as_ref().and_then(|precision| precision.tick_size),
+            tick_size: self
+                .precision
+                .as_ref()
+                .and_then(|precision| precision.tick_size),
+            row_multiplier: self.footprint_settings.row_multiplier,
             show_value_area: self.footprint_settings.show_value_area,
             show_imbalance: self.footprint_settings.show_imbalance,
             imbalance_ratio: self.footprint_settings.imbalance_ratio,
         });
+        self.footprint_step.set(grid.step);
+
+        // The renderer never paints text shorter than the font, so avoid
+        // formatting value strings for every cell when the row ladder is dense.
+        let price_span = (price_max - price_min).max(f64::MIN_POSITIVE);
+        let row_px = metrics.plot_height as f64 * grid.step / price_span;
+        let text_visible = row_px >= (metrics.text_size + 1.0) as f64;
 
         let hover_focus = self.hovered_footprint;
         let pinned_focus = self.pinned_footprint;
@@ -1087,18 +1530,24 @@ impl ChartPanel {
                 let base = if delta >= 0.0 { bullish } else { bearish };
                 let alpha = 0.08 + 0.20 * intensity + if bar.is_closed { 0.0 } else { 0.05 };
                 let background = base.opacity(alpha.min(0.45));
-                let (left_text, right_text, single_text) = match self.footprint_settings.mode {
-                    FootprintMode::BidAsk => (
-                        compact_flow(row.sell).into(),
-                        compact_flow(row.buy).into(),
-                        compact_delta(delta).into(),
-                    ),
-                    FootprintMode::Delta => (
-                        "".into(),
-                        "".into(),
-                        compact_delta(delta).into(),
-                    ),
-                    FootprintMode::Volume => ("".into(), "".into(), compact_flow(row.volume()).into()),
+                let (left_text, right_text, single_text) = if !text_visible {
+                    (
+                        SharedString::default(),
+                        SharedString::default(),
+                        SharedString::default(),
+                    )
+                } else {
+                    match self.footprint_settings.mode {
+                        FootprintMode::BidAsk => (
+                            compact_flow(row.sell).into(),
+                            compact_flow(row.buy).into(),
+                            compact_delta(delta).into(),
+                        ),
+                        FootprintMode::Delta => ("".into(), "".into(), compact_delta(delta).into()),
+                        FootprintMode::Volume => {
+                            ("".into(), "".into(), compact_flow(row.volume()).into())
+                        }
+                    }
                 };
                 let is_focus_row = |focus: Option<FootprintFocus>| {
                     focus.is_some_and(|focus| {
@@ -1153,9 +1602,15 @@ impl ChartPanel {
             return Vec::new();
         }
 
-        let visible_candles = &candles[candles.len().saturating_sub(120)..];
-        let first_ts = visible_candles.first().map(|c| c.timestamp).unwrap_or(0);
-        let last_ts = visible_candles.last().map(|c| c.timestamp).unwrap_or(0);
+        let range = self.chart_state.visible_range(candles.len());
+        let visible_candles = &candles[range];
+        let (Some(first_candle), Some(last_candle)) =
+            (visible_candles.first(), visible_candles.last())
+        else {
+            return Vec::new();
+        };
+        let first_ts = first_candle.timestamp;
+        let last_ts = last_candle.timestamp;
         let bar_ms = crate::data::bridge::BridgeConfig::timeframe_to_ms(&self.timeframe).max(1_000);
         let end_ts = last_ts + bar_ms;
         let mut min_price = f64::INFINITY;
@@ -1168,48 +1623,61 @@ impl ChartPanel {
             return Vec::new();
         }
 
-        let metrics = self.chart_metrics();
-        let rows = metrics.liquidity_rows.max(1);
-        let step = (max_price - min_price) / rows as f64;
-        let max_level = liquidity
-            .samples
-            .iter()
-            .flat_map(|sample| sample.levels.iter())
-            .map(|level| level.quantity)
-            .fold(0.0, f64::max);
-        if step <= 0.0 || max_level <= 0.0 {
-            return Vec::new();
-        }
-
-        let samples: Vec<&crate::data::liquidity_feed::LiquiditySample> = liquidity
-            .samples
-            .iter()
-            .rev()
-            .take(120)
-            .rev()
-            .collect();
+        // Only book samples whose timestamps fall inside the visible candle
+        // window are used, plus one pre-window sample so a carried history
+        // sample seeds the left edge. Off-screen samples are skipped instead
+        // of being clamped into a band at the plot edge.
+        let sample_range = liquidity_window_range(&liquidity.samples, first_ts, end_ts);
+        let samples = &liquidity.samples[sample_range];
         if samples.is_empty() {
             return Vec::new();
         }
 
+        let metrics = self.chart_metrics();
+        let rows = metrics.liquidity_rows.max(1);
+        let step = (max_price - min_price) / rows as f64;
+        if !step.is_finite() || step <= 0.0 {
+            return Vec::new();
+        }
+        let max_level = samples
+            .iter()
+            .flat_map(|sample| sample.levels.iter())
+            .filter(|level| level.price >= min_price && level.price <= max_price)
+            .map(|level| {
+                if level.quantity.is_finite() && level.quantity > 0.0 {
+                    level.quantity
+                } else {
+                    0.0
+                }
+            })
+            .fold(0.0, f64::max);
+        if max_level <= 0.0 {
+            return Vec::new();
+        }
+
+        let mut buckets = vec![0.0f64; rows];
         let mut cells = Vec::new();
         for (index, sample) in samples.iter().enumerate() {
-            if sample.timestamp_ms < first_ts || sample.timestamp_ms > end_ts {
+            let next_ts = samples.get(index + 1).map(|next| next.timestamp_ms);
+            let (start_ms, end_ms) =
+                liquidity_cell_bounds(sample.timestamp_ms, next_ts, first_ts, end_ts);
+            if end_ms <= start_ms {
                 continue;
             }
-            let next_ts = samples
-                .get(index + 1)
-                .map(|next| next.timestamp_ms)
-                .unwrap_or(end_ts);
-            let start_ms = sample.timestamp_ms.max(first_ts);
-            let end_ms = next_ts.min(end_ts).max(start_ms + 1);
-            let mut buckets = vec![0.0f64; rows];
+            buckets.fill(0.0);
             for level in &sample.levels {
+                if !level.price.is_finite() || !level.quantity.is_finite() || level.quantity <= 0.0
+                {
+                    continue;
+                }
+                if level.price < min_price || level.price > max_price {
+                    continue;
+                }
                 let idx = (((level.price - min_price) / step).floor() as isize)
                     .clamp(0, rows as isize - 1) as usize;
                 buckets[idx] += level.quantity;
             }
-            for (idx, quantity) in buckets.into_iter().enumerate() {
+            for (idx, quantity) in buckets.iter().copied().enumerate() {
                 if quantity <= 0.0 {
                     continue;
                 }
@@ -1231,19 +1699,73 @@ impl ChartPanel {
         candles: &[OhlcvCandle],
         orderflow: Option<&OrderFlowSnapshot>,
         color: gpui::Hsla,
-    ) -> (Vec<ProfileBarSpec>, Vec<ProfileLineSpec>) {
+    ) -> (Vec<ProfileBarSpec>, Vec<ProfileLineSpec>, bool) {
         if !self.show_profile {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), false);
         }
         let Some(orderflow) = orderflow else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), false);
         };
-        if orderflow.bars.is_empty() || candles.is_empty() {
-            return (Vec::new(), Vec::new());
+        if candles.is_empty() {
+            return (Vec::new(), Vec::new(), false);
         }
-        let metrics = self.chart_metrics();
 
-        if !orderflow.profile_rows.is_empty() {
+        let range = self.chart_state.visible_range(candles.len());
+        let visible = &candles[range];
+        let (Some(first_candle), Some(last_candle)) = (visible.first(), visible.last()) else {
+            return (Vec::new(), Vec::new(), false);
+        };
+        let first_ts = first_candle.timestamp;
+        let last_ts = last_candle.timestamp;
+        let bar_range = visible_bar_range(&orderflow.bars, first_ts, last_ts);
+        let visible_bars = &orderflow.bars[bar_range];
+        let has_rows = visible_bars.iter().any(|bar| !bar.price_rows.is_empty());
+
+        if has_rows {
+            let metrics = self.chart_metrics();
+            let (min_price, max_price) = flow_price_span(visible_bars).unwrap_or((0.0, 0.0));
+            let max_rows = metrics.profile_rows.max(1);
+            let mut step = effective_row_size(
+                visible_bars,
+                self.precision
+                    .as_ref()
+                    .and_then(|precision| precision.tick_size),
+                min_price,
+                max_price,
+                max_rows,
+                self.footprint_settings.row_multiplier,
+            )
+            .unwrap_or(0.0);
+            // A profile is a visual aid: keep its row count bounded so a wide
+            // viewport at fine tick granularity cannot emit thousands of quads.
+            // The step stays an absolute-price multiple, so the aggregation is
+            // stable when the viewport pans.
+            if step > 0.0 && max_price > min_price {
+                let needed = ((max_price - min_price) / step).ceil();
+                if needed > max_rows as f64 {
+                    let factor = (needed / max_rows as f64).ceil().max(1.0);
+                    step *= factor;
+                }
+            }
+            let profile = build_visible_profile(visible_bars, step, 0.70);
+            if !profile.rows.is_empty() {
+                let (bars, lines) = profile_specs(&profile, color, metrics.profile_width_fraction);
+                return (bars, lines, false);
+            }
+        }
+
+        // Session-profile fallback: only when the visible bars carry no
+        // order-flow ladder and the backend profile window overlaps the view.
+        if !has_rows
+            && !orderflow.profile_rows.is_empty()
+            && profile_window_overlaps(
+                orderflow.profile_window_start,
+                orderflow.profile_window_end,
+                first_ts,
+                last_ts,
+            )
+        {
+            let metrics = self.chart_metrics();
             let max_volume = orderflow
                 .profile_rows
                 .iter()
@@ -1257,120 +1779,32 @@ impl ChartPanel {
                     .map(|row| ProfileBarSpec {
                         price_low: row.price_low,
                         price_high: row.price_high,
-                        width_fraction: ((row.buy + row.sell) / max_volume).clamp(0.0, 1.0)
-                            as f32
+                        width_fraction: ((row.buy + row.sell) / max_volume).clamp(0.0, 1.0) as f32
                             * metrics.profile_width_fraction,
-                        color: color.opacity(0.30)
+                        color: color.opacity(0.30),
                     })
                     .collect();
                 let mut lines = Vec::new();
-                for price in [orderflow.profile_poc, orderflow.profile_vah, orderflow.profile_val]
+                if let Some(price) = orderflow.profile_poc {
+                    lines.push(ProfileLineSpec {
+                        price,
+                        color: color.opacity(0.75),
+                    });
+                }
+                for price in [orderflow.profile_vah, orderflow.profile_val]
                     .into_iter()
                     .flatten()
                 {
                     lines.push(ProfileLineSpec {
                         price,
-                        color: color.opacity(0.55)
+                        color: color.opacity(0.38),
                     });
                 }
-                return (bars, lines);
+                return (bars, lines, true);
             }
         }
 
-        let mut min_price = f64::INFINITY;
-        let mut max_price = f64::NEG_INFINITY;
-        for candle in candles {
-            if candle.low.is_finite() && candle.high.is_finite() {
-                min_price = min_price.min(candle.low);
-                max_price = max_price.max(candle.high);
-            }
-        }
-        if !min_price.is_finite() || !max_price.is_finite() || max_price <= min_price {
-            return (Vec::new(), Vec::new());
-        }
-
-        let rows = metrics.profile_rows.max(1);
-        let step = (max_price - min_price) / rows as f64;
-        if step <= 0.0 {
-            return (Vec::new(), Vec::new());
-        }
-        let mut volume = vec![0.0f64; rows];
-        let mut delta = vec![0.0f64; rows];
-        for bar in &orderflow.bars {
-            for row in &bar.price_rows {
-                let idx = (((row.price - min_price) / step).floor() as isize)
-                    .clamp(0, rows as isize - 1) as usize;
-                volume[idx] += row.volume();
-                delta[idx] += row.delta();
-            }
-        }
-        let max_volume = volume.iter().copied().fold(0.0, f64::max);
-        let total_volume: f64 = volume.iter().sum();
-        if max_volume <= 0.0 || total_volume <= 0.0 {
-            return (Vec::new(), Vec::new());
-        }
-
-        let bars: Vec<ProfileBarSpec> = volume
-            .iter()
-            .enumerate()
-            .filter(|(_, value)| **value > 0.0)
-            .map(|(idx, value)| {
-                let width = (value / max_volume).clamp(0.0, 1.0) as f32
-                    * metrics.profile_width_fraction;
-                let bar_color = if delta[idx] >= 0.0 {
-                    color.opacity(0.36)
-                } else {
-                    color.opacity(0.22)
-                };
-                ProfileBarSpec {
-                    price_low: min_price + step * idx as f64,
-                    price_high: min_price + step * (idx + 1) as f64,
-                    width_fraction: width,
-                    color: bar_color,
-                }
-            })
-            .collect();
-
-        // Value area: grow outward from POC by highest-volume rows until 70%.
-        let poc = volume
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        let mut order: Vec<usize> = (0..rows).collect();
-        order.sort_by(|&a, &b| volume[b].total_cmp(&volume[a]));
-        let target = total_volume * 0.70;
-        let mut accumulated = 0.0;
-        let mut included = std::collections::HashSet::new();
-        included.insert(poc);
-        accumulated += volume[poc];
-        for idx in order {
-            if accumulated >= target {
-                break;
-            }
-            if included.insert(idx) {
-                accumulated += volume[idx];
-            }
-        }
-        let low_idx = *included.iter().min().unwrap_or(&poc);
-        let high_idx = *included.iter().max().unwrap_or(&poc);
-        let lines = vec![
-            ProfileLineSpec {
-                price: min_price + step * (poc as f64 + 0.5),
-                color: color.opacity(0.75),
-            },
-            ProfileLineSpec {
-                price: min_price + step * (high_idx as f64 + 1.0),
-                color: color.opacity(0.38),
-            },
-            ProfileLineSpec {
-                price: min_price + step * low_idx as f64,
-                color: color.opacity(0.38),
-            },
-        ];
-
-        (bars, lines)
+        (Vec::new(), Vec::new(), false)
     }
 
     // -----------------------------------------------------------------------
@@ -1454,20 +1888,23 @@ impl ChartPanel {
 
 impl Render for ChartPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let credit_error = self.feed.credit_error().or_else(|| {
-            crate::data::credits::CreditStore::module_error("Chart")
-        });
+        let credit_error = self
+            .feed
+            .credit_error()
+            .or_else(|| crate::data::credits::CreditStore::module_error("Chart"));
 
         if let Some(ref ce) = credit_error {
             return v_flex()
                 .size_full()
                 .bg(cx.theme().colors.background)
-                .child(crate::components::ui::credit_alert::render_credits_exhausted_empty(
-                    "Chart Data",
-                    Some(ce),
-                    false,
-                    cx.theme(),
-                ))
+                .child(
+                    crate::components::ui::credit_alert::render_credits_exhausted_empty(
+                        "Chart Data",
+                        Some(ce),
+                        false,
+                        cx.theme(),
+                    ),
+                )
                 .into_any_element();
         }
 
@@ -1485,20 +1922,11 @@ impl Render for ChartPanel {
         self.check_debounced_save();
 
         let (candles_snap, feed_version) = self.feed.snapshot_with_version();
-        let orderflow_snapshot = self
-            .orderflow_feed
-            .as_ref()
-            .map(|feed| feed.snapshot());
-        self.orderflow_cache = if self.show_footprint {
-            orderflow_snapshot.clone()
-        } else {
-            None
-        };
+        // Refresh only on feed version changes; the cached copies are reused for
+        // footprint, profile, delta/CVD, liquidity, and hover hit-testing.
+        self.refresh_orderflow_cache();
+        self.refresh_liquidity_cache();
         let metrics = self.chart_metrics();
-        let liquidity_snapshot = self
-            .liquidity_feed
-            .as_ref()
-            .map(|feed| feed.snapshot_with_version().1);
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
         if current_oldest > 0 && current_oldest != self.oldest_loaded_ts {
             if self.oldest_loaded_ts > 0 {
@@ -1518,15 +1946,21 @@ impl Render for ChartPanel {
         }
 
         if let Some(completion) = &self.history_completion {
-            if !matches!(completion.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+            if !matches!(
+                completion.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
                 self.is_loading_more = false;
                 self.history_completion = None;
-                self.history_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+                self.history_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
             }
         }
 
         if !self.is_loading_more
-            && self.history_retry_at.is_none_or(|at| std::time::Instant::now() >= at)
+            && self
+                .history_retry_at
+                .is_none_or(|at| std::time::Instant::now() >= at)
             && self.load_more_attempts < 3
             && current_oldest > 0
             && self.chart_state.viewport_offset <= 15.0
@@ -1578,6 +2012,16 @@ impl Render for ChartPanel {
             }
             self.last_completed_candle_ts = latest_ts;
         }
+
+        // Historical liquidity backfill: drain the in-flight page and request
+        // older history only while the viewport is near the left edge.
+        self.poll_liquidity_history(cx);
+        let visible_range = self.chart_state.visible_range(candles.len());
+        let oldest_visible_ts = candles
+            .get(visible_range.start)
+            .map(|candle| candle.timestamp)
+            .unwrap_or(0);
+        self.maybe_request_liquidity_history(oldest_visible_ts, cx);
 
         // NOTE: The candle series from `self.feed.snapshot_with_version()` is
         // authoritative. `CandleFeed` already subscribes to and maintains the
@@ -1652,31 +2096,54 @@ impl Render for ChartPanel {
             candles.last()
         };
 
-        // Compute parameterized indicators with versioned cache
+        // Compute parameterized indicators with versioned cache. Taking the
+        // order-flow cache out for the `&mut self` indicator call avoids cloning
+        // the whole snapshot on every frame.
+        let orderflow_ref = self.orderflow_cache.take();
         let (indicator_lines, subpane_count) =
-            self.compute_indicators_for_chart(&candles, feed_version, orderflow_snapshot.as_ref());
-        let (profile_bars, profile_lines) = self.compute_profile_bars(
-            &candles,
-            orderflow_snapshot.as_ref(),
-            cx.theme().primary,
-        );
+            self.compute_indicators_for_chart(&candles, feed_version, orderflow_ref.as_ref());
+        self.orderflow_cache = orderflow_ref;
+        let orderflow_snapshot = self.orderflow_cache.as_ref();
+        let (profile_bars, profile_lines, profile_is_session) =
+            self.compute_profile_bars(&candles, orderflow_snapshot, cx.theme().primary);
         let footprint_cells = self.compute_footprint_cells(
             &candles,
-            orderflow_snapshot.as_ref(),
+            orderflow_snapshot,
             cx.theme().bullish,
             cx.theme().bearish,
             cx.theme().colors.foreground,
         );
         let heatmap_cells = self.compute_liquidity_cells(
             &candles,
-            liquidity_snapshot.as_ref(),
+            self.liquidity_cache.as_deref(),
             cx.theme().primary,
         );
+
+        // Order flow is live-session only. When the viewport includes candles
+        // older than the first order-flow bar, say so instead of fabricating a
+        // historical footprint.
+        let orderflow_note = if self.show_footprint {
+            orderflow_snapshot
+                .and_then(|snapshot| snapshot.bars.first())
+                .and_then(|first| {
+                    let range = self.chart_state.visible_range(candles.len());
+                    candles
+                        .get(range.start)
+                        .filter(|candle| candle.timestamp < first.timestamp)
+                        .map(|_| "Order flow: live session")
+                })
+        } else {
+            None
+        };
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;
         let mut total_subpane_ratio = 0.0;
-        let default_subpane_ratio = if metrics.plot_height < 280.0 { 0.26 } else { 0.18 };
+        let default_subpane_ratio = if metrics.plot_height < 280.0 {
+            0.26
+        } else {
+            0.18
+        };
         let mut subpane_ratios = vec![default_subpane_ratio; subpane_count];
         {
             let ratios = self.chart_state.subpane_ratios.borrow();
@@ -1858,69 +2325,84 @@ impl Render for ChartPanel {
                         )
                 );
 
-            if self.show_footprint && self.footprint_settings.show_summary {
-                if let Some(bar) = orderflow_snapshot.as_ref().and_then(|snapshot| {
-                    snapshot.bars.iter().find(|bar| bar.timestamp == c.timestamp)
-                }) {
-                    let delta = bar.delta();
-                    let delta_color = if delta >= 0.0 {
-                        cx.theme().bullish
-                    } else {
-                        cx.theme().bearish
-                    };
-                    let volume = if bar.total_volume > 0.0 {
-                        bar.total_volume
-                    } else {
-                        bar.volume()
-                    };
-                    let poc = bar
-                        .poc
-                        .map(|price| format_price(price, precision.as_ref()))
-                        .unwrap_or_else(|| "—".to_string());
-                    let status_color = if bar.is_closed {
-                        cx.theme().colors.muted_foreground
-                    } else {
-                        cx.theme().primary
-                    };
-                    legend = legend.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
-                            .child(
+            if self.show_footprint
+                && self.footprint_settings.show_summary
+                && let Some(bar) = orderflow_snapshot.and_then(|snapshot| {
+                    snapshot
+                        .bars
+                        .iter()
+                        .find(|bar| bar.timestamp == c.timestamp)
+                })
+            {
+                let delta = bar.delta();
+                let delta_color = if delta >= 0.0 {
+                    cx.theme().bullish
+                } else {
+                    cx.theme().bearish
+                };
+                let volume = if bar.total_volume > 0.0 {
+                    bar.total_volume
+                } else {
+                    bar.volume()
+                };
+                let poc = bar
+                    .poc
+                    .map(|price| format_price(price, precision.as_ref()))
+                    .unwrap_or_else(|| "—".to_string());
+                let status_color = if bar.is_closed {
+                    cx.theme().colors.muted_foreground
+                } else {
+                    cx.theme().primary
+                };
+                legend = legend.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
+                        .child(
+                            div()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child("FP"),
+                        )
+                        .child(
+                            div()
+                                .text_color(delta_color)
+                                .child(format!("Δ {}", compact_delta(delta))),
+                        )
+                        .child(
+                            div()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(format!("Vol {}", compact_flow(volume))),
+                        )
+                        .child(
+                            div()
+                                .text_color(cx.theme().colors.muted_foreground)
+                                .child(format!("POC {poc}")),
+                        )
+                        .children({
+                            let step = self.footprint_step.get();
+                            (step.is_finite() && step > 0.0).then(|| {
                                 div()
                                     .text_color(cx.theme().colors.muted_foreground)
-                                    .child("FP"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(delta_color)
-                                    .child(format!("Δ {}", compact_delta(delta))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(format!("Vol {}", compact_flow(volume))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(format!("POC {poc}")),
-                            )
-                            .child(
-                                div()
-                                    .text_color(status_color)
-                                    .child(if bar.is_closed { "CLOSED" } else { "LIVE" }),
-                            ),
-                    );
-                }
+                                    .child(format!(
+                                        "Row {}",
+                                        format_price(step, self.precision.as_ref())
+                                    ))
+                            })
+                        })
+                        .child(div().text_color(status_color).child(if bar.is_closed {
+                            "CLOSED"
+                        } else {
+                            "LIVE"
+                        })),
+                );
             }
 
             if self.show_footprint {
                 let focus = self.hovered_footprint.or(self.pinned_footprint);
                 if let Some(focus) = focus {
-                    let found = orderflow_snapshot.as_ref().and_then(|snapshot| {
+                    let found = orderflow_snapshot.and_then(|snapshot| {
                         snapshot
                             .bars
                             .iter()
@@ -1960,11 +2442,7 @@ impl Render for ChartPanel {
                                         .text_color(cx.theme().colors.muted_foreground)
                                         .child(marker),
                                 )
-                                .child(
-                                    div()
-                                        .text_color(cx.theme().colors.foreground)
-                                        .child(price),
-                                )
+                                .child(div().text_color(cx.theme().colors.foreground).child(price))
                                 .child(
                                     div()
                                         .text_color(cx.theme().bearish)
@@ -1983,14 +2461,32 @@ impl Render for ChartPanel {
                                 .child(
                                     div()
                                         .text_color(cx.theme().colors.muted_foreground)
-                                        .child(format!(
-                                            "T {}",
-                                            row.buy_count + row.sell_count
-                                        )),
+                                        .child(format!("T {}", row.buy_count + row.sell_count)),
                                 ),
                         );
                     }
                 }
+            }
+
+            if let Some(note) = orderflow_note {
+                legend = legend.child(
+                    div()
+                        .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(note),
+                );
+            }
+            if self.show_profile {
+                legend = legend.child(
+                    div()
+                        .text_size(px((metrics.legend_text_size - 1.0).max(9.0)))
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(if profile_is_session {
+                            "VP: session"
+                        } else {
+                            "VP: visible"
+                        }),
+                );
             }
 
             let active_timestamp = c.timestamp;
@@ -2004,8 +2500,10 @@ impl Render for ChartPanel {
                 if ind.kind == IndicatorKind::Vol {
                     continue;
                 }
-                let lines_for_ind: Vec<&IndicatorLineSpec> =
-                    indicator_lines.iter().filter(|l| l.instance_id == ind.id).collect();
+                let lines_for_ind: Vec<&IndicatorLineSpec> = indicator_lines
+                    .iter()
+                    .filter(|l| l.instance_id == ind.id)
+                    .collect();
                 if lines_for_ind.is_empty() {
                     continue;
                 }
@@ -2101,7 +2599,9 @@ impl Render for ChartPanel {
                                     div()
                                         .cursor_pointer()
                                         .text_color(cx.theme().colors.bearish)
-                                        .hover(|s| s.text_color(cx.theme().colors.bearish.opacity(0.8)))
+                                        .hover(|s| {
+                                            s.text_color(cx.theme().colors.bearish.opacity(0.8))
+                                        })
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
                                             cx.listener({
@@ -2177,52 +2677,65 @@ impl Render for ChartPanel {
                 .iter()
                 .filter(|line| line.instance_id.starts_with("orderflow-"))
                 .collect();
-            if let Some(first) = orderflow_lines.first() {
-                let color: gpui::Hsla = gpui::rgba(0x00F0FFFF).into();
-                let mut row = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .text_xs()
-                    .child(
+            if !orderflow_lines.is_empty() {
+                // Group by the actual pane so Delta and CVD each get their own
+                // legend row; previously every order-flow line was placed at
+                // the first pane and the CVD pane had no label.
+                let mut by_pane: BTreeMap<usize, Vec<&IndicatorLineSpec>> = BTreeMap::new();
+                for line in &orderflow_lines {
+                    if let PaneTarget::Subpane(index) = line.pane {
+                        by_pane.entry(index).or_default().push(line);
+                    }
+                }
+                let partial = orderflow_snapshot.is_some_and(|snapshot| snapshot.partial);
+                let first_pane = by_pane.keys().next().copied();
+                for (idx, pane_lines) in by_pane {
+                    let title_color = pane_lines
+                        .first()
+                        .map(|line| line.color)
+                        .unwrap_or_else(|| gpui::rgba(0x00F0FFFF).into());
+                    let mut row = div().flex().items_center().gap(px(8.0)).text_xs().child(
                         div()
-                            .text_color(color)
+                            .text_color(title_color)
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("ORDER FLOW"),
                     );
-                for line in &orderflow_lines {
-                    let val = match line
-                        .series
-                        .binary_search_by_key(&active_timestamp, |&(ts, _)| ts)
-                    {
-                        Ok(idx) => line.series[idx].1,
-                        Err(_) => f64::NAN,
-                    };
-                    let val_str = if val.is_nan() {
-                        "--".to_string()
-                    } else {
-                        format!("{val:.4}")
-                    };
-                    row = row.child(
-                        div()
-                            .flex()
-                            .gap(px(4.0))
-                            .child(div().text_color(color).child(format!("{}:", line.name)))
-                            .child(div().text_color(color).child(val_str)),
-                    );
-                }
-                if orderflow_snapshot.as_ref().is_some_and(|snapshot| snapshot.partial) {
-                    row = row.child(
-                        div()
-                            .text_color(cx.theme().colors.warning)
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("PARTIAL"),
-                    );
-                }
-                if let PaneTarget::Subpane(idx) = first.pane {
+                    for line in pane_lines {
+                        let val = match line
+                            .series
+                            .binary_search_by_key(&active_timestamp, |&(ts, _)| ts)
+                        {
+                            Ok(index) => line.series[index].1,
+                            Err(_) => f64::NAN,
+                        };
+                        let val_str = if val.is_nan() {
+                            "--".to_string()
+                        } else {
+                            compact_delta(val)
+                        };
+                        row = row.child(
+                            div()
+                                .flex()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_color(line.color)
+                                        .child(format!("{}:", line.name)),
+                                )
+                                .child(div().text_color(line.color).child(val_str)),
+                        );
+                    }
+                    if partial && Some(idx) == first_pane {
+                        row = row.child(
+                            div()
+                                .text_color(cx.theme().colors.warning)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("PARTIAL"),
+                        );
+                    }
                     let mut y0 = candle_h + 2.0;
-                    for j in 0..idx {
-                        y0 += avail * subpane_ratios[j] + 2.0;
+                    for ratio in subpane_ratios.iter().take(idx) {
+                        y0 += avail * *ratio + 2.0;
                     }
                     y0 += 8.0;
                     let y0 = if full_h > 0.0 {
@@ -2262,7 +2775,10 @@ impl Render for ChartPanel {
             200.0
         };
 
-        let has_vol = self.indicators.iter().any(|i| i.kind == IndicatorKind::Vol && i.visible);
+        let has_vol = self
+            .indicators
+            .iter()
+            .any(|i| i.kind == IndicatorKind::Vol && i.visible);
         let legend_vol_ui: AnyElement = if !has_vol {
             div().into_any_element()
         } else if let Some(c) = active_candle {
@@ -2371,9 +2887,11 @@ impl Render for ChartPanel {
             let title = match target {
                 LegendSettingsTarget::Main => self.title.clone(),
                 LegendSettingsTarget::Volume => "Vol".to_string(),
-                LegendSettingsTarget::Indicator(idx) => {
-                    self.indicators.get(idx).map(|i| i.display_label()).unwrap_or_default()
-                }
+                LegendSettingsTarget::Indicator(idx) => self
+                    .indicators
+                    .get(idx)
+                    .map(|i| i.display_label())
+                    .unwrap_or_default(),
             };
             div()
                 .absolute()
@@ -2473,8 +2991,12 @@ impl Render for ChartPanel {
 
         // Candlestick chart construction
         let current_mark = candles.last().map(|c| c.close).unwrap_or(0.0);
+        // While a footprint is active the cells replace candle bodies, but keep
+        // candles usable whenever there is no live order flow to draw.
+        let show_candles =
+            self.show_main_series && (!self.show_footprint || footprint_cells.is_empty());
         let mut chart = CandlestickChart::new(candles)
-            .show_candles(self.show_main_series && !self.show_footprint)
+            .show_candles(show_candles)
             .subpane_count(subpane_count)
             .show_volume_pane(has_vol)
             .timestamp_ms(|c: &OhlcvCandle| c.timestamp)
@@ -2536,12 +3058,16 @@ impl Render for ChartPanel {
         // a live feed. Overwriting here would fight the tick-feed writer and make
         // PnL flicker between the candle close and the live traded price.
         if current_mark > 0.0 {
-            let mut store = crate::data::trade_store::TradeStore::global().lock().unwrap();
+            let mut store = crate::data::trade_store::TradeStore::global()
+                .lock()
+                .unwrap();
             store.sync_chart_mark_price(&self.symbol, current_mark);
         }
 
         let (pos_overlays, ord_overlays) = {
-            let store = crate::data::trade_store::TradeStore::global().lock().unwrap();
+            let store = crate::data::trade_store::TradeStore::global()
+                .lock()
+                .unwrap();
             let chart_mark = if current_mark > 0.0 {
                 current_mark
             } else {
@@ -2597,7 +3123,10 @@ impl Render for ChartPanel {
             let ord: Vec<OrderOverlaySpec> = store
                 .orders
                 .iter()
-                .filter(|o| o.status == "OPEN" && crate::data::trade_store::symbol_matches(&o.symbol, &self.symbol))
+                .filter(|o| {
+                    o.status == "OPEN"
+                        && crate::data::trade_store::symbol_matches(&o.symbol, &self.symbol)
+                })
                 .map(|o| OrderOverlaySpec {
                     id: o.id.clone(),
                     symbol: o.symbol.clone(),
@@ -2616,7 +3145,9 @@ impl Render for ChartPanel {
             (pos, ord)
         };
 
-        chart = chart.position_overlays(pos_overlays).order_overlays(ord_overlays);
+        chart = chart
+            .position_overlays(pos_overlays)
+            .order_overlays(ord_overlays);
 
         // Saved price alerts for this pane's exchange/symbol. The store is
         // populated by the alerts sidebar and survives panes created before it.
@@ -2679,227 +3210,343 @@ impl Render for ChartPanel {
                 _ => None,
             };
 
-            div()
-                .absolute()
-                .size_full()
-                .child(gpui::canvas(
-                    move |_, _, _| {},
-                    move |_, _, window, _cx| {
-                        let origin = chart_st.candle_plot_origin.get();
-                        let size = chart_st.candle_plot_size.get();
-                        let ts_range = chart_st.candle_ts_range.get();
-                        let price_range = chart_st.candle_price_range.get();
+            div().absolute().size_full().child(gpui::canvas(
+                move |_, _, _| {},
+                move |_, _, window, _cx| {
+                    let origin = chart_st.candle_plot_origin.get();
+                    let size = chart_st.candle_plot_size.get();
+                    let ts_range = chart_st.candle_ts_range.get();
+                    let price_range = chart_st.candle_price_range.get();
 
-                        if let (Some(orig), Some(sz), Some((ts_min, ts_max)), Some((p_min, p_max))) =
-                            (origin, size, ts_range, price_range)
-                        {
-                            let to_screen = |pt: &DrawingPoint| -> (f32, f32) {
-                                let x = if ts_max > ts_min {
-                                    orig.0
-                                        + ((pt.timestamp as f64 - ts_min) / (ts_max - ts_min))
-                                            as f32
-                                            * sz.0
-                                } else {
-                                    orig.0
-                                };
-                                let y = if p_max > p_min {
-                                    orig.1
-                                        + ((p_max - pt.price) / (p_max - p_min)) as f32 * sz.1
-                                } else {
-                                    orig.1
-                                };
-                                (x, y)
+                    if let (Some(orig), Some(sz), Some((ts_min, ts_max)), Some((p_min, p_max))) =
+                        (origin, size, ts_range, price_range)
+                    {
+                        let to_screen = |pt: &DrawingPoint| -> (f32, f32) {
+                            let x = if ts_max > ts_min {
+                                orig.0
+                                    + ((pt.timestamp as f64 - ts_min) / (ts_max - ts_min)) as f32
+                                        * sz.0
+                            } else {
+                                orig.0
                             };
+                            let y = if p_max > p_min {
+                                orig.1 + ((p_max - pt.price) / (p_max - p_min)) as f32 * sz.1
+                            } else {
+                                orig.1
+                            };
+                            (x, y)
+                        };
 
-                            for d in drawings.iter().chain(preview_drawing.as_ref()) {
-                                let is_selected = selected_id.as_deref() == Some(&d.id);
-                                let color = Self::parse_hex_color(&d.style.color)
-                                    .unwrap_or(gpui::rgba(0xc4e855ff).into());
+                        for d in drawings.iter().chain(preview_drawing.as_ref()) {
+                            let is_selected = selected_id.as_deref() == Some(&d.id);
+                            let color = Self::parse_hex_color(&d.style.color)
+                                .unwrap_or(gpui::rgba(0xc4e855ff).into());
 
-                                match d.tool {
-                                    DrawingTool::Trendline | DrawingTool::Segment => {
-                                        if d.points.len() >= 2 {
-                                            let (x0, y0) = to_screen(&d.points[0]);
-                                            let (x1, y1) = to_screen(&d.points[1]);
-                                            let mut b =
-                                                PathBuilder::stroke(px(d.style.width as f32));
-                                            if d.style.dashed {
-                                                b = b.dash_array(&[px(4.0), px(2.0)]);
-                                            }
-                                            b.move_to(gpui::point(px(x0), px(y0)));
-                                            b.line_to(gpui::point(px(x1), px(y1)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
+                            match d.tool {
+                                DrawingTool::Trendline | DrawingTool::Segment => {
+                                    if d.points.len() >= 2 {
+                                        let (x0, y0) = to_screen(&d.points[0]);
+                                        let (x1, y1) = to_screen(&d.points[1]);
+                                        let mut b = PathBuilder::stroke(px(d.style.width as f32));
+                                        if d.style.dashed {
+                                            b = b.dash_array(&[px(4.0), px(2.0)]);
                                         }
-                                    }
-                                    DrawingTool::HorizontalLine => {
-                                        if let Some(pt) = d.points.first() {
-                                            let (_, y0) = to_screen(pt);
-                                            let mut b =
-                                                PathBuilder::stroke(px(d.style.width as f32));
-                                            if d.style.dashed {
-                                                b = b.dash_array(&[px(4.0), px(2.0)]);
-                                            }
-                                            b.move_to(gpui::point(px(orig.0), px(y0)));
-                                            b.line_to(gpui::point(px(orig.0 + sz.0), px(y0)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::VerticalLine => {
-                                        if let Some(pt) = d.points.first() {
-                                            let (x0, _) = to_screen(pt);
-                                            let mut b =
-                                                PathBuilder::stroke(px(d.style.width as f32));
-                                            if d.style.dashed {
-                                                b = b.dash_array(&[px(4.0), px(2.0)]);
-                                            }
-                                            b.move_to(gpui::point(px(x0), px(orig.1)));
-                                            b.line_to(gpui::point(px(x0), px(orig.1 + sz.1)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::Ray => {
-                                        if d.points.len() >= 2 {
-                                            let (x0, y0) = to_screen(&d.points[0]);
-                                            let (x1, y1) = to_screen(&d.points[1]);
-                                            let dx = x1 - x0;
-                                            let dy = y1 - y0;
-                                            let (end_x, end_y) = if dx.abs() > 1e-4 {
-                                                let target_x = orig.0 + sz.0;
-                                                let scale = (target_x - x0) / dx;
-                                                (target_x, y0 + dy * scale)
-                                            } else {
-                                                (x0, orig.1 + sz.1)
-                                            };
-                                            let mut b =
-                                                PathBuilder::stroke(px(d.style.width as f32));
-                                            b.move_to(gpui::point(px(x0), px(y0)));
-                                            b.line_to(gpui::point(px(end_x), px(end_y)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::Fibonacci => {
-                                        if d.points.len() >= 2 {
-                                            let (x0, _) = to_screen(&d.points[0]);
-                                            let (x1, _) = to_screen(&d.points[1]);
-                                            let min_x = x0.min(x1);
-                                            let max_x = (x0.max(x1)).max(orig.0 + sz.0);
-                                            let levels = klinechart::fibonacci_levels(
-                                                d.points[0].price,
-                                                d.points[1].price,
-                                            );
-                                            for (_, price) in levels {
-                                                let pt = DrawingPoint {
-                                                    timestamp: 0,
-                                                    price,
-                                                };
-                                                let (_, y) = to_screen(&pt);
-                                                let mut b = PathBuilder::stroke(px(1.0));
-                                                b.move_to(gpui::point(px(min_x), px(y)));
-                                                b.line_to(gpui::point(px(max_x), px(y)));
-                                                if let Ok(path) = b.build() {
-                                                    window.paint_path(path, color);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::PriceChannel => {
-                                        if d.points.len() >= 2 {
-                                            let (x0, y0) = to_screen(&d.points[0]);
-                                            let (x1, y1) = to_screen(&d.points[1]);
-                                            let mut b =
-                                                PathBuilder::stroke(px(d.style.width as f32));
-                                            b.move_to(gpui::point(px(x0), px(y0)));
-                                            b.line_to(gpui::point(px(x1), px(y1)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
-                                            if d.points.len() >= 3 {
-                                                let (_, y2) = to_screen(&d.points[2]);
-                                                let offset_y = y2 - y0;
-                                                let mut b2 =
-                                                    PathBuilder::stroke(px(d.style.width as f32));
-                                                b2.move_to(gpui::point(px(x0), px(y0 + offset_y)));
-                                                b2.line_to(gpui::point(px(x1), px(y1 + offset_y)));
-                                                if let Ok(path) = b2.build() {
-                                                    window.paint_path(path, color);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::LongPosition | DrawingTool::ShortPosition => {
-                                        if d.points.len() >= 2 {
-                                            let (x0, y_entry) = to_screen(&d.points[0]);
-                                            let (x1, y_target) = to_screen(&d.points[1]);
-                                            let min_x = x0.min(x1);
-                                            let max_x = x0.max(x1).max(min_x + 60.0);
-
-                                            let green_bounds = gpui::Bounds::from_corners(
-                                                gpui::point(px(min_x), px(y_entry.min(y_target))),
-                                                gpui::point(px(max_x), px(y_entry.max(y_target))),
-                                            );
-                                            window.paint_quad(gpui::fill(
-                                                green_bounds,
-                                                gpui::rgba(0x2ebd8533),
-                                            ));
-
-                                            let stop_y = y_entry + (y_entry - y_target) * 0.5;
-                                            let red_bounds = gpui::Bounds::from_corners(
-                                                gpui::point(px(min_x), px(y_entry.min(stop_y))),
-                                                gpui::point(px(max_x), px(y_entry.max(stop_y))),
-                                            );
-                                            window.paint_quad(gpui::fill(
-                                                red_bounds,
-                                                gpui::rgba(0xf6465d33),
-                                            ));
-
-                                            let mut b = PathBuilder::stroke(px(1.5));
-                                            b.move_to(gpui::point(px(min_x), px(y_entry)));
-                                            b.line_to(gpui::point(px(max_x), px(y_entry)));
-                                            if let Ok(path) = b.build() {
-                                                window.paint_path(path, color);
-                                            }
-                                        }
-                                    }
-                                    DrawingTool::Text => {
-                                        if let Some(pt) = d.points.first() {
-                                            let (x0, y0) = to_screen(pt);
-                                            let rect = gpui::Bounds::from_corners(
-                                                gpui::point(px(x0), px(y0)),
-                                                gpui::point(px(x0 + 80.0), px(y0 + 20.0)),
-                                            );
-                                            window.paint_quad(gpui::fill(
-                                                rect,
-                                                gpui::rgba(0x1e222dcc),
-                                            ));
+                                        b.move_to(gpui::point(px(x0), px(y0)));
+                                        b.line_to(gpui::point(px(x1), px(y1)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
                                         }
                                     }
                                 }
+                                DrawingTool::HorizontalLine => {
+                                    if let Some(pt) = d.points.first() {
+                                        let (_, y0) = to_screen(pt);
+                                        let mut b = PathBuilder::stroke(px(d.style.width as f32));
+                                        if d.style.dashed {
+                                            b = b.dash_array(&[px(4.0), px(2.0)]);
+                                        }
+                                        b.move_to(gpui::point(px(orig.0), px(y0)));
+                                        b.line_to(gpui::point(px(orig.0 + sz.0), px(y0)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
+                                        }
+                                    }
+                                }
+                                DrawingTool::VerticalLine => {
+                                    if let Some(pt) = d.points.first() {
+                                        let (x0, _) = to_screen(pt);
+                                        let mut b = PathBuilder::stroke(px(d.style.width as f32));
+                                        if d.style.dashed {
+                                            b = b.dash_array(&[px(4.0), px(2.0)]);
+                                        }
+                                        b.move_to(gpui::point(px(x0), px(orig.1)));
+                                        b.line_to(gpui::point(px(x0), px(orig.1 + sz.1)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
+                                        }
+                                    }
+                                }
+                                DrawingTool::Ray => {
+                                    if d.points.len() >= 2 {
+                                        let (x0, y0) = to_screen(&d.points[0]);
+                                        let (x1, y1) = to_screen(&d.points[1]);
+                                        let dx = x1 - x0;
+                                        let dy = y1 - y0;
+                                        let (end_x, end_y) = if dx.abs() > 1e-4 {
+                                            let target_x = orig.0 + sz.0;
+                                            let scale = (target_x - x0) / dx;
+                                            (target_x, y0 + dy * scale)
+                                        } else {
+                                            (x0, orig.1 + sz.1)
+                                        };
+                                        let mut b = PathBuilder::stroke(px(d.style.width as f32));
+                                        b.move_to(gpui::point(px(x0), px(y0)));
+                                        b.line_to(gpui::point(px(end_x), px(end_y)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
+                                        }
+                                    }
+                                }
+                                DrawingTool::Fibonacci => {
+                                    if d.points.len() >= 2 {
+                                        let (x0, _) = to_screen(&d.points[0]);
+                                        let (x1, _) = to_screen(&d.points[1]);
+                                        let min_x = x0.min(x1);
+                                        let max_x = (x0.max(x1)).max(orig.0 + sz.0);
+                                        let levels = klinechart::fibonacci_levels(
+                                            d.points[0].price,
+                                            d.points[1].price,
+                                        );
+                                        for (_, price) in levels {
+                                            let pt = DrawingPoint {
+                                                timestamp: 0,
+                                                price,
+                                            };
+                                            let (_, y) = to_screen(&pt);
+                                            let mut b = PathBuilder::stroke(px(1.0));
+                                            b.move_to(gpui::point(px(min_x), px(y)));
+                                            b.line_to(gpui::point(px(max_x), px(y)));
+                                            if let Ok(path) = b.build() {
+                                                window.paint_path(path, color);
+                                            }
+                                        }
+                                    }
+                                }
+                                DrawingTool::PriceChannel => {
+                                    if d.points.len() >= 2 {
+                                        let (x0, y0) = to_screen(&d.points[0]);
+                                        let (x1, y1) = to_screen(&d.points[1]);
+                                        let mut b = PathBuilder::stroke(px(d.style.width as f32));
+                                        b.move_to(gpui::point(px(x0), px(y0)));
+                                        b.line_to(gpui::point(px(x1), px(y1)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
+                                        }
+                                        if d.points.len() >= 3 {
+                                            let (_, y2) = to_screen(&d.points[2]);
+                                            let offset_y = y2 - y0;
+                                            let mut b2 =
+                                                PathBuilder::stroke(px(d.style.width as f32));
+                                            b2.move_to(gpui::point(px(x0), px(y0 + offset_y)));
+                                            b2.line_to(gpui::point(px(x1), px(y1 + offset_y)));
+                                            if let Ok(path) = b2.build() {
+                                                window.paint_path(path, color);
+                                            }
+                                        }
+                                    }
+                                }
+                                DrawingTool::LongPosition | DrawingTool::ShortPosition => {
+                                    if d.points.len() >= 2 {
+                                        let (x0, y_entry) = to_screen(&d.points[0]);
+                                        let (x1, y_target) = to_screen(&d.points[1]);
+                                        let min_x = x0.min(x1);
+                                        let max_x = x0.max(x1).max(min_x + 60.0);
 
-                                if is_selected {
-                                    for pt in &d.points {
-                                        let (px_x, px_y) = to_screen(pt);
-                                        let handle = gpui::Bounds::from_corners(
-                                            gpui::point(px(px_x - 4.0), px(px_y - 4.0)),
-                                            gpui::point(px(px_x + 4.0), px(px_y + 4.0)),
+                                        let green_bounds = gpui::Bounds::from_corners(
+                                            gpui::point(px(min_x), px(y_entry.min(y_target))),
+                                            gpui::point(px(max_x), px(y_entry.max(y_target))),
                                         );
                                         window.paint_quad(gpui::fill(
-                                            handle,
-                                            gpui::rgba(0xffffffff),
+                                            green_bounds,
+                                            gpui::rgba(0x2ebd8533),
                                         ));
+
+                                        let stop_y = y_entry + (y_entry - y_target) * 0.5;
+                                        let red_bounds = gpui::Bounds::from_corners(
+                                            gpui::point(px(min_x), px(y_entry.min(stop_y))),
+                                            gpui::point(px(max_x), px(y_entry.max(stop_y))),
+                                        );
+                                        window.paint_quad(gpui::fill(
+                                            red_bounds,
+                                            gpui::rgba(0xf6465d33),
+                                        ));
+
+                                        let mut b = PathBuilder::stroke(px(1.5));
+                                        b.move_to(gpui::point(px(min_x), px(y_entry)));
+                                        b.line_to(gpui::point(px(max_x), px(y_entry)));
+                                        if let Ok(path) = b.build() {
+                                            window.paint_path(path, color);
+                                        }
+                                    }
+                                }
+                                DrawingTool::Text => {
+                                    if let Some(pt) = d.points.first() {
+                                        let (x0, y0) = to_screen(pt);
+                                        let rect = gpui::Bounds::from_corners(
+                                            gpui::point(px(x0), px(y0)),
+                                            gpui::point(px(x0 + 80.0), px(y0 + 20.0)),
+                                        );
+                                        window.paint_quad(gpui::fill(rect, gpui::rgba(0x1e222dcc)));
                                     }
                                 }
                             }
+
+                            if is_selected {
+                                for pt in &d.points {
+                                    let (px_x, px_y) = to_screen(pt);
+                                    let handle = gpui::Bounds::from_corners(
+                                        gpui::point(px(px_x - 4.0), px(px_y - 4.0)),
+                                        gpui::point(px(px_x + 4.0), px(px_y + 4.0)),
+                                    );
+                                    window.paint_quad(gpui::fill(handle, gpui::rgba(0xffffffff)));
+                                }
+                            }
                         }
-                    },
-                ))
+                    }
+                },
+            ))
+        };
+
+        // L1 best bid/ask step lines. The overlay is a sibling canvas like the
+        // drawing overlay, so it inherits the exact plot origin/scale the
+        // chart reports and needs no vendored chart-crate change.
+        let l1_overlay = {
+            let show = self.show_l1;
+            let snapshot = self.liquidity_cache.clone();
+            let chart_st = self.chart_state.clone();
+            let bid_color = cx.theme().bullish.opacity(0.9);
+            let ask_color = cx.theme().bearish.opacity(0.9);
+
+            div().absolute().size_full().child(gpui::canvas(
+                move |_, _, _| {},
+                move |_, _, window, _cx| {
+                    if !show {
+                        return;
+                    }
+                    let Some(snapshot) = snapshot.as_ref() else {
+                        return;
+                    };
+                    let (Some((ts_min, ts_max)), Some((p_min, p_max)), Some(origin), Some(size)) = (
+                        chart_st.candle_ts_range.get(),
+                        chart_st.candle_price_range.get(),
+                        chart_st.candle_plot_origin.get(),
+                        chart_st.candle_plot_size.get(),
+                    ) else {
+                        return;
+                    };
+                    if ts_max <= ts_min || p_max <= p_min || size.0 <= 0.0 || size.1 <= 0.0 {
+                        return;
+                    }
+                    let right = origin.0 + size.0;
+                    let bottom = origin.1 + size.1;
+                    let x_for = |ts: i64| {
+                        chart_st
+                            .ts_to_x(ts as f64)
+                            .map(|x| x.clamp(origin.0, right))
+                    };
+                    // Include one pre-window sample so the step line enters
+                    // from the left edge instead of starting mid-air.
+                    let range =
+                        visible_sample_range(&snapshot.samples, ts_min as i64, ts_max as i64);
+                    let start = range.start.saturating_sub(1);
+                    let end = range.end.max(start + 1).min(snapshot.samples.len());
+                    if end <= start {
+                        return;
+                    }
+
+                    let mut bid_path = PathBuilder::stroke(px(1.0));
+                    let mut ask_path = PathBuilder::stroke(px(1.0));
+                    let mut bid_prev: Option<(f32, f32)> = None;
+                    let mut ask_prev: Option<(f32, f32)> = None;
+                    let mut bid_prev_ts: Option<i64> = None;
+                    let mut ask_prev_ts: Option<i64> = None;
+                    for sample in &snapshot.samples[start..end] {
+                        let Some(x) = x_for(sample.timestamp_ms) else {
+                            continue;
+                        };
+                        if let Some(y) = sample.best_bid.and_then(|price| {
+                            chart_st
+                                .price_to_y(price)
+                                .map(|y| y.clamp(origin.1, bottom))
+                        }) {
+                            match bid_prev {
+                                Some((_, prev_y))
+                                    if !l1_step_break(bid_prev_ts, sample.timestamp_ms) =>
+                                {
+                                    bid_path.line_to(gpui::point(px(x), px(prev_y)));
+                                    bid_path.line_to(gpui::point(px(x), px(y)));
+                                }
+                                _ => bid_path.move_to(gpui::point(px(x), px(y))),
+                            }
+                            bid_prev = Some((x, y));
+                            bid_prev_ts = Some(sample.timestamp_ms);
+                        }
+                        if let Some(y) = sample.best_ask.and_then(|price| {
+                            chart_st
+                                .price_to_y(price)
+                                .map(|y| y.clamp(origin.1, bottom))
+                        }) {
+                            match ask_prev {
+                                Some((_, prev_y))
+                                    if !l1_step_break(ask_prev_ts, sample.timestamp_ms) =>
+                                {
+                                    ask_path.line_to(gpui::point(px(x), px(prev_y)));
+                                    ask_path.line_to(gpui::point(px(x), px(y)));
+                                }
+                                _ => ask_path.move_to(gpui::point(px(x), px(y))),
+                            }
+                            ask_prev = Some((x, y));
+                            ask_prev_ts = Some(sample.timestamp_ms);
+                        }
+                    }
+                    // Extend only the final subpath to the right edge; a path
+                    // broken by a gap must not reconnect across it.
+                    if let Some((_, y)) = bid_prev {
+                        bid_path.line_to(gpui::point(px(right), px(y)));
+                    }
+                    if let Some((_, y)) = ask_prev {
+                        ask_path.line_to(gpui::point(px(right), px(y)));
+                    }
+                    if bid_prev.is_some() {
+                        if let Ok(path) = bid_path.build() {
+                            window.paint_path(path, bid_color);
+                        }
+                    }
+                    if ask_prev.is_some() {
+                        if let Ok(path) = ask_path.build() {
+                            window.paint_path(path, ask_color);
+                        }
+                    }
+                },
+            ))
+        };
+
+        let liquidity_history_note = if self.show_liquidity || self.show_l1 {
+            self.liquidity_history_note.clone().map(|note| {
+                div()
+                    .absolute()
+                    .left(px(8.0))
+                    .bottom(px(8.0))
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(cx.theme().colors.background.opacity(0.78))
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(note)
+            })
+        } else {
+            None
         };
 
         let is_near_separator = {
@@ -2932,7 +3579,9 @@ impl Render for ChartPanel {
         let chart_area = chart_area
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !*hovered {
-                    if this.chart_state.crosshair_pos.is_some() || this.drawing_cursor_point.is_some() {
+                    if this.chart_state.crosshair_pos.is_some()
+                        || this.drawing_cursor_point.is_some()
+                    {
                         this.chart_state.crosshair_pos = None;
                         this.drawing_cursor_point = None;
                         this.hovered_footprint = None;
@@ -2944,20 +3593,20 @@ impl Render for ChartPanel {
                 let pos: Point<Pixels> = ev.position;
                 if this.library_dragging {
                     this.chart_state.crosshair_pos = None;
-                    this.library_x = this.library_drag_origin_x + pos.x.as_f32()
-                        - this.library_drag_start_x;
-                    this.library_y = this.library_drag_origin_y + pos.y.as_f32()
-                        - this.library_drag_start_y;
+                    this.library_x =
+                        this.library_drag_origin_x + pos.x.as_f32() - this.library_drag_start_x;
+                    this.library_y =
+                        this.library_drag_origin_y + pos.y.as_f32() - this.library_drag_start_y;
                     this.mark_dirty();
                     cx.notify();
                     return;
                 }
                 if this.settings_panel_dragging {
                     this.chart_state.crosshair_pos = None;
-                    this.settings_panel_x = this.settings_drag_origin_x + pos.x.as_f32()
-                        - this.settings_drag_start_x;
-                    this.settings_panel_y = this.settings_drag_origin_y + pos.y.as_f32()
-                        - this.settings_drag_start_y;
+                    this.settings_panel_x =
+                        this.settings_drag_origin_x + pos.x.as_f32() - this.settings_drag_start_x;
+                    this.settings_panel_y =
+                        this.settings_drag_origin_y + pos.y.as_f32() - this.settings_drag_start_y;
                     this.mark_dirty();
                     cx.notify();
                     return;
@@ -3002,14 +3651,16 @@ impl Render for ChartPanel {
                 // Handle chart panning
                 if this.chart_state.is_dragging {
                     let dx = pos.x.as_f32() - this.chart_state.drag_start_x;
-                    let candle_width = if this.chart_state.visible_count > 0 && this.last_chart_width > 0.0 {
-                        this.last_chart_width as f64 / this.chart_state.visible_count as f64
-                    } else {
-                        8.0
-                    };
+                    let candle_width =
+                        if this.chart_state.visible_count > 0 && this.last_chart_width > 0.0 {
+                            this.last_chart_width as f64 / this.chart_state.visible_count as f64
+                        } else {
+                            8.0
+                        };
                     let candle_delta = -(dx as f64 / candle_width);
                     let total = this.feed.len();
-                    this.chart_state.viewport_offset = this.chart_state.drag_start_offset + candle_delta;
+                    this.chart_state.viewport_offset =
+                        this.chart_state.drag_start_offset + candle_delta;
                     this.chart_state.clamp_offset(total);
                     this.chart_state.pinned_to_latest = false;
                     cx.notify();
@@ -3162,10 +3813,12 @@ impl Render for ChartPanel {
                             // Snap to closest candle if enabled
                             if this.snap_to_candle {
                                 let snap_feed = this.feed.snapshot();
-                                if let Some(closest) = snap_feed.iter().min_by_key(|c| {
-                                    (c.timestamp - cur_pt.timestamp).abs()
-                                }) {
-                                    let prices = [closest.open, closest.high, closest.low, closest.close];
+                                if let Some(closest) = snap_feed
+                                    .iter()
+                                    .min_by_key(|c| (c.timestamp - cur_pt.timestamp).abs())
+                                {
+                                    let prices =
+                                        [closest.open, closest.high, closest.low, closest.close];
                                     if let Some(&best_price) = prices.iter().min_by(|a, b| {
                                         (*a - cur_pt.price)
                                             .abs()
@@ -3199,10 +3852,7 @@ impl Render for ChartPanel {
                                             points: vec![cur_pt],
                                         };
                                     }
-                                    DrawingInteractionState::Placing {
-                                        tool: _,
-                                        points,
-                                    } => {
+                                    DrawingInteractionState::Placing { tool: _, points } => {
                                         points.push(cur_pt);
                                         if points.len() >= tool.points_required() {
                                             let mut inst = DrawingInstance::new(
@@ -3244,8 +3894,7 @@ impl Render for ChartPanel {
                     {
                         let to_screen = |ts: i64, price: f64| -> Option<(f64, f64)> {
                             let x = if ts_max > ts_min {
-                                orig.0
-                                    + ((ts as f64 - ts_min) / (ts_max - ts_min)) as f32 * sz.0
+                                orig.0 + ((ts as f64 - ts_min) / (ts_max - ts_min)) as f32 * sz.0
                             } else {
                                 orig.0
                             };
@@ -3257,9 +3906,13 @@ impl Render for ChartPanel {
                             Some((x as f64, y as f64))
                         };
 
-                        if let Some(hit_id) =
-                            hit_test_drawings(pos.x.as_f32() as f64, pos.y.as_f32() as f64, &this.drawings, 8.0, to_screen)
-                        {
+                        if let Some(hit_id) = hit_test_drawings(
+                            pos.x.as_f32() as f64,
+                            pos.y.as_f32() as f64,
+                            &this.drawings,
+                            8.0,
+                            to_screen,
+                        ) {
                             this.selected_drawing_id = Some(hit_id.clone());
                             this.drawing_state =
                                 DrawingInteractionState::Selected { drawing_id: hit_id };
@@ -3291,12 +3944,11 @@ impl Render for ChartPanel {
                         let dx = pos.x.as_f32() - press_x;
                         let dy = pos.y.as_f32() - press_y;
                         if dx * dx + dy * dy <= 25.0 {
-                            this.pinned_footprint =
-                                if this.pinned_footprint == Some(focus) {
-                                    None
-                                } else {
-                                    Some(focus)
-                                };
+                            this.pinned_footprint = if this.pinned_footprint == Some(focus) {
+                                None
+                            } else {
+                                Some(focus)
+                            };
                         }
                     }
                     if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
@@ -3334,13 +3986,12 @@ impl Render for ChartPanel {
 
                 let delta_x = ev.delta.pixel_delta(px(1.0)).x.as_f32();
                 if delta_x.abs() > 1.0 {
-                    let candle_width = if this.chart_state.visible_count > 0
-                        && this.last_chart_width > 0.0
-                    {
-                        this.last_chart_width as f64 / this.chart_state.visible_count as f64
-                    } else {
-                        8.0
-                    };
+                    let candle_width =
+                        if this.chart_state.visible_count > 0 && this.last_chart_width > 0.0 {
+                            this.last_chart_width as f64 / this.chart_state.visible_count as f64
+                        } else {
+                            8.0
+                        };
                     let candle_delta = -(delta_x as f64 / candle_width);
                     this.chart_state.scroll_by(candle_delta, total);
                 }
@@ -3390,6 +4041,11 @@ impl Render for ChartPanel {
                         this.mark_dirty();
                         cx.notify();
                     }
+                    "b" => {
+                        this.show_l1 = !this.show_l1;
+                        this.mark_dirty();
+                        cx.notify();
+                    }
                     "l" => {
                         let total = this.feed.len();
                         this.chart_state.scroll_to_latest(total);
@@ -3406,10 +4062,12 @@ impl Render for ChartPanel {
             }))
             .overflow_hidden()
             .child(chart)
+            .child(l1_overlay)
             .child(drawing_overlay)
             .child(legend_ui)
             .child(legend_vol_ui)
             .children(subpane_legends)
+            .children(liquidity_history_note)
             .child(gpui::deferred(settings_panel))
             .child(gpui::deferred(self.render_indicator_library(cx)));
 
@@ -3419,7 +4077,9 @@ impl Render for ChartPanel {
             .bg(cx.theme().colors.background)
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !*hovered {
-                    if this.chart_state.crosshair_pos.is_some() || this.drawing_cursor_point.is_some() {
+                    if this.chart_state.crosshair_pos.is_some()
+                        || this.drawing_cursor_point.is_some()
+                    {
                         this.chart_state.crosshair_pos = None;
                         this.drawing_cursor_point = None;
                         this.hovered_footprint = None;
@@ -3457,9 +4117,7 @@ impl ChartPanel {
         let is_ultra_compact = w < 360.0;
         let is_short = self.pane_height > 0.0 && self.pane_height < 140.0;
         let toolbar_h = if is_short { px(28.0) } else { px(34.0) };
-        let icon = |path: &'static str| {
-            gpui_component::Icon::default().path(path).size(px(15.0))
-        };
+        let icon = |path: &'static str| gpui_component::Icon::default().path(path).size(px(15.0));
         let active_bg = colors.primary.opacity(0.14);
         let active_fg = colors.primary;
 
@@ -3471,7 +4129,10 @@ impl ChartPanel {
                 .tooltip(label)
         };
 
-        let drawing_button = |tool: Option<DrawingTool>, id: &'static str, path: &'static str, label: &'static str| {
+        let drawing_button = |tool: Option<DrawingTool>,
+                              id: &'static str,
+                              path: &'static str,
+                              label: &'static str| {
             let active = self.active_drawing_tool == tool;
             toolbar_button(id, path, label)
                 .selected(active)
@@ -3490,8 +4151,14 @@ impl ChartPanel {
             selected_tool.map(|tool| tool.label()).unwrap_or("Drawings"),
         )
         .selected(selected_tool.is_some())
-        .when(selected_tool.is_some(), |button| button.bg(active_bg).text_color(active_fg))
-        .tooltip(selected_tool.map(|tool| tool.label()).unwrap_or("Drawing tools"))
+        .when(selected_tool.is_some(), |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
+        .tooltip(
+            selected_tool
+                .map(|tool| tool.label())
+                .unwrap_or("Drawing tools"),
+        )
         .dropdown_caret(true)
         .dropdown_menu(move |mut menu, _, _| {
             for tool in std::iter::once(None).chain(DrawingTool::all().into_iter().map(Some)) {
@@ -3516,14 +4183,20 @@ impl ChartPanel {
 
         let separator = || div().w(px(1.0)).h(px(18.0)).bg(colors.border);
 
-        let indicators = toolbar_button("toolbar_btn_indicators", "icons/chart-pie.svg", "Indicators")
-            .selected(self.show_indicator_library)
-            .when(self.show_indicator_library, |button| button.bg(active_bg).text_color(active_fg))
-            .tooltip("Indicators (I)")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.show_indicator_library = !this.show_indicator_library;
-                cx.notify();
-            }));
+        let indicators = toolbar_button(
+            "toolbar_btn_indicators",
+            "icons/chart-pie.svg",
+            "Indicators",
+        )
+        .selected(self.show_indicator_library)
+        .when(self.show_indicator_library, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
+        .tooltip("Indicators (I)")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_indicator_library = !this.show_indicator_library;
+            cx.notify();
+        }));
 
         let candle_label = |kind: CandleType| match kind {
             CandleType::Solid => "Candles",
@@ -3572,15 +4245,21 @@ impl ChartPanel {
             menu
         });
 
-        let orderflow = toolbar_button("toolbar_btn_orderflow", "icons/trending-up.svg", "Order flow")
-            .selected(self.show_delta)
-            .when(self.show_delta, |button| button.bg(active_bg).text_color(active_fg))
-            .tooltip("Delta / CVD order flow")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.show_delta = !this.show_delta;
-                this.mark_dirty();
-                cx.notify();
-            }));
+        let orderflow = toolbar_button(
+            "toolbar_btn_orderflow",
+            "icons/trending-up.svg",
+            "Order flow",
+        )
+        .selected(self.show_delta)
+        .when(self.show_delta, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
+        .tooltip("Delta / CVD order flow")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_delta = !this.show_delta;
+            this.mark_dirty();
+            cx.notify();
+        }));
 
         let profile = toolbar_button(
             "toolbar_btn_profile",
@@ -3588,7 +4267,9 @@ impl ChartPanel {
             "Volume profile",
         )
         .selected(self.show_profile)
-        .when(self.show_profile, |button| button.bg(active_bg).text_color(active_fg))
+        .when(self.show_profile, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
         .tooltip("Volume profile")
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.show_profile = !this.show_profile;
@@ -3600,14 +4281,28 @@ impl ChartPanel {
         let footprint_view = cx.entity().downgrade();
         let footprint_visible = self.show_footprint;
         let footprint_mode_label = Self::footprint_mode_label(self.footprint_settings.mode);
+        let footprint_multiplier = self.footprint_settings.row_multiplier.max(1);
+        let footprint_step = self.footprint_step.get();
+        let footprint_step_hint = if footprint_step.is_finite() && footprint_step > 0.0 {
+            format!(
+                " · row {}",
+                format_price(footprint_step, self.precision.as_ref())
+            )
+        } else {
+            String::new()
+        };
         let footprint = toolbar_button(
             "toolbar_btn_footprint",
             "icons/chart-candlestick.svg",
             "Footprint",
         )
         .selected(self.show_footprint)
-        .when(self.show_footprint, |button| button.bg(active_bg).text_color(active_fg))
-        .tooltip(format!("Footprint: {footprint_mode_label}"))
+        .when(self.show_footprint, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
+        .tooltip(format!(
+            "Footprint: {footprint_mode_label} · {footprint_multiplier}× rows{footprint_step_hint}"
+        ))
         .dropdown_caret(true)
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.toggle_footprint(cx);
@@ -3663,7 +4358,8 @@ impl ChartPanel {
                         let view = view.clone();
                         window.defer(cx, move |window, cx| {
                             let _ = view.update(cx, |this, cx| {
-                                this.footprint_settings.show_poc = !this.footprint_settings.show_poc;
+                                this.footprint_settings.show_poc =
+                                    !this.footprint_settings.show_poc;
                                 this.mark_dirty();
                                 window.focus(&this.focus_handle);
                                 cx.notify();
@@ -3733,6 +4429,25 @@ impl ChartPanel {
                 }),
             );
 
+            for multiplier in [1u32, 2, 4, 8] {
+                let view = footprint_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("Row size {multiplier}×"))
+                        .checked(footprint_settings.row_multiplier == multiplier)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.footprint_settings.row_multiplier = multiplier;
+                                    this.mark_dirty();
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        }),
+                );
+            }
+
             let view = footprint_view.clone();
             menu = menu.item(
                 PopupMenuItem::new("Summary")
@@ -3759,7 +4474,9 @@ impl ChartPanel {
             "Liquidity",
         )
         .selected(self.show_liquidity)
-        .when(self.show_liquidity, |button| button.bg(active_bg).text_color(active_fg))
+        .when(self.show_liquidity, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
         .tooltip("Resting liquidity heatmap")
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.show_liquidity = !this.show_liquidity;
@@ -3767,10 +4484,26 @@ impl ChartPanel {
             cx.notify();
         }));
 
+        let l1_lines = toolbar_button(
+            "toolbar_btn_l1",
+            "icons/chart-candlestick.svg",
+            "L1 bid/ask",
+        )
+        .selected(self.show_l1)
+        .when(self.show_l1, |button| {
+            button.bg(active_bg).text_color(active_fg)
+        })
+        .tooltip("L1 best bid/ask step lines")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.show_l1 = !this.show_l1;
+            this.mark_dirty();
+            cx.notify();
+        }));
+
         let current_hex = self.drawing_color.clone();
         let current_hsv = self.drawing_color_hsv();
-        let parsed_color = Self::parse_hex_color(&current_hex)
-            .unwrap_or(gpui::rgba(0xc4e855ff).into());
+        let parsed_color =
+            Self::parse_hex_color(&current_hex).unwrap_or(gpui::rgba(0xc4e855ff).into());
         let color_view = cx.entity().downgrade();
 
         let color_trigger = Button::new("toolbar_drawing_color")
@@ -3803,12 +4536,30 @@ impl ChartPanel {
                 let square_drag_view = view.clone();
                 let hue_drag_view = view.clone();
                 let palettes: &[(&str, &[&str])] = &[
-                    ("Quick picks", &["#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF"]),
-                    ("Greens", &["#00E676", "#2EBD85", "#C4E855", "#AEEA00", "#76FF03"]),
-                    ("Blues & violet", &["#00F0FF", "#00B0FF", "#2979FF", "#651FFF", "#3D5AFE"]),
-                    ("Warm accents", &["#FFEA00", "#FFD600", "#FF9100", "#FF6D00", "#FF3D00"]),
-                    ("Pink & red", &["#FF0055", "#F6465D", "#FF1744", "#F50057", "#D500F9"]),
-                    ("Neutral", &["#FFFFFF", "#ECEFF1", "#90A4AE", "#546E7A", "#263238"]),
+                    (
+                        "Quick picks",
+                        &["#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF"],
+                    ),
+                    (
+                        "Greens",
+                        &["#00E676", "#2EBD85", "#C4E855", "#AEEA00", "#76FF03"],
+                    ),
+                    (
+                        "Blues & violet",
+                        &["#00F0FF", "#00B0FF", "#2979FF", "#651FFF", "#3D5AFE"],
+                    ),
+                    (
+                        "Warm accents",
+                        &["#FFEA00", "#FFD600", "#FF9100", "#FF6D00", "#FF3D00"],
+                    ),
+                    (
+                        "Pink & red",
+                        &["#FF0055", "#F6465D", "#FF1744", "#F50057", "#D500F9"],
+                    ),
+                    (
+                        "Neutral",
+                        &["#FFFFFF", "#ECEFF1", "#90A4AE", "#546E7A", "#263238"],
+                    ),
                 ];
 
                 div()
@@ -3904,7 +4655,10 @@ impl ChartPanel {
                                     cx.stop_propagation();
                                     let _ = view.update(cx, |this, cx| {
                                         this.color_picker_drag = Some(ColorPickerDrag::Square);
-                                        this.update_color_picker(event.position, ColorPickerDrag::Square);
+                                        this.update_color_picker(
+                                            event.position,
+                                            ColorPickerDrag::Square,
+                                        );
                                         cx.notify();
                                     });
                                 }
@@ -3915,7 +4669,10 @@ impl ChartPanel {
                                     let _ = view.update(cx, |this, cx| {
                                         if this.color_picker_drag == Some(ColorPickerDrag::Square) {
                                             cx.stop_propagation();
-                                            this.update_color_picker(event.position, ColorPickerDrag::Square);
+                                            this.update_color_picker(
+                                                event.position,
+                                                ColorPickerDrag::Square,
+                                            );
                                             cx.notify();
                                         }
                                     });
@@ -3945,13 +4702,26 @@ impl ChartPanel {
                                         const ROWS: usize = 26;
                                         for row in 0..ROWS {
                                             for column in 0..COLUMNS {
-                                                let saturation = column as f32 / (COLUMNS - 1) as f32;
+                                                let saturation =
+                                                    column as f32 / (COLUMNS - 1) as f32;
                                                 let value = 1.0 - row as f32 / (ROWS - 1) as f32;
-                                                let color = ChartPanel::hsv_color(selected_hue, saturation, value);
-                                                let x0 = bounds.origin.x + bounds.size.width * (column as f32 / COLUMNS as f32);
-                                                let y0 = bounds.origin.y + bounds.size.height * (row as f32 / ROWS as f32);
-                                                let x1 = bounds.origin.x + bounds.size.width * ((column + 1) as f32 / COLUMNS as f32);
-                                                let y1 = bounds.origin.y + bounds.size.height * ((row + 1) as f32 / ROWS as f32);
+                                                let color = ChartPanel::hsv_color(
+                                                    selected_hue,
+                                                    saturation,
+                                                    value,
+                                                );
+                                                let x0 = bounds.origin.x
+                                                    + bounds.size.width
+                                                        * (column as f32 / COLUMNS as f32);
+                                                let y0 = bounds.origin.y
+                                                    + bounds.size.height
+                                                        * (row as f32 / ROWS as f32);
+                                                let x1 = bounds.origin.x
+                                                    + bounds.size.width
+                                                        * ((column + 1) as f32 / COLUMNS as f32);
+                                                let y1 = bounds.origin.y
+                                                    + bounds.size.height
+                                                        * ((row + 1) as f32 / ROWS as f32);
                                                 window.paint_quad(gpui::fill(
                                                     gpui::Bounds::from_corners(
                                                         gpui::point(x0, y0),
@@ -3996,7 +4766,10 @@ impl ChartPanel {
                                     cx.stop_propagation();
                                     let _ = view.update(cx, |this, cx| {
                                         this.color_picker_drag = Some(ColorPickerDrag::Hue);
-                                        this.update_color_picker(event.position, ColorPickerDrag::Hue);
+                                        this.update_color_picker(
+                                            event.position,
+                                            ColorPickerDrag::Hue,
+                                        );
                                         cx.notify();
                                     });
                                 }
@@ -4007,7 +4780,10 @@ impl ChartPanel {
                                     let _ = view.update(cx, |this, cx| {
                                         if this.color_picker_drag == Some(ColorPickerDrag::Hue) {
                                             cx.stop_propagation();
-                                            this.update_color_picker(event.position, ColorPickerDrag::Hue);
+                                            this.update_color_picker(
+                                                event.position,
+                                                ColorPickerDrag::Hue,
+                                            );
                                             cx.notify();
                                         }
                                     });
@@ -4037,11 +4813,16 @@ impl ChartPanel {
                                         for step in 0..STEPS {
                                             let hue = step as f32 / STEPS as f32;
                                             let x0 = bounds.origin.x + bounds.size.width * hue;
-                                            let x1 = bounds.origin.x + bounds.size.width * ((step + 1) as f32 / STEPS as f32);
+                                            let x1 = bounds.origin.x
+                                                + bounds.size.width
+                                                    * ((step + 1) as f32 / STEPS as f32);
                                             window.paint_quad(gpui::fill(
                                                 gpui::Bounds::from_corners(
                                                     gpui::point(x0, bounds.origin.y),
-                                                    gpui::point(x1, bounds.origin.y + bounds.size.height),
+                                                    gpui::point(
+                                                        x1,
+                                                        bounds.origin.y + bounds.size.height,
+                                                    ),
                                                 ),
                                                 ChartPanel::hsv_color(hue, 1.0, 1.0),
                                             ));
@@ -4135,7 +4916,9 @@ impl ChartPanel {
 
         let snap = toolbar_button("toolbar_snap", "icons/magnet.svg", "Snap")
             .selected(self.snap_to_candle)
-            .when(self.snap_to_candle, |button| button.bg(active_bg).text_color(active_fg))
+            .when(self.snap_to_candle, |button| {
+                button.bg(active_bg).text_color(active_fg)
+            })
             .tooltip("Snap drawings to candles")
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.snap_to_candle = !this.snap_to_candle;
@@ -4152,7 +4935,11 @@ impl ChartPanel {
 
         let grid = toolbar_button("toolbar_grid", "icons/crosshair.svg", "Grid")
             .selected(self.show_horizontal_grid)
-            .when(self.show_horizontal_grid, |button| button.bg(colors.muted.opacity(0.3)).text_color(colors.foreground))
+            .when(self.show_horizontal_grid, |button| {
+                button
+                    .bg(colors.muted.opacity(0.3))
+                    .text_color(colors.foreground)
+            })
             .tooltip("Horizontal grid (G)")
             .on_click(cx.listener(|this, _event, _window, cx| {
                 this.show_horizontal_grid = !this.show_horizontal_grid;
@@ -4199,27 +4986,76 @@ impl ChartPanel {
                     .child(profile)
                     .child(footprint)
                     .child(liquidity)
+                    .child(l1_lines)
                     .when(!is_ultra_compact, |this| this.child(separator()))
-                    .child(drawing_button(None, "toolbar_pointer", "icons/mouse-pointer.svg", "Pointer"))
+                    .child(drawing_button(
+                        None,
+                        "toolbar_pointer",
+                        "icons/mouse-pointer.svg",
+                        "Pointer",
+                    ))
                     .when(!is_ultra_compact, |this| {
-                        this.child(drawing_button(Some(DrawingTool::Trendline), "toolbar_trendline", "icons/trending-up.svg", "Trend"))
+                        this.child(drawing_button(
+                            Some(DrawingTool::Trendline),
+                            "toolbar_trendline",
+                            "icons/trending-up.svg",
+                            "Trend",
+                        ))
                     })
                     .when(is_wide || is_medium, |this| {
-                        this.child(drawing_button(Some(DrawingTool::HorizontalLine), "toolbar_horizontal", "icons/minus.svg", "Horizontal"))
+                        this.child(drawing_button(
+                            Some(DrawingTool::HorizontalLine),
+                            "toolbar_horizontal",
+                            "icons/minus.svg",
+                            "Horizontal",
+                        ))
                     })
                     .when(is_wide, |this| {
-                        this.child(drawing_button(Some(DrawingTool::VerticalLine), "toolbar_vertical", "icons/arrow-up.svg", "Vertical"))
-                            .child(drawing_button(Some(DrawingTool::Ray), "toolbar_ray", "icons/arrow-right.svg", "Ray"))
-                            .child(drawing_button(Some(DrawingTool::Fibonacci), "toolbar_fibonacci", "icons/sort-ascending.svg", "Fib"))
-                            .child(drawing_button(Some(DrawingTool::PriceChannel), "toolbar_channel", "icons/frame.svg", "Channel"))
-                            .child(drawing_button(Some(DrawingTool::Text), "toolbar_text", "icons/a-large-small.svg", "Text"))
+                        this.child(drawing_button(
+                            Some(DrawingTool::VerticalLine),
+                            "toolbar_vertical",
+                            "icons/arrow-up.svg",
+                            "Vertical",
+                        ))
+                        .child(drawing_button(
+                            Some(DrawingTool::Ray),
+                            "toolbar_ray",
+                            "icons/arrow-right.svg",
+                            "Ray",
+                        ))
+                        .child(drawing_button(
+                            Some(DrawingTool::Fibonacci),
+                            "toolbar_fibonacci",
+                            "icons/sort-ascending.svg",
+                            "Fib",
+                        ))
+                        .child(drawing_button(
+                            Some(DrawingTool::PriceChannel),
+                            "toolbar_channel",
+                            "icons/frame.svg",
+                            "Channel",
+                        ))
+                        .child(drawing_button(
+                            Some(DrawingTool::Text),
+                            "toolbar_text",
+                            "icons/a-large-small.svg",
+                            "Text",
+                        ))
                     })
-                    .when(!is_wide, |this| {
-                        this.child(more_drawings)
-                    })
+                    .when(!is_wide, |this| this.child(more_drawings))
                     .when(is_wide || is_medium, |this| {
-                        this.child(drawing_button(Some(DrawingTool::LongPosition), "toolbar_long", "icons/arrow-up.svg", "Long"))
-                            .child(drawing_button(Some(DrawingTool::ShortPosition), "toolbar_short", "icons/arrow-down.svg", "Short"))
+                        this.child(drawing_button(
+                            Some(DrawingTool::LongPosition),
+                            "toolbar_long",
+                            "icons/arrow-up.svg",
+                            "Long",
+                        ))
+                        .child(drawing_button(
+                            Some(DrawingTool::ShortPosition),
+                            "toolbar_short",
+                            "icons/arrow-down.svg",
+                            "Short",
+                        ))
                     })
                     .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(color_picker)
@@ -4692,6 +5528,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn liquidity_cell_end_is_capped_at_five_seconds() {
+        // The last history sample must not smear across a long gap (for
+        // example the 1h lag seam) to the next live sample.
+        let (start, end) = liquidity_cell_bounds(1_000, Some(61_000), 0, 100_000);
+        assert_eq!(start, 1_000);
+        assert_eq!(end, 6_000);
+    }
+
+    #[test]
+    fn l1_step_breaks_only_after_five_seconds() {
+        assert!(!l1_step_break(None, 1_000));
+        assert!(!l1_step_break(Some(1_000), 6_000));
+        assert!(l1_step_break(Some(1_000), 6_001));
+        // The 1h history/live seam always breaks.
+        assert!(l1_step_break(Some(1_000_000), 4_600_000));
+    }
+
+    #[test]
+    fn carried_pre_window_sample_seeds_the_left_edge() {
+        let samples: Vec<LiquiditySample> = [9_000, 11_000, 12_000]
+            .into_iter()
+            .map(|timestamp_ms| LiquiditySample {
+                timestamp_ms,
+                ..LiquiditySample::default()
+            })
+            .collect();
+        // `visible_sample_range` still starts at the first in-window sample...
+        assert_eq!(visible_sample_range(&samples, 10_000, 20_000), 1..3);
+        // ...while the drawing window includes one carried sample.
+        assert_eq!(liquidity_window_range(&samples, 10_000, 20_000), 0..3);
+
+        let (start, end) = liquidity_cell_bounds(
+            samples[0].timestamp_ms,
+            Some(samples[1].timestamp_ms),
+            10_000,
+            20_000,
+        );
+        assert_eq!(start, 10_000);
+        // The carried sample paints up to the next sample (1s), not further.
+        assert_eq!(end, 11_000);
+    }
+
+    #[test]
     fn format_time_works() {
         let ts = 12 * 3600 * 1000 + 30 * 60 * 1000;
         assert_eq!(ChartPanel::format_time(ts), "12:30");
@@ -4721,8 +5600,14 @@ mod tests {
     #[test]
     fn drawing_instance_creation() {
         let mut d = DrawingInstance::new("test-1", DrawingTool::Trendline);
-        d.points.push(DrawingPoint { timestamp: 100, price: 50.0 });
-        d.points.push(DrawingPoint { timestamp: 200, price: 60.0 });
+        d.points.push(DrawingPoint {
+            timestamp: 100,
+            price: 50.0,
+        });
+        d.points.push(DrawingPoint {
+            timestamp: 200,
+            price: 60.0,
+        });
         assert_eq!(d.points.len(), 2);
     }
 
@@ -4767,8 +5652,8 @@ mod tests {
     #[test]
     fn test_color_picker_hex_parsing() {
         let colors = [
-            "#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF",
-            "#00E676", "#2EBD85", "#2979FF", "#FF3D00", "#ECEFF1",
+            "#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF", "#00E676", "#2EBD85", "#2979FF",
+            "#FF3D00", "#ECEFF1",
         ];
         for hex in colors {
             assert!(ChartPanel::parse_hex_color(hex).is_some());

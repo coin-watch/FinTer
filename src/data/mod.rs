@@ -3,6 +3,7 @@ pub mod alerts;
 pub mod api_management;
 pub mod app_icon;
 pub mod auth;
+pub mod book_history;
 pub mod bridge;
 pub mod candle_feed;
 pub mod client;
