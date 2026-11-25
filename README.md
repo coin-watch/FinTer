@@ -117,6 +117,7 @@ A locally configured endpoint is preserved across restarts and is not cleared by
 | `FINTER_CAP_WS_URL` | Market-cap WebSocket; defaults to `wss://<api-origin>/ws/market-caps`. |
 | `FINTER_VERSION_URL` | HTTPS update metadata; unset disables update checks. CI sets it per channel, and users can switch channels in Settings → Updates. |
 | `FINTER_BUILD_ID` | Build identifier used to detect same-version channel updates. |
+| `FINTER_CHART_V2` | Set (any value) to render the experimental scene-based chart engine. Unset by default; the legacy renderer keeps drawings, alerts, footprint and L1/L2 overlays. |
 
 <details>
 <summary><strong>Authentication, storage &amp; data separation</strong></summary>

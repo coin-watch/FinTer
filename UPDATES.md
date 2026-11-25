@@ -17,6 +17,10 @@ The footprint, Delta/CVD, volume profile, and liquidity overlays were tightened 
 
 Order flow remains **live-session only**. Historical candles do not fabricate footprint rows; the chart shows an `Order flow: live session` note when the viewport extends before the first order-flow bar. Rendering changes are documented in `gpui-component-patched/FINTER-PATCHES.md`. No update/checksum behavior changed.
 
+## Chart core (experimental, opt-in)
+
+A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, footprint hover/pin, history paging and the L1/L2/liquidity-history overlays. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.
+
 ## Release workflow
 
 The included GitHub Actions workflow builds and tests platform binaries. On pushes to `alpha`, `beta`, or matching version tags (`v*`), it runs the `release` job to publish verified binaries to public Backblaze B2 using `scripts/publish_updates.py`.
