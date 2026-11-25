@@ -115,6 +115,18 @@ pub struct ChartLayout {
     /// Show L1 best bid/ask step lines.
     #[serde(default)]
     pub show_l1: bool,
+    /// Mark bars whose heavy aggressive volume failed to move price.
+    #[serde(default)]
+    pub show_absorption: bool,
+    /// Draw price/CVD swing divergences.
+    #[serde(default)]
+    pub show_divergence: bool,
+    /// Outline runs of stacked footprint imbalances.
+    #[serde(default)]
+    pub show_imbalance_stacks: bool,
+    /// Show the rising/falling/flat CVD regime badge in the order-flow legend.
+    #[serde(default)]
+    pub show_cvd_regime: bool,
     /// Price scale mode: `linear`, `log`, `percent`, or `inverted`.
     #[serde(default = "default_price_scale_mode")]
     pub price_scale_mode: String,
@@ -158,6 +170,10 @@ impl ChartLayout {
             footprint: FootprintSettings::default(),
             show_liquidity: false,
             show_l1: false,
+            show_absorption: false,
+            show_divergence: false,
+            show_imbalance_stacks: false,
+            show_cvd_regime: false,
             price_scale_mode: default_price_scale_mode(),
             manual_price_range: None,
             percent_anchor: None,
@@ -466,6 +482,40 @@ mod tests {
         let encoded = serde_json::to_vec(&layout).unwrap();
         let decoded: ChartLayout = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.show_l1);
+    }
+
+    #[test]
+    fn chart_layout_analytics_defaults_off_and_round_trip() {
+        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
+        let mut value = serde_json::to_value(&layout).unwrap();
+        // Layouts written before the order-flow analytics existed must load.
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "show_absorption",
+            "show_divergence",
+            "show_imbalance_stacks",
+            "show_cvd_regime",
+        ] {
+            object.remove(field);
+        }
+        let decoded: ChartLayout = serde_json::from_value(value).unwrap();
+        assert!(!decoded.show_absorption);
+        assert!(!decoded.show_divergence);
+        assert!(!decoded.show_imbalance_stacks);
+        assert!(!decoded.show_cvd_regime);
+        // The schema does not change for additive toggles.
+        assert_eq!(decoded.schema_version, 2);
+
+        layout.show_absorption = true;
+        layout.show_divergence = true;
+        layout.show_imbalance_stacks = true;
+        layout.show_cvd_regime = true;
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        let decoded: ChartLayout = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.show_absorption);
+        assert!(decoded.show_divergence);
+        assert!(decoded.show_imbalance_stacks);
+        assert!(decoded.show_cvd_regime);
     }
 
     #[test]

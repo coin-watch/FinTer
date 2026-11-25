@@ -68,7 +68,9 @@ use crate::chart::model::{
     IndicatorKind, WindowGeometry,
 };
 use crate::chart::orderflow::{
-    build_visible_profile, profile_window_overlaps, visible_bar_range, visible_sample_range,
+    AbsorptionDirection, AbsorptionMarker, CvdRegime, CvdSeries, Divergence, DivergenceKind,
+    ImbalanceStack, build_cvd_series, build_visible_profile, detect_absorption, detect_divergences,
+    detect_stacked_imbalances, profile_window_overlaps, visible_bar_range, visible_sample_range,
 };
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
@@ -131,6 +133,33 @@ struct FootprintFocus {
     timestamp: i64,
     price: f64,
 }
+
+/// Derived order-flow analytics, computed once per flow version and kept in an
+/// `Arc` so the per-frame overlay only bumps a refcount.
+#[derive(Clone, Debug, Default)]
+struct OrderFlowAnalytics {
+    absorption: Vec<AbsorptionMarker>,
+    divergences: Vec<Divergence>,
+    stacks: Vec<ImbalanceStack>,
+    cvd: CvdSeries,
+    /// Flow feed version that produced this cache.
+    flow_version: u64,
+    /// Row settings that shaped the imbalance stacks.
+    settings_key: u64,
+}
+
+/// Bars used by the windowed analytics (absorption distribution, divergence
+/// swings, CVD slope). The snapshot is a live session, so this is a relevance
+/// window rather than a hard data limit.
+const ANALYTICS_LOOKBACK_BARS: usize = 240;
+/// Minimum consecutive imbalanced rows before a run is a stack.
+const ANALYTICS_MIN_STACK: usize = 3;
+/// Row cap for the analytics-only footprint grid, matching the visible grid.
+const ANALYTICS_MAX_ROWS: usize = 96;
+/// Normalised CVD slope below which the regime is flat.
+const CVD_FLAT_THRESHOLD: f64 = 0.05;
+/// At most this many divergence labels are painted to keep the overlay cheap.
+const MAX_DIVERGENCE_LABELS: usize = 6;
 
 /// Callback that fetches one `(since, until)` book window and reports the
 /// outcome so the chart can surface queued/auth/credit states.
@@ -212,6 +241,16 @@ pub struct ChartPanel {
     show_liquidity: bool,
     /// Show L1 best bid/ask step lines.
     show_l1: bool,
+    /// Marker heavy aggressive volume absorbed without price progress.
+    show_absorption: bool,
+    /// Draw price/CVD swing divergences.
+    show_divergence: bool,
+    /// Outline stacked footprint imbalances.
+    show_imbalance_stacks: bool,
+    /// Show the CVD regime badge in the order-flow legend.
+    show_cvd_regime: bool,
+    /// Cached pure analytics keyed by flow version and row settings.
+    orderflow_analytics: Option<Arc<OrderFlowAnalytics>>,
     /// In-flight historical book request.
     liquidity_history_completion: Option<std::sync::mpsc::Receiver<LiquidityHistoryOutcome>>,
     liquidity_history_loading: bool,
@@ -717,6 +756,11 @@ impl ChartPanel {
             footprint_step: Cell::new(0.0),
             show_liquidity: false,
             show_l1: false,
+            show_absorption: false,
+            show_divergence: false,
+            show_imbalance_stacks: false,
+            show_cvd_regime: false,
+            orderflow_analytics: None,
             liquidity_history_completion: None,
             liquidity_history_loading: false,
             liquidity_history_next_at: None,
@@ -794,7 +838,7 @@ impl ChartPanel {
                         let current = version.load(std::sync::atomic::Ordering::Relaxed);
                         if current != last {
                             last = current;
-                            if panel.show_delta || panel.show_profile || panel.show_footprint {
+                            if panel.orderflow_visible() {
                                 cx.notify();
                             }
                         }
@@ -841,11 +885,79 @@ impl ChartPanel {
         .detach();
     }
 
+    /// True when any order-flow layer needs the flow snapshot.
+    fn orderflow_visible(&self) -> bool {
+        self.show_delta
+            || self.show_profile
+            || self.show_footprint
+            || self.show_absorption
+            || self.show_divergence
+            || self.show_imbalance_stacks
+            || self.show_cvd_regime
+    }
+
     /// Toggle footprint mode and zoom in to a readable density on first open.
     fn toggle_footprint(&mut self, cx: &mut Context<Self>) {
         self.show_footprint = !self.show_footprint;
         if self.show_footprint {
             self.ensure_footprint_density();
+        }
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Single mutation path for the Delta + CVD pane toggle.
+    fn toggle_delta(&mut self, cx: &mut Context<Self>) {
+        self.show_delta = !self.show_delta;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Single mutation path for the volume-profile toggle.
+    fn toggle_profile(&mut self, cx: &mut Context<Self>) {
+        self.show_profile = !self.show_profile;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Single mutation path for the liquidity heatmap toggle.
+    fn toggle_liquidity(&mut self, cx: &mut Context<Self>) {
+        self.show_liquidity = !self.show_liquidity;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// Single mutation path for the L1 best bid/ask toggle.
+    fn toggle_l1(&mut self, cx: &mut Context<Self>) {
+        self.show_l1 = !self.show_l1;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    fn toggle_absorption(&mut self, cx: &mut Context<Self>) {
+        self.show_absorption = !self.show_absorption;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    fn toggle_divergence(&mut self, cx: &mut Context<Self>) {
+        self.show_divergence = !self.show_divergence;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    fn toggle_imbalance_stacks(&mut self, cx: &mut Context<Self>) {
+        self.show_imbalance_stacks = !self.show_imbalance_stacks;
+        self.mark_dirty();
+        cx.notify();
+    }
+
+    /// The badge lives in the delta/CVD legend, so enabling it also opens that
+    /// pane instead of leaving the user with no feedback.
+    fn toggle_cvd_regime(&mut self, cx: &mut Context<Self>) {
+        self.show_cvd_regime = !self.show_cvd_regime;
+        if self.show_cvd_regime && !self.show_delta {
+            self.show_delta = true;
         }
         self.mark_dirty();
         cx.notify();
@@ -875,7 +987,7 @@ impl ChartPanel {
     /// `render()` holds a reference to the cached copy instead of cloning the
     /// whole bar/row ladder every frame.
     fn refresh_orderflow_cache(&mut self) {
-        let needed = self.show_delta || self.show_profile || self.show_footprint;
+        let needed = self.orderflow_visible();
         let Some(feed) = self.orderflow_feed.as_ref() else {
             self.orderflow_cache = None;
             self.orderflow_cache_version = u64::MAX;
@@ -892,6 +1004,101 @@ impl ChartPanel {
             self.orderflow_cache = Some(snapshot);
             self.orderflow_cache_version = version;
         }
+    }
+
+    /// Settings that change how imbalance stacks are bucketed.
+    fn analytics_settings_key(&self) -> u64 {
+        u64::from(self.footprint_settings.row_multiplier)
+            ^ self
+                .footprint_settings
+                .imbalance_ratio
+                .to_bits()
+                .rotate_left(32)
+    }
+
+    /// Derive absorption, divergence, imbalance stacks and the CVD regime from
+    /// the cached snapshot. Pure analytics run once per flow version (or when
+    /// the row settings change), never per frame.
+    fn refresh_orderflow_analytics(&mut self) {
+        let needed = self.show_absorption
+            || self.show_divergence
+            || self.show_imbalance_stacks
+            || self.show_cvd_regime;
+        if !needed {
+            self.orderflow_analytics = None;
+            return;
+        }
+        let Some(snapshot) = self.orderflow_cache.as_ref() else {
+            self.orderflow_analytics = None;
+            return;
+        };
+        let version = self.orderflow_cache_version;
+        let settings_key = self.analytics_settings_key();
+        if self.orderflow_analytics.as_ref().is_some_and(|cache| {
+            cache.flow_version == version && cache.settings_key == settings_key
+        }) {
+            return;
+        }
+
+        // Window the signals to the recent session so a long retained tape does
+        // not drown the current distribution. Rowless bars are skipped inside
+        // the pure detectors, so no synthetic level can enter a signal.
+        let start = snapshot.bars.len().saturating_sub(ANALYTICS_LOOKBACK_BARS);
+        let bars = &snapshot.bars[start..];
+
+        let absorption = if self.show_absorption {
+            detect_absorption(bars)
+        } else {
+            Vec::new()
+        };
+        let divergences = if self.show_divergence {
+            detect_divergences(bars, &snapshot.cvd, ANALYTICS_LOOKBACK_BARS)
+        } else {
+            Vec::new()
+        };
+        let cvd = if self.show_cvd_regime {
+            build_cvd_series(&snapshot.cvd, ANALYTICS_LOOKBACK_BARS, CVD_FLAT_THRESHOLD)
+        } else {
+            CvdSeries::default()
+        };
+        let stacks = if self.show_imbalance_stacks && !bars.is_empty() {
+            let timestamps: HashSet<i64> = bars
+                .iter()
+                .filter(|bar| !bar.price_rows.is_empty())
+                .map(|bar| bar.timestamp)
+                .collect();
+            let (price_min, price_max) = flow_price_span(bars).unwrap_or((0.0, 0.0));
+            let grid = build_footprint_grid(&FootprintBuildInput {
+                bars,
+                timestamps: &timestamps,
+                price_min,
+                price_max,
+                max_rows: ANALYTICS_MAX_ROWS,
+                tick_size: self
+                    .precision
+                    .as_ref()
+                    .and_then(|precision| precision.tick_size),
+                row_multiplier: self.footprint_settings.row_multiplier,
+                show_value_area: false,
+                show_imbalance: true,
+                imbalance_ratio: self.footprint_settings.imbalance_ratio,
+            });
+            grid.bars
+                .iter()
+                .flat_map(|bar| detect_stacked_imbalances(bar, ANALYTICS_MIN_STACK))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        self.orderflow_analytics = Some(Arc::new(OrderFlowAnalytics {
+            absorption,
+            divergences,
+            stacks,
+            cvd,
+            flow_version: version,
+            settings_key,
+        }));
     }
 
     /// Refresh the book-history snapshot only on version changes, and only when
@@ -1095,12 +1302,10 @@ impl ChartPanel {
         Self::schedule_liquidity_wake(cx, 400);
     }
 
+    /// Changes the footprint display mode. Visibility has its own toggle, so
+    /// choosing a mode here does not silently force the footprint open.
     fn set_footprint_mode(&mut self, mode: FootprintMode, cx: &mut Context<Self>) {
         self.footprint_settings.mode = mode;
-        if !self.show_footprint {
-            self.show_footprint = true;
-            self.ensure_footprint_density();
-        }
         self.mark_dirty();
         cx.notify();
     }
@@ -1232,6 +1437,14 @@ impl ChartPanel {
         self.footprint_settings = layout.footprint;
         self.show_liquidity = layout.show_liquidity;
         self.show_l1 = layout.show_l1;
+        self.show_absorption = layout.show_absorption;
+        self.show_divergence = layout.show_divergence;
+        self.show_imbalance_stacks = layout.show_imbalance_stacks;
+        self.show_cvd_regime = layout.show_cvd_regime;
+        if self.show_cvd_regime {
+            // The badge lives in the Delta/CVD legend.
+            self.show_delta = true;
+        }
         if self.show_footprint {
             self.ensure_footprint_density();
         }
@@ -1265,6 +1478,10 @@ impl ChartPanel {
         layout.footprint = self.footprint_settings.clone();
         layout.show_liquidity = self.show_liquidity;
         layout.show_l1 = self.show_l1;
+        layout.show_absorption = self.show_absorption;
+        layout.show_divergence = self.show_divergence;
+        layout.show_imbalance_stacks = self.show_imbalance_stacks;
+        layout.show_cvd_regime = self.show_cvd_regime;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
@@ -2131,6 +2348,7 @@ impl Render for ChartPanel {
         // Refresh only on feed version changes; the cached copies are reused for
         // footprint, profile, delta/CVD, liquidity, and hover hit-testing.
         self.refresh_orderflow_cache();
+        self.refresh_orderflow_analytics();
         self.refresh_liquidity_cache();
         let metrics = self.chart_metrics();
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
@@ -2895,6 +3113,9 @@ impl Render for ChartPanel {
                 }
                 let partial = orderflow_snapshot.is_some_and(|snapshot| snapshot.partial);
                 let first_pane = by_pane.keys().next().copied();
+                let has_cvd_pane = orderflow_lines
+                    .iter()
+                    .any(|line| line.instance_id == "orderflow-cvd");
                 for (idx, pane_lines) in by_pane {
                     let title_color = pane_lines
                         .first()
@@ -2906,6 +3127,9 @@ impl Render for ChartPanel {
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("ORDER FLOW"),
                     );
+                    let is_cvd_pane = pane_lines
+                        .iter()
+                        .any(|line| line.instance_id == "orderflow-cvd");
                     for line in pane_lines {
                         let val = match line
                             .series
@@ -2937,6 +3161,29 @@ impl Render for ChartPanel {
                                 .text_color(cx.theme().colors.warning)
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("PARTIAL"),
+                        );
+                    }
+                    if self.show_cvd_regime
+                        && (is_cvd_pane || (!has_cvd_pane && Some(idx) == first_pane))
+                    {
+                        let regime = self
+                            .orderflow_analytics
+                            .as_ref()
+                            .map(|analytics| analytics.cvd.regime)
+                            .unwrap_or(CvdRegime::Flat);
+                        let (label, color) = match regime {
+                            CvdRegime::Rising => ("CVD RISING", cx.theme().colors.bullish),
+                            CvdRegime::Falling => ("CVD FALLING", cx.theme().colors.bearish),
+                            CvdRegime::Flat => ("CVD FLAT", cx.theme().colors.muted_foreground),
+                        };
+                        row = row.child(
+                            div()
+                                .px(px(4.0))
+                                .rounded(px(3.0))
+                                .bg(color.opacity(0.12))
+                                .text_color(color)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(label),
                         );
                     }
                     let mut y0 = candle_h + 2.0;
@@ -3737,6 +3984,218 @@ impl Render for ChartPanel {
             ))
         };
 
+        // Pure order-flow analytics. Like the L1 overlay this is a sibling
+        // canvas bound to the plot origin/scale the chart reports, so the
+        // vendored chart crate stays untouched.
+        let analytics_overlay = {
+            let show = self.show_absorption || self.show_divergence || self.show_imbalance_stacks;
+            let analytics = self.orderflow_analytics.clone();
+            let chart_st = self.chart_state.clone();
+            let bullish = cx.theme().bullish;
+            let bearish = cx.theme().bearish;
+
+            div().absolute().size_full().child(gpui::canvas(
+                move |_, _, _| {},
+                move |_, _, window, _cx| {
+                    if !show {
+                        return;
+                    }
+                    let Some(analytics) = analytics.as_ref() else {
+                        return;
+                    };
+                    let (Some((ts_min, ts_max)), Some((p_min, p_max)), Some(origin), Some(size)) = (
+                        chart_st.candle_ts_range.get(),
+                        chart_st.candle_price_range.get(),
+                        chart_st.candle_plot_origin.get(),
+                        chart_st.candle_plot_size.get(),
+                    ) else {
+                        return;
+                    };
+                    if ts_max <= ts_min || p_max <= p_min || size.0 <= 0.0 || size.1 <= 0.0 {
+                        return;
+                    }
+                    let right = origin.0 + size.0;
+                    let bottom = origin.1 + size.1;
+                    let x_for = |ts: i64| {
+                        chart_st
+                            .ts_to_x(ts as f64)
+                            .filter(|x| *x >= origin.0 && *x <= right)
+                    };
+                    let y_for = |price: f64| {
+                        chart_st
+                            .price_to_y(price)
+                            .filter(|y| *y >= origin.1 && *y <= bottom)
+                    };
+                    let visible = |ts: i64| ts as f64 >= ts_min && ts as f64 <= ts_max;
+
+                    // Absorption: a small diamond on the absorbing bar, coloured
+                    // by the side that absorbed the aggression.
+                    for marker in &analytics.absorption {
+                        if !visible(marker.timestamp) {
+                            continue;
+                        }
+                        let (Some(x), Some(y)) = (x_for(marker.timestamp), y_for(marker.price))
+                        else {
+                            continue;
+                        };
+                        let radius = 2.5 + 2.5 * marker.strength.clamp(0.0, 1.0) as f32;
+                        let color = match marker.direction {
+                            AbsorptionDirection::Selling => bearish,
+                            AbsorptionDirection::Buying => bullish,
+                        };
+                        let mut diamond = PathBuilder::fill();
+                        diamond.add_polygon(
+                            &[
+                                gpui::point(px(x), px(y - radius)),
+                                gpui::point(px(x + radius), px(y)),
+                                gpui::point(px(x), px(y + radius)),
+                                gpui::point(px(x - radius), px(y)),
+                            ],
+                            true,
+                        );
+                        if let Ok(path) = diamond.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+
+                    // Divergence: dashed line between the two swing points.
+                    for divergence in &analytics.divergences {
+                        if !visible(divergence.first_timestamp)
+                            || !visible(divergence.second_timestamp)
+                        {
+                            continue;
+                        }
+                        let (Some(x0), Some(y0)) = (
+                            x_for(divergence.first_timestamp),
+                            y_for(divergence.first_price),
+                        ) else {
+                            continue;
+                        };
+                        let (Some(x1), Some(y1)) = (
+                            x_for(divergence.second_timestamp),
+                            y_for(divergence.second_price),
+                        ) else {
+                            continue;
+                        };
+                        let color = match divergence.kind {
+                            DivergenceKind::Bearish => bearish,
+                            DivergenceKind::Bullish => bullish,
+                        };
+                        let mut line =
+                            PathBuilder::stroke(px(1.25)).dash_array(&[px(4.0), px(2.0)]);
+                        line.move_to(gpui::point(px(x0), px(y0)));
+                        line.line_to(gpui::point(px(x1), px(y1)));
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+
+                    // Imbalance stacks: outline the stacked price range at the
+                    // bar's x position.
+                    for stack in &analytics.stacks {
+                        if !visible(stack.timestamp) {
+                            continue;
+                        }
+                        if stack.price_high < p_min || stack.price_low > p_max {
+                            continue;
+                        }
+                        let (Some(x), Some(mut y_low), Some(mut y_high)) = (
+                            x_for(stack.timestamp),
+                            chart_st.price_to_y(stack.price_low),
+                            chart_st.price_to_y(stack.price_high),
+                        ) else {
+                            continue;
+                        };
+                        if y_low > y_high {
+                            std::mem::swap(&mut y_low, &mut y_high);
+                        }
+                        y_low = y_low.clamp(origin.1, bottom);
+                        y_high = y_high.clamp(origin.1, bottom);
+                        let left = (x - 3.0).clamp(origin.0, right);
+                        let box_right = (x + 3.0).clamp(origin.0, right);
+                        let color = match stack.side {
+                            crate::chart::orderflow::ImbalanceSide::Buy => bullish,
+                            crate::chart::orderflow::ImbalanceSide::Sell => bearish,
+                        };
+                        let bounds = gpui::Bounds::from_corners(
+                            gpui::point(px(left), px(y_low)),
+                            gpui::point(px(box_right), px(y_high)),
+                        );
+                        window.paint_quad(gpui::fill(bounds, color.opacity(0.12)));
+                        let mut outline = PathBuilder::stroke(px(1.0));
+                        outline.add_polygon(
+                            &[
+                                gpui::point(px(left), px(y_low)),
+                                gpui::point(px(box_right), px(y_low)),
+                                gpui::point(px(box_right), px(y_high)),
+                                gpui::point(px(left), px(y_high)),
+                            ],
+                            true,
+                        );
+                        if let Ok(path) = outline.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+                },
+            ))
+        };
+
+        // Divergence labels are DOM text rather than canvas text so they pick
+        // up the theme font. Capped to the newest few to keep the overlay light.
+        let analytics_labels: AnyElement = if self.show_divergence {
+            let mut labels: Vec<AnyElement> = Vec::new();
+            if let Some(analytics) = self.orderflow_analytics.as_deref() {
+                let ts_range = self.chart_state.candle_ts_range.get();
+                let price_range = self.chart_state.candle_price_range.get();
+                if let (Some((ts_min, ts_max)), Some((p_min, p_max))) = (ts_range, price_range) {
+                    for divergence in analytics.divergences.iter().rev() {
+                        if labels.len() >= MAX_DIVERGENCE_LABELS {
+                            break;
+                        }
+                        if (divergence.second_timestamp as f64) > ts_max
+                            || (divergence.first_timestamp as f64) < ts_min
+                            || divergence.second_price < p_min
+                            || divergence.second_price > p_max
+                        {
+                            continue;
+                        }
+                        let Some(x) = self.chart_state.ts_to_x(divergence.second_timestamp as f64)
+                        else {
+                            continue;
+                        };
+                        let Some(y) = self.chart_state.price_to_y(divergence.second_price) else {
+                            continue;
+                        };
+                        let (text, color) = match divergence.kind {
+                            DivergenceKind::Bearish => ("BEAR", cx.theme().colors.bearish),
+                            DivergenceKind::Bullish => ("BULL", cx.theme().colors.bullish),
+                        };
+                        labels.push(
+                            div()
+                                .absolute()
+                                .left(px(x + 5.0))
+                                .top(px(y - 14.0))
+                                .px(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(cx.theme().colors.background.opacity(0.72))
+                                .text_size(px(9.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(color)
+                                .child(text)
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+            div()
+                .absolute()
+                .size_full()
+                .children(labels)
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
         let liquidity_history_note = if self.show_liquidity || self.show_l1 {
             self.liquidity_history_note.clone().map(|note| {
                 div()
@@ -4229,29 +4688,11 @@ impl Render for ChartPanel {
                         this.mark_dirty();
                         cx.notify();
                     }
-                    "d" => {
-                        this.show_delta = !this.show_delta;
-                        this.mark_dirty();
-                        cx.notify();
-                    }
-                    "p" => {
-                        this.show_profile = !this.show_profile;
-                        this.mark_dirty();
-                        cx.notify();
-                    }
-                    "v" => {
-                        this.toggle_footprint(cx);
-                    }
-                    "h" => {
-                        this.show_liquidity = !this.show_liquidity;
-                        this.mark_dirty();
-                        cx.notify();
-                    }
-                    "b" => {
-                        this.show_l1 = !this.show_l1;
-                        this.mark_dirty();
-                        cx.notify();
-                    }
+                    "d" => this.toggle_delta(cx),
+                    "p" => this.toggle_profile(cx),
+                    "v" => this.toggle_footprint(cx),
+                    "h" => this.toggle_liquidity(cx),
+                    "b" => this.toggle_l1(cx),
                     "l" => {
                         let total = this.feed.len();
                         this.chart_state.scroll_to_latest(total);
@@ -4269,6 +4710,8 @@ impl Render for ChartPanel {
             .overflow_hidden()
             .child(chart)
             .child(l1_overlay)
+            .child(analytics_overlay)
+            .child(analytics_labels)
             .child(drawing_overlay)
             .child(legend_ui)
             .child(legend_vol_ui)
@@ -4451,40 +4894,9 @@ impl ChartPanel {
             menu
         });
 
-        let orderflow = toolbar_button(
-            "toolbar_btn_orderflow",
-            "icons/trending-up.svg",
-            "Order flow",
-        )
-        .selected(self.show_delta)
-        .when(self.show_delta, |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip("Delta / CVD order flow")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_delta = !this.show_delta;
-            this.mark_dirty();
-            cx.notify();
-        }));
-
-        let profile = toolbar_button(
-            "toolbar_btn_profile",
-            "icons/sort-ascending.svg",
-            "Volume profile",
-        )
-        .selected(self.show_profile)
-        .when(self.show_profile, |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip("Volume profile")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_profile = !this.show_profile;
-            this.mark_dirty();
-            cx.notify();
-        }));
-
+        let orderflow_active = self.orderflow_visible();
+        let orderflow_view = cx.entity().downgrade();
         let footprint_settings = self.footprint_settings.clone();
-        let footprint_view = cx.entity().downgrade();
         let footprint_visible = self.show_footprint;
         let footprint_mode_label = Self::footprint_mode_label(self.footprint_settings.mode);
         let footprint_multiplier = self.footprint_settings.row_multiplier.max(1);
@@ -4497,49 +4909,56 @@ impl ChartPanel {
         } else {
             String::new()
         };
-        let footprint = toolbar_button(
-            "toolbar_btn_footprint",
-            "icons/chart-candlestick.svg",
-            "Footprint",
+        let show_delta = self.show_delta;
+        let show_profile = self.show_profile;
+        let show_liquidity = self.show_liquidity;
+        let show_l1 = self.show_l1;
+        let show_absorption = self.show_absorption;
+        let show_divergence = self.show_divergence;
+        let show_imbalance_stacks = self.show_imbalance_stacks;
+        let show_cvd_regime = self.show_cvd_regime;
+
+        // One coherent order-flow menu. Every toggle has a single mutation
+        // method on the panel; the menu, keyboard shortcuts and any future
+        // trigger all call the same path.
+        let orderflow = toolbar_button(
+            "toolbar_btn_orderflow",
+            "icons/trending-up.svg",
+            "Order flow",
         )
-        .selected(self.show_footprint)
-        .when(self.show_footprint, |button| {
+        .selected(orderflow_active)
+        .when(orderflow_active, |button| {
             button.bg(active_bg).text_color(active_fg)
         })
         .tooltip(format!(
-            "Footprint: {footprint_mode_label} · {footprint_multiplier}× rows{footprint_step_hint}"
+            "Order flow: footprint {footprint_mode_label} {footprint_multiplier}×{footprint_step_hint}"
         ))
         .dropdown_caret(true)
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.toggle_footprint(cx);
-        }))
         .dropdown_menu(move |mut menu, _, _| {
-            let view = footprint_view.clone();
-            menu = menu.item(
-                PopupMenuItem::new("Show footprint")
-                    .checked(footprint_visible)
-                    .on_click(move |_, window, cx| {
-                        let view = view.clone();
-                        window.defer(cx, move |window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                this.show_footprint = !this.show_footprint;
-                                if this.show_footprint {
-                                    this.ensure_footprint_density();
-                                }
-                                this.mark_dirty();
-                                window.focus(&this.focus_handle);
-                                cx.notify();
+            menu = menu
+                .item(PopupMenuItem::label("Footprint"))
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Show footprint")
+                        .checked(footprint_visible)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_footprint(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
                             });
-                        });
-                    }),
-            );
+                        })
+                });
 
             for (mode, label) in [
                 (FootprintMode::BidAsk, "Bid × Ask"),
                 (FootprintMode::Delta, "Delta"),
                 (FootprintMode::Volume, "Volume"),
             ] {
-                let view = footprint_view.clone();
+                let view = orderflow_view.clone();
                 menu = menu.item(
                     PopupMenuItem::new(label)
                         .checked(footprint_settings.mode == mode)
@@ -4556,26 +4975,43 @@ impl ChartPanel {
                 );
             }
 
-            let view = footprint_view.clone();
-            menu = menu.item(
+            for multiplier in [1u32, 2, 4, 8] {
+                let view = orderflow_view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("Row size {multiplier}×"))
+                        .checked(footprint_settings.row_multiplier == multiplier)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.footprint_settings.row_multiplier = multiplier;
+                                    this.mark_dirty();
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        }),
+                );
+            }
+
+            menu = menu.item({
+                let view = orderflow_view.clone();
                 PopupMenuItem::new("Point of control")
                     .checked(footprint_settings.show_poc)
                     .on_click(move |_, window, cx| {
                         let view = view.clone();
                         window.defer(cx, move |window, cx| {
                             let _ = view.update(cx, |this, cx| {
-                                this.footprint_settings.show_poc =
-                                    !this.footprint_settings.show_poc;
+                                this.footprint_settings.show_poc = !this.footprint_settings.show_poc;
                                 this.mark_dirty();
                                 window.focus(&this.focus_handle);
                                 cx.notify();
                             });
                         });
-                    }),
-            );
-
-            let view = footprint_view.clone();
-            menu = menu.item(
+                    })
+            });
+            menu = menu.item({
+                let view = orderflow_view.clone();
                 PopupMenuItem::new("Value area")
                     .checked(footprint_settings.show_value_area)
                     .on_click(move |_, window, cx| {
@@ -4589,11 +5025,10 @@ impl ChartPanel {
                                 cx.notify();
                             });
                         });
-                    }),
-            );
-
-            let view = footprint_view.clone();
-            menu = menu.item(
+                    })
+            });
+            menu = menu.item({
+                let view = orderflow_view.clone();
                 PopupMenuItem::new("Imbalance")
                     .checked(footprint_settings.show_imbalance)
                     .on_click(move |_, window, cx| {
@@ -4607,11 +5042,10 @@ impl ChartPanel {
                                 cx.notify();
                             });
                         });
-                    }),
-            );
-
-            let view = footprint_view.clone();
-            menu = menu.item(
+                    })
+            });
+            menu = menu.item({
+                let view = orderflow_view.clone();
                 PopupMenuItem::new(format!(
                     "Imbalance ratio: {:.0}×",
                     footprint_settings.imbalance_ratio
@@ -4632,30 +5066,10 @@ impl ChartPanel {
                             cx.notify();
                         });
                     });
-                }),
-            );
-
-            for multiplier in [1u32, 2, 4, 8] {
-                let view = footprint_view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(format!("Row size {multiplier}×"))
-                        .checked(footprint_settings.row_multiplier == multiplier)
-                        .on_click(move |_, window, cx| {
-                            let view = view.clone();
-                            window.defer(cx, move |window, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    this.footprint_settings.row_multiplier = multiplier;
-                                    this.mark_dirty();
-                                    window.focus(&this.focus_handle);
-                                    cx.notify();
-                                });
-                            });
-                        }),
-                );
-            }
-
-            let view = footprint_view.clone();
-            menu = menu.item(
+                })
+            });
+            menu = menu.item({
+                let view = orderflow_view.clone();
                 PopupMenuItem::new("Summary")
                     .checked(footprint_settings.show_summary)
                     .on_click(move |_, window, cx| {
@@ -4669,42 +5083,135 @@ impl ChartPanel {
                                 cx.notify();
                             });
                         });
-                    }),
-            );
+                    })
+            });
+
+            menu = menu
+                .item(PopupMenuItem::separator())
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Volume profile")
+                        .checked(show_profile)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_profile(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Delta + CVD")
+                        .checked(show_delta)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_delta(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Liquidity heatmap")
+                        .checked(show_liquidity)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_liquidity(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("L1 bid/ask")
+                        .checked(show_l1)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_l1(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item(PopupMenuItem::separator())
+                .item(PopupMenuItem::label("Analytics"))
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Absorption")
+                        .checked(show_absorption)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_absorption(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Delta divergence")
+                        .checked(show_divergence)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_divergence(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Imbalance stacks")
+                        .checked(show_imbalance_stacks)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_imbalance_stacks(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("CVD regime")
+                        .checked(show_cvd_regime)
+                        .on_click(move |_, window, cx| {
+                            let view = view.clone();
+                            window.defer(cx, move |window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    this.toggle_cvd_regime(cx);
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                });
+                            });
+                        })
+                });
             menu
         });
-
-        let liquidity = toolbar_button(
-            "toolbar_btn_liquidity",
-            "icons/panel-bottom-open.svg",
-            "Liquidity",
-        )
-        .selected(self.show_liquidity)
-        .when(self.show_liquidity, |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip("Resting liquidity heatmap")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_liquidity = !this.show_liquidity;
-            this.mark_dirty();
-            cx.notify();
-        }));
-
-        let l1_lines = toolbar_button(
-            "toolbar_btn_l1",
-            "icons/chart-candlestick.svg",
-            "L1 bid/ask",
-        )
-        .selected(self.show_l1)
-        .when(self.show_l1, |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip("L1 best bid/ask step lines")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_l1 = !this.show_l1;
-            this.mark_dirty();
-            cx.notify();
-        }));
 
         let current_hex = self.drawing_color.clone();
         let current_hsv = self.drawing_color_hsv();
@@ -5189,10 +5696,6 @@ impl ChartPanel {
                     .child(indicators)
                     .child(chart_type)
                     .child(orderflow)
-                    .child(profile)
-                    .child(footprint)
-                    .child(liquidity)
-                    .child(l1_lines)
                     .when(!is_ultra_compact, |this| this.child(separator()))
                     .child(drawing_button(
                         None,

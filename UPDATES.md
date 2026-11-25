@@ -6,6 +6,17 @@ Updates require explicit user action to download and install. Downloads are boun
 
 ## Chart order flow
 
+The five separate order-flow toolbar buttons are now one **Order flow** menu with grouped footprint, profile, Delta/CVD, liquidity, L1, and analytics sections. Every toggle has one mutation path, shared by the menu and the `V`/`D`/`P`/`H`/`B` shortcuts; choosing a footprint mode no longer silently forces the footprint open.
+
+Four pure analytics now render on the legacy chart path without touching the vendored chart crate:
+
+- **Absorption** places a direction-coloured diamond on bars with top-decile volume but below-median range and a non-zero delta.
+- **Delta divergence** draws a dashed line between consecutive price/CVD swing highs or lows plus a `BEAR`/`BULL` label.
+- **Imbalance stacks** outline runs of at least three consecutive footprint imbalances at the bar's x position.
+- **CVD regime** adds a `CVD RISING/FALLING/FLAT` badge to the Delta/CVD pane legend.
+
+The analytics are cached by order-flow feed version (plus the row multiplier/imbalance ratio that shape stacks), not recomputed per frame, and never run on bars without real trade rows. The v2 engine still renders candles only; these overlays remain on the legacy path.
+
 The footprint, Delta/CVD, volume profile, and liquidity overlays were tightened without changing the backend wire contract:
 
 - Footprint rows now use the backend `row_size` (or the symbol tick / inferred source gaps) and are anchored to absolute prices, so panning and zooming cannot re-bucket prints. The footprint menu offers **Row size 1×/2×/4×/8×**; `1×` keeps backend rows 1:1, and merged rows split volume by price overlap.
