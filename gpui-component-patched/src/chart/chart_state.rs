@@ -41,7 +41,7 @@ pub struct ChartState {
     /// Height ratio of the volume / indicator pane (default 0.18).
     pub volume_height_ratio: f32,
     pub subpane_ratios: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, f32>>>,
-    
+
     /// Is the user dragging the volume pane separator?
     pub is_dragging_volume: bool,
     pub is_dragging_separator: Option<usize>,
@@ -100,9 +100,13 @@ impl ChartState {
             pinned_to_latest: true,
             last_cursor_frac: std::rc::Rc::new(std::cell::Cell::new(0.5)),
             volume_height_ratio: 0.18,
-            subpane_ratios: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            subpane_ratios: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
             is_dragging_separator: None,
-            separator_ys: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            separator_ys: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
             is_dragging_volume: false,
             drag_start_y: 0.0,
             drag_start_vol_ratio: 0.18,
@@ -180,7 +184,7 @@ impl ChartState {
     /// Pass `0.5` to get the old centre-anchored behaviour.
     pub fn zoom(&mut self, factor: f32, total: usize, cursor_frac: f32) {
         let cursor_frac = cursor_frac.clamp(0.0, 1.0) as f64;
-        
+
         let visible_f = (self.visible_count as f64 - 1.0).max(0.0);
         let exact_anchor = self.viewport_offset + visible_f * cursor_frac;
 
@@ -191,7 +195,7 @@ impl ChartState {
 
         let new_visible_f = (self.visible_count as f64 - 1.0).max(0.0);
         let new_offset = exact_anchor - new_visible_f * cursor_frac;
-        
+
         self.viewport_offset = new_offset.max(0.0);
         self.clamp_offset(total);
     }
@@ -287,7 +291,7 @@ mod tests {
     fn scroll_by_clamps_to_zero() {
         let mut s = ChartState::new();
         s.viewport_offset = 5.0;
-        s.scroll_by(-100, 200);
+        s.scroll_by(-100.0, 200);
         assert_eq!(s.viewport_offset, 0.0);
     }
 
@@ -317,7 +321,7 @@ mod tests {
         s.zoom(0.5, 500, 0.25);
         // After zoom: visible_count = 50; offset = 75 - 50*0.25 = 75 - 12.5 = 62 → 62
         assert_eq!(s.visible_count, 50);
-        assert_eq!(s.viewport_offset, 62.0);
+        assert_eq!(s.viewport_offset, 62.5);
     }
 
     #[test]

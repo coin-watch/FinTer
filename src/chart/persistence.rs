@@ -42,14 +42,16 @@ pub fn save_layout(root: &Path, layout: &ChartLayout) -> io::Result<()> {
     fs::rename(temporary, path)
 }
 
-/// Load an exact saved layout, or a new v1 layout when absent, corrupt, or unsupported.
+/// Load an exact saved layout, or a fresh layout when absent, corrupt, or unsupported.
+/// Schema versions 1 and 2 are accepted; missing v2 fields fall back to their
+/// serde defaults so layouts written before the chart-core merge keep loading.
 pub fn load_layout(root: &Path, exchange: &str, symbol: &str, timeframe: &str) -> ChartLayout {
     let fallback = ChartLayout::new(exchange, symbol, timeframe);
     let path = layout_path(root, exchange, symbol, timeframe);
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ChartLayout>(&bytes).ok())
-        .filter(|layout| layout.schema_version == 1)
+        .filter(|layout| (1..=2).contains(&layout.schema_version))
         .unwrap_or(fallback)
 }
 
@@ -74,7 +76,7 @@ pub fn load_preset(root: &Path, preset_name: &str) -> Option<ChartLayout> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<ChartLayout>(&bytes).ok())
-        .filter(|layout| layout.schema_version == 1)
+        .filter(|layout| (1..=2).contains(&layout.schema_version))
 }
 
 pub fn list_presets(root: &Path) -> Vec<String> {
@@ -92,7 +94,11 @@ pub fn list_presets(root: &Path) -> Vec<String> {
 }
 
 /// Returns standard built-in layout presets.
-pub fn built_in_presets(exchange: &str, symbol: &str, timeframe: &str) -> Vec<(&'static str, ChartLayout)> {
+pub fn built_in_presets(
+    exchange: &str,
+    symbol: &str,
+    timeframe: &str,
+) -> Vec<(&'static str, ChartLayout)> {
     let mut default_layout = ChartLayout::new(exchange, symbol, timeframe);
     default_layout.indicators = vec![
         IndicatorInstance::new("ma-20", IndicatorKind::Ma),
@@ -165,6 +171,24 @@ mod tests {
             load_layout(&root, "binance", "BTC/USDT", "1h"),
             ChartLayout::new("binance", "BTC/USDT", "1h")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v1_layout_file_still_loads_with_defaults() {
+        let root = root();
+        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1h");
+        layout.schema_version = 1;
+        layout.show_l1 = true;
+        let path = layout_path(&root, "binance", "BTC/USDT", "1h");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        fs::write(&path, encoded).unwrap();
+
+        let loaded = load_layout(&root, "binance", "BTC/USDT", "1h");
+        assert_eq!(loaded.schema_version, 1);
+        assert!(loaded.show_l1);
+        assert_eq!(loaded.price_scale_mode, "linear");
         fs::remove_dir_all(root).unwrap();
     }
 

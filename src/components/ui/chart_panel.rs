@@ -32,7 +32,7 @@
 /// mutations (mouse events) mark the view dirty via `cx.notify()`, which
 /// triggers the next frame immediately.
 use gpui::{
-    AnyElement, App, Context, Corner, ElementId, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, AppContext, Context, Corner, ElementId, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
@@ -40,6 +40,11 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::Selectable;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::chart::core::{Ohlcv, PriceScaleMode};
+use gpui_component::chart::elements::{
+    ChartEvent, ChartOptions, ChartSnapshot, ChartView, PriceAxisState,
+};
+use gpui_component::chart::theme::ChartPalette;
 use gpui_component::chart::{
     AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
     FootprintCellSpec, HeatmapCellSpec, IndicatorStyle, OrderOverlaySpec, PaneTarget,
@@ -78,6 +83,7 @@ use crate::klinechart;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +153,14 @@ pub struct ChartPanel {
     focus_handle: FocusHandle,
     /// Interactive viewport + crosshair state.
     chart_state: ChartState,
+    /// Experimental scene-based chart (enabled with `FINTER_CHART_V2=1`).
+    chart_v2: gpui::Entity<ChartView>,
+    /// Cheap change key for the v2 chart snapshot/options.
+    last_v2_key: String,
+    /// Persisted v2 price scale mode and range.
+    v2_price_scale_mode: String,
+    v2_manual_price_range: Option<(f64, f64)>,
+    v2_percent_anchor: Option<f64>,
     pub on_load_more:
         Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
     /// Fetch one historical book window `(since, until)` for the liquidity
@@ -423,7 +437,119 @@ fn profile_specs(
     (bars, lines)
 }
 
+fn chart_v2_enabled() -> bool {
+    std::env::var_os("FINTER_CHART_V2").is_some()
+}
+
+fn chart_v2_snapshot(feed: &CandleFeed) -> (ChartSnapshot, u64) {
+    let (candles, version) = feed.snapshot_with_version();
+    let mut bars = Vec::with_capacity(candles.len());
+    let mut timestamps = Vec::with_capacity(candles.len());
+    for candle in &candles {
+        bars.push(Ohlcv::new(
+            candle.open,
+            candle.high,
+            candle.low,
+            candle.close,
+            candle.volume,
+        ));
+        timestamps.push(candle.timestamp);
+    }
+    (
+        ChartSnapshot::new(Arc::from(bars), Arc::from(timestamps), version),
+        version,
+    )
+}
+
+fn chart_v2_options(
+    precision: &Option<PrecisionInfo>,
+    timezone: &str,
+    show_grid: bool,
+) -> ChartOptions {
+    let precision = precision.clone();
+    let timezone = timezone.to_string();
+    ChartOptions {
+        show_grid,
+        price_formatter: Some(Arc::new(move |value| {
+            format_price(value, precision.as_ref()).into()
+        })),
+        time_formatter: Some(Arc::new(move |timestamp| {
+            let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp / 1_000, 0)
+                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+            let tz = timezone.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC);
+            utc.with_timezone(&tz)
+                .format("%b %d %H:%M")
+                .to_string()
+                .into()
+        })),
+        ..Default::default()
+    }
+}
+
+fn chart_v2_scale_mode(
+    name: &str,
+    manual: Option<(f64, f64)>,
+    percent_anchor: Option<f64>,
+) -> PriceScaleMode {
+    match name {
+        "log" => PriceScaleMode::Log,
+        "percent" => {
+            let anchor = percent_anchor
+                .filter(|anchor| anchor.is_finite() && *anchor != 0.0)
+                .or_else(|| {
+                    manual
+                        .filter(|(min, max)| min.is_finite() && max.is_finite() && max > min)
+                        .map(|(min, max)| (min + max) * 0.5)
+                })
+                .unwrap_or(1.0);
+            PriceScaleMode::percent(anchor)
+        }
+        "inverted" => PriceScaleMode::InvertedLinear,
+        _ => PriceScaleMode::Linear,
+    }
+}
+
 impl ChartPanel {
+    fn sync_chart_v2(&mut self, cx: &mut Context<Self>) {
+        let (snapshot, version) = chart_v2_snapshot(&self.feed);
+        let mut options =
+            chart_v2_options(&self.precision, &self.timezone, self.show_horizontal_grid);
+        options.title = format!("{} · {}", self.symbol, self.timeframe).into();
+        let palette = ChartPalette::from_theme(&cx.theme().colors);
+        let mode = chart_v2_scale_mode(
+            &self.v2_price_scale_mode,
+            self.v2_manual_price_range,
+            self.v2_percent_anchor,
+        );
+        let axis_state = match self.v2_manual_price_range {
+            Some((min, max)) if min.is_finite() && max.is_finite() && max > min => {
+                PriceAxisState::Manual { min, max }
+            }
+            _ => PriceAxisState::Auto,
+        };
+        self.chart_v2.update(cx, |view, cx| {
+            view.set_snapshot(snapshot, cx);
+            view.set_options(options, cx);
+            view.set_palette_if_changed(palette, cx);
+            if view.price_scale_mode() != mode {
+                view.set_price_scale_mode(mode, cx);
+            }
+            if view.price_axis_state() != axis_state {
+                view.set_price_axis_state(axis_state, cx);
+            }
+        });
+        self.last_v2_key = format!(
+            "{:?}|{}|{}|{}|{}|{:?}|{:?}",
+            self.precision,
+            self.timezone,
+            self.show_horizontal_grid,
+            version,
+            self.v2_price_scale_mode,
+            self.v2_manual_price_range,
+            self.v2_percent_anchor
+        );
+    }
+
     pub fn agent_snapshot(&self) -> serde_json::Value {
         let candles = self.feed.snapshot();
         serde_json::json!({
@@ -503,6 +629,47 @@ impl ChartPanel {
             .unwrap_or(&title_str)
             .to_string();
 
+        let (v2_snapshot, _v2_version) = chart_v2_snapshot(&feed);
+        let v2_palette = ChartPalette::from_theme(&cx.theme().colors);
+        let chart_v2 =
+            cx.new(|cx| ChartView::new(v2_snapshot, ChartOptions::default(), v2_palette, cx));
+        let last_v2_key = String::new();
+        let v2_price_scale_mode = "linear".to_string();
+        let v2_manual_price_range = None;
+        let v2_percent_anchor = None;
+        cx.subscribe(&chart_v2, |panel, _, event: &ChartEvent, cx| {
+            if let ChartEvent::ScaleChanged { mode, manual } = event {
+                let name = match mode {
+                    PriceScaleMode::Linear => "linear",
+                    PriceScaleMode::Log => "log",
+                    PriceScaleMode::Percent { .. } => "percent",
+                    PriceScaleMode::InvertedLinear => "inverted",
+                };
+                let anchor = mode.anchor();
+                if panel.v2_price_scale_mode != name
+                    || panel.v2_manual_price_range != *manual
+                    || panel.v2_percent_anchor != anchor
+                {
+                    panel.v2_price_scale_mode = name.to_string();
+                    panel.v2_manual_price_range = *manual;
+                    panel.v2_percent_anchor = anchor;
+                    panel.mark_dirty();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(650))
+                            .await;
+                        let _ = this.update(cx, |panel, cx| {
+                            panel.check_debounced_save();
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                cx.notify();
+            }
+        })
+        .detach();
+
         let mut panel = Self {
             feed,
             title: title_str,
@@ -512,6 +679,11 @@ impl ChartPanel {
             precision: None,
             focus_handle: cx.focus_handle(),
             chart_state: ChartState::new(),
+            chart_v2,
+            last_v2_key,
+            v2_price_scale_mode,
+            v2_manual_price_range,
+            v2_percent_anchor,
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
             candle_type: CandleType::Solid,
@@ -606,6 +778,7 @@ impl ChartPanel {
         };
 
         panel.load_layout();
+        panel.sync_chart_v2(cx);
         panel
     }
 
@@ -1062,6 +1235,9 @@ impl ChartPanel {
         if self.show_footprint {
             self.ensure_footprint_density();
         }
+        self.v2_price_scale_mode = layout.price_scale_mode;
+        self.v2_manual_price_range = layout.manual_price_range;
+        self.v2_percent_anchor = layout.percent_anchor;
         if let Some(geom) = layout.library_geometry {
             self.library_x = geom.x;
             self.library_y = geom.y;
@@ -1092,6 +1268,9 @@ impl ChartPanel {
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
+        layout.price_scale_mode = self.v2_price_scale_mode.clone();
+        layout.manual_price_range = self.v2_manual_price_range;
+        layout.percent_anchor = self.v2_percent_anchor;
         layout.library_geometry = Some(WindowGeometry {
             x: self.library_x,
             y: self.library_y,
@@ -1905,6 +2084,33 @@ impl Render for ChartPanel {
                         cx.theme(),
                     ),
                 )
+                .into_any_element();
+        }
+
+        if chart_v2_enabled() {
+            self.check_debounced_save();
+            let key = format!(
+                "{:?}|{}|{}|{}|{}|{:?}|{:?}",
+                self.precision,
+                self.timezone,
+                self.show_horizontal_grid,
+                self.feed.version(),
+                self.v2_price_scale_mode,
+                self.v2_manual_price_range,
+                self.v2_percent_anchor
+            );
+            if key != self.last_v2_key {
+                self.sync_chart_v2(cx);
+            }
+            let palette = ChartPalette::from_theme(&cx.theme().colors);
+            self.chart_v2
+                .update(cx, |view, cx| view.set_palette_if_changed(palette, cx));
+            let toolbar = self.render_chart_toolbar(cx);
+            return v_flex()
+                .size_full()
+                .bg(cx.theme().colors.background)
+                .child(toolbar)
+                .child(div().flex_1().min_h_0().child(self.chart_v2.clone()))
                 .into_any_element();
         }
 

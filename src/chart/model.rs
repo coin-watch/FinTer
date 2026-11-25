@@ -115,6 +115,19 @@ pub struct ChartLayout {
     /// Show L1 best bid/ask step lines.
     #[serde(default)]
     pub show_l1: bool,
+    /// Price scale mode: `linear`, `log`, `percent`, or `inverted`.
+    #[serde(default = "default_price_scale_mode")]
+    pub price_scale_mode: String,
+    /// User-locked price range; `None` means auto-fit.
+    #[serde(default)]
+    pub manual_price_range: Option<(f64, f64)>,
+    /// Anchor for percentage labels when `price_scale_mode == "percent"`.
+    #[serde(default)]
+    pub percent_anchor: Option<f64>,
+}
+
+fn default_price_scale_mode() -> String {
+    "linear".to_string()
 }
 
 fn default_show_delta() -> bool {
@@ -128,7 +141,7 @@ impl ChartLayout {
         timeframe: impl Into<String>,
     ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             exchange: exchange.into(),
             symbol: symbol.into(),
             timeframe: timeframe.into(),
@@ -145,6 +158,9 @@ impl ChartLayout {
             footprint: FootprintSettings::default(),
             show_liquidity: false,
             show_l1: false,
+            price_scale_mode: default_price_scale_mode(),
+            manual_price_range: None,
+            percent_anchor: None,
         }
     }
 }
@@ -469,6 +485,38 @@ mod tests {
         let decoded: FootprintSettings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, settings);
         assert_eq!(decoded.row_multiplier, 4);
+    }
+
+    #[test]
+    fn v1_layout_without_scale_fields_uses_defaults() {
+        let layout = ChartLayout::new("binance", "BTC/USDT", "1m");
+        let mut value = serde_json::to_value(&layout).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("schema_version".into(), serde_json::json!(1));
+        object.remove("price_scale_mode");
+        object.remove("manual_price_range");
+        object.remove("percent_anchor");
+        // v1 layouts also predate the L1 toggle.
+        object.remove("show_l1");
+        let parsed: ChartLayout = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.price_scale_mode, "linear");
+        assert_eq!(parsed.manual_price_range, None);
+        assert_eq!(parsed.percent_anchor, None);
+        assert!(!parsed.show_l1);
+    }
+
+    #[test]
+    fn scale_fields_round_trip() {
+        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
+        layout.price_scale_mode = "percent".into();
+        layout.manual_price_range = Some((100.0, 200.0));
+        layout.percent_anchor = Some(150.0);
+        let encoded = serde_json::to_vec(&layout).unwrap();
+        let parsed: ChartLayout = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(parsed.price_scale_mode, "percent");
+        assert_eq!(parsed.manual_price_range, Some((100.0, 200.0)));
+        assert_eq!(parsed.percent_anchor, Some(150.0));
     }
 
     #[test]

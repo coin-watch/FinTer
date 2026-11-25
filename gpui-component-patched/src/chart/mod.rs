@@ -1,3 +1,9 @@
+pub mod charts;
+pub mod core;
+pub mod elements;
+pub mod scene;
+pub mod theme;
+
 mod area_chart;
 mod bar_chart;
 mod candlestick_chart;
@@ -18,4 +24,5 @@ pub use line_chart::LineChart;
 pub use linear_scale::LinearScale;
 pub use pie_chart::PieChart;
 
-pub mod radar_chart; pub use radar_chart::*;
+pub mod radar_chart;
+pub use radar_chart::*;
