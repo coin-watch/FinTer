@@ -203,6 +203,51 @@ fn amount_with_positive(amount: f64) -> f64 {
     }
 }
 
+/// Merge historical flow bars behind a live snapshot without double counting.
+///
+/// Only history bars strictly older than the oldest live bar are inserted, so
+/// the live window (including the seam bar) remains authoritative. Bars are
+/// deduplicated by timestamp and sorted ascending, and CVD/`total_delta` are
+/// recomputed across the merged series.
+///
+/// If the live snapshot has no bars there is no anchor for the seam; the live
+/// path stays authoritative and this returns `0` without touching history.
+/// Returns the number of history bars inserted.
+pub fn merge_history_bars(live: &mut OrderFlowSnapshot, history: Vec<FlowBar>) -> usize {
+    let Some(oldest_live) = live.bars.first().map(|bar| bar.timestamp) else {
+        return 0;
+    };
+    let mut history: Vec<FlowBar> = history
+        .into_iter()
+        .filter(|bar| bar.timestamp > 0 && bar.timestamp < oldest_live)
+        .collect();
+    if history.is_empty() {
+        return 0;
+    }
+    history.sort_by_key(|bar| bar.timestamp);
+    history.dedup_by_key(|bar| bar.timestamp);
+    let inserted = history.len();
+
+    let mut merged = Vec::with_capacity(inserted + live.bars.len());
+    merged.append(&mut history);
+    merged.extend(live.bars.iter().cloned());
+    merged.sort_by_key(|bar| bar.timestamp);
+    // History already excludes the oldest live timestamp; this is a defensive
+    // dedupe for malformed pages that repeat a bar.
+    merged.dedup_by_key(|bar| bar.timestamp);
+
+    let mut cvd = Vec::with_capacity(merged.len());
+    let mut running = 0.0;
+    for bar in &merged {
+        running += bar.delta();
+        cvd.push((bar.timestamp, running));
+    }
+    live.bars = merged;
+    live.cvd = cvd;
+    live.total_delta = running;
+    inserted
+}
+
 /// Shared order-flow feed driven by the bridge's trade stream.
 pub struct OrderFlowFeed {
     inner: Arc<Mutex<State>>,
@@ -779,5 +824,85 @@ mod tests {
         assert!((bar.buy_volume - 100.0).abs() < f64::EPSILON);
         assert!((bar.sell_volume - 50.0).abs() < f64::EPSILON);
         assert!((bar.total_volume - 150.0).abs() < f64::EPSILON);
+    }
+
+    fn flow_bar(timestamp: i64, buy: f64, sell: f64) -> FlowBar {
+        FlowBar {
+            timestamp,
+            buy_volume: buy,
+            sell_volume: sell,
+            total_volume: buy + sell,
+            is_closed: true,
+            ..FlowBar::default()
+        }
+    }
+
+    fn live_snapshot() -> OrderFlowSnapshot {
+        let bars = vec![flow_bar(200, 2.0, 1.0), flow_bar(300, 1.0, 2.0)];
+        let mut cvd = Vec::new();
+        let mut running = 0.0;
+        for bar in &bars {
+            running += bar.delta();
+            cvd.push((bar.timestamp, running));
+        }
+        OrderFlowSnapshot {
+            bars,
+            cvd,
+            total_delta: running,
+            ..OrderFlowSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn merge_history_inserts_only_before_live_and_recomputes_cvd() {
+        let mut live = live_snapshot();
+        let inserted = merge_history_bars(
+            &mut live,
+            vec![
+                flow_bar(100, 0.0, 1.0),
+                // At/after the oldest live bar: the live path owns the seam.
+                flow_bar(200, 99.0, 0.0),
+                flow_bar(250, 99.0, 0.0),
+                // Duplicate history timestamp: first one wins after sorting.
+                flow_bar(50, 4.0, 0.0),
+                flow_bar(50, 9.0, 0.0),
+            ],
+        );
+        // Timestamps 50 and 100 are inserted; the 50 duplicate collapses.
+        assert_eq!(inserted, 2);
+        let timestamps: Vec<i64> = live.bars.iter().map(|bar| bar.timestamp).collect();
+        assert_eq!(timestamps, vec![50, 100, 200, 300]);
+        // deltas: +4, -1, +1, -1 => cvd 4, 3, 4, 3
+        assert_eq!(
+            live.cvd,
+            vec![(50, 4.0), (100, 3.0), (200, 4.0), (300, 3.0)]
+        );
+        assert!((live.total_delta - 3.0).abs() < f64::EPSILON);
+        // The live seam bar's volumes are untouched.
+        assert!((live.bars[2].buy_volume - 2.0).abs() < f64::EPSILON);
+        assert!((live.bars[2].sell_volume - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn merge_history_without_live_anchor_is_a_noop() {
+        let mut live = OrderFlowSnapshot::default();
+        let inserted = merge_history_bars(&mut live, vec![flow_bar(100, 1.0, 0.0)]);
+        assert_eq!(inserted, 0);
+        assert!(live.bars.is_empty());
+        assert!(live.cvd.is_empty());
+        assert_eq!(live.total_delta, 0.0);
+    }
+
+    #[test]
+    fn merge_history_is_idempotent_for_overlapping_windows() {
+        let mut live = live_snapshot();
+        let history = vec![flow_bar(50, 1.0, 0.0), flow_bar(100, 0.0, 1.0)];
+        assert_eq!(merge_history_bars(&mut live, history.clone()), 2);
+        let first_total = live.total_delta;
+        // A fresh merge starts from the feed snapshot again; applying the same
+        // history to the already-merged snapshot must not add new bars.
+        assert_eq!(merge_history_bars(&mut live, history), 0);
+        assert_eq!(live.bars.len(), 4);
+        assert_eq!(live.total_delta, first_total);
     }
 }

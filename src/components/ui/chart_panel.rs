@@ -79,8 +79,11 @@ use crate::data::liquidity_feed::{
     LiquidityFeed, LiquidityHistoryOutcome, LiquiditySample, LiquiditySnapshot,
 };
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
-use crate::data::orderflow_feed::{DerivedFlowFeed, FlowBar, OrderFlowSnapshot};
+use crate::data::orderflow_feed::{
+    DerivedFlowFeed, FlowBar, OrderFlowSnapshot, merge_history_bars,
+};
 use crate::data::price_format::format_price;
+use crate::data::trade_history::TradeHistoryOutcome;
 use crate::klinechart;
 
 use std::cell::Cell;
@@ -167,6 +170,12 @@ pub type LiquidityHistoryLoader = std::sync::Arc<
     dyn Fn(i64, i64, std::sync::mpsc::Sender<LiquidityHistoryOutcome>) + Send + Sync,
 >;
 
+/// Explicit, user-triggered loader for raw-trade order-flow history. The
+/// arguments are `(since, until, timeframe_ms, completion)`.
+pub type TradeHistoryLoader = std::sync::Arc<
+    dyn Fn(i64, i64, i64, std::sync::mpsc::Sender<TradeHistoryOutcome>) + Send + Sync,
+>;
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -196,6 +205,9 @@ pub struct ChartPanel {
     /// heatmap / L1 lines. The closure merges samples into the feed and reports
     /// the outcome so the panel can show queued/auth/credit states.
     pub on_load_liquidity_history: Option<LiquidityHistoryLoader>,
+    /// Explicit `(since, until, timeframe_ms)` loader for historical raw trades.
+    /// Only invoked from the Order flow menu; never fetched automatically.
+    pub on_load_trade_history: Option<TradeHistoryLoader>,
     /// Called shortly after a new live candle appears so the feed can re-fetch
     /// the just-closed bar from the exchange (final OHLCV + volume).
     pub on_refresh_latest: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
@@ -229,6 +241,14 @@ pub struct ChartPanel {
     orderflow_cache: Option<OrderFlowSnapshot>,
     /// Feed version that produced `orderflow_cache`.
     orderflow_cache_version: u64,
+    /// Explicitly loaded historical flow bars, merged behind the live feed.
+    flow_history: Vec<FlowBar>,
+    /// In-flight receiver for one trade-history load.
+    flow_history_receiver: Option<std::sync::mpsc::Receiver<TradeHistoryOutcome>>,
+    flow_history_loading: bool,
+    flow_history_note: Option<SharedString>,
+    /// Covered range (bar start, exclusive end) of the last loaded history.
+    flow_history_loaded_range: Option<(i64, i64)>,
     /// Optional book-history feed for the liquidity heatmap.
     liquidity_feed: Option<LiquidityFeed>,
     /// Latest liquidity snapshot, cached by feed version. `Arc` keeps the L1
@@ -733,6 +753,7 @@ impl ChartPanel {
             on_load_more: None,
             on_refresh_latest: None,
             on_load_liquidity_history: None,
+            on_load_trade_history: None,
             last_completed_candle_ts: 0,
             history_completion: None,
             history_retry_at: None,
@@ -750,6 +771,11 @@ impl ChartPanel {
             footprint_press: None,
             orderflow_cache: None,
             orderflow_cache_version: u64::MAX,
+            flow_history: Vec::new(),
+            flow_history_receiver: None,
+            flow_history_loading: false,
+            flow_history_note: None,
+            flow_history_loaded_range: None,
             liquidity_feed: None,
             liquidity_cache: None,
             liquidity_cache_version: u64::MAX,
@@ -1000,7 +1026,12 @@ impl ChartPanel {
         }
         let current = feed.version();
         if self.orderflow_cache.is_none() || current != self.orderflow_cache_version {
-            let (version, snapshot) = feed.snapshot_with_version();
+            let (version, mut snapshot) = feed.snapshot_with_version();
+            if !self.flow_history.is_empty() {
+                // History is inserted strictly before the oldest live bar; the
+                // live feed owns the seam and is never rewritten.
+                merge_history_bars(&mut snapshot, self.flow_history.clone());
+            }
             self.orderflow_cache = Some(snapshot);
             self.orderflow_cache_version = version;
         }
@@ -1300,6 +1331,153 @@ impl ChartPanel {
         // Wake even when the response merges no new samples (queued/empty) so
         // the outcome is drained without waiting for a live book update.
         Self::schedule_liquidity_wake(cx, 400);
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn flow_history_range_label(&self, start: i64, end_ms: i64) -> String {
+        let format = if end_ms.saturating_sub(start) > 24 * 60 * 60 * 1000 {
+            "%m-%d %H:%M"
+        } else {
+            "%H:%M"
+        };
+        format!(
+            "{} – {}",
+            Self::format_timestamp(start, &self.timezone, format),
+            Self::format_timestamp(end_ms, &self.timezone, format)
+        )
+    }
+
+    /// Explicitly load raw-trade order-flow history for the visible candle
+    /// range (or the last 30 minutes when the chart has no candles yet).
+    ///
+    /// This is the only place that spends credits on the trade-tape route; it
+    /// is invoked from the Order flow menu and never from a repaint.
+    fn request_orderflow_history(&mut self, cx: &mut Context<Self>) {
+        if self.flow_history_loading {
+            self.flow_history_note = Some("Order flow history: already loading".into());
+            cx.notify();
+            return;
+        }
+        let Some(load) = self.on_load_trade_history.clone() else {
+            self.flow_history_note = Some("Order flow history: not available".into());
+            cx.notify();
+            return;
+        };
+        let timeframe_ms =
+            crate::data::bridge::BridgeConfig::timeframe_to_ms(&self.timeframe).max(1_000);
+        let now = Self::now_ms();
+        let candles = self.feed.snapshot();
+        let (since, until) = if candles.is_empty() {
+            (now.saturating_sub(30 * 60 * 1000), now)
+        } else {
+            let range = self.chart_state.visible_range(candles.len());
+            if range.is_empty() {
+                self.flow_history_note = Some("Order flow history: no visible bars".into());
+                cx.notify();
+                return;
+            }
+            let start = range.start.min(candles.len() - 1);
+            let end = range.end.min(candles.len()).max(start + 1);
+            let since = candles[start].timestamp;
+            let until = candles[end - 1]
+                .timestamp
+                .saturating_add(timeframe_ms)
+                .min(now);
+            (since, until)
+        };
+        // The relay rejects windows older than its 14-day raw-trade retention.
+        let since =
+            since.max(now.saturating_sub(crate::data::trade_history::TRADE_HISTORY_RETENTION_MS));
+        if since <= 0 || since >= until {
+            self.flow_history_note =
+                Some("Order flow history: no older trades in this window".into());
+            cx.notify();
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.flow_history_receiver = Some(rx);
+        self.flow_history_loading = true;
+        self.flow_history_note = Some("Order flow history: loading".into());
+        load(since, until, timeframe_ms, tx);
+        // Wake even when the response merges no bars so the outcome is drained.
+        Self::schedule_liquidity_wake(cx, 400);
+        cx.notify();
+    }
+
+    /// Drain the in-flight trade-history request and update the status note.
+    fn poll_orderflow_history(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = self.flow_history_receiver.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                self.flow_history_receiver = None;
+                self.flow_history_loading = false;
+                match outcome {
+                    TradeHistoryOutcome::Loaded {
+                        bars,
+                        trades,
+                        partial,
+                    } => {
+                        if bars.is_empty() {
+                            self.flow_history_note =
+                                Some("Order flow history: no trades in this window".into());
+                        } else {
+                            let timeframe_ms =
+                                crate::data::bridge::BridgeConfig::timeframe_to_ms(&self.timeframe)
+                                    .max(1_000);
+                            let start = bars.first().map(|bar| bar.timestamp).unwrap_or(0);
+                            let end = bars
+                                .last()
+                                .map(|bar| bar.timestamp.saturating_add(timeframe_ms))
+                                .unwrap_or(start);
+                            let range_label = self.flow_history_range_label(start, end);
+                            self.flow_history_loaded_range = Some((start, end));
+                            self.flow_history = bars;
+                            // Force the merged snapshot to rebuild on the next
+                            // refresh, even when the live feed version is idle.
+                            self.orderflow_cache_version = u64::MAX;
+                            let partial_label = if partial { " · partial" } else { "" };
+                            self.flow_history_note = Some(
+                                format!(
+                                    "Order flow history: {trades} trades{partial_label} · {range_label}"
+                                )
+                                .into(),
+                            );
+                            self.mark_dirty();
+                        }
+                    }
+                    TradeHistoryOutcome::AuthRequired => {
+                        self.flow_history_note = Some("Sign in for order-flow history".into());
+                    }
+                    TradeHistoryOutcome::Credits(message) => {
+                        self.flow_history_note =
+                            Some(format!("Order-flow history needs credits: {message}").into());
+                    }
+                    TradeHistoryOutcome::NotAvailable => {
+                        self.flow_history_note =
+                            Some("Order-flow history: no coverage for this window".into());
+                    }
+                    TradeHistoryOutcome::Error(message) => {
+                        self.flow_history_note =
+                            Some(format!("Order-flow history unavailable ({message})").into());
+                    }
+                }
+                cx.notify();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.flow_history_receiver = None;
+                self.flow_history_loading = false;
+            }
+        }
     }
 
     /// Changes the footprint display mode. Visibility has its own toggle, so
@@ -2334,6 +2512,10 @@ impl Render for ChartPanel {
         // The feed watcher and interaction handlers notify this entity. Avoid
         // scheduling an unconditional 60 FPS render loop when the chart is idle.
 
+        // Explicit, user-triggered trade history: drain the in-flight load so
+        // the merged snapshot is rebuilt without waiting for a live trade.
+        self.poll_orderflow_history(cx);
+
         // Track chart width for dynamic toolbar
         if let Some((w, _)) = self.chart_state.candle_plot_size.get() {
             if w > 0.0 {
@@ -2543,9 +2725,11 @@ impl Render for ChartPanel {
             cx.theme().primary,
         );
 
-        // Order flow is live-session only. When the viewport includes candles
-        // older than the first order-flow bar, say so instead of fabricating a
-        // historical footprint.
+        // Order flow is live-session only until the user explicitly loads raw
+        // trade history. Merged history covers bars older than the live feed,
+        // so the "live session" note only appears when the viewport reaches
+        // before the loaded history (or before the live window when none is
+        // loaded).
         let orderflow_note = if self.show_footprint {
             orderflow_snapshot
                 .and_then(|snapshot| snapshot.bars.first())
@@ -2554,7 +2738,13 @@ impl Render for ChartPanel {
                     candles
                         .get(range.start)
                         .filter(|candle| candle.timestamp < first.timestamp)
-                        .map(|_| "Order flow: live session")
+                        .map(|_| match self.flow_history_loaded_range {
+                            Some((start, _)) => format!(
+                                "Order flow: history from {}",
+                                Self::format_timestamp(start, &self.timezone, "%m-%d %H:%M")
+                            ),
+                            None => "Order flow: live session".to_string(),
+                        })
                 })
         } else {
             None
@@ -4214,6 +4404,31 @@ impl Render for ChartPanel {
             None
         };
 
+        // Keep the order-flow history note above the liquidity note when both
+        // overlays are visible.
+        let flow_history_note = if self.orderflow_visible() {
+            self.flow_history_note.clone().map(|note| {
+                let bottom = if self.show_liquidity || self.show_l1 {
+                    30.0
+                } else {
+                    8.0
+                };
+                div()
+                    .absolute()
+                    .left(px(8.0))
+                    .bottom(px(bottom))
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(cx.theme().colors.background.opacity(0.78))
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(note)
+            })
+        } else {
+            None
+        };
+
         let is_near_separator = {
             let mut near = false;
             if let Some(pos) = self.chart_state.crosshair_pos {
@@ -4717,6 +4932,7 @@ impl Render for ChartPanel {
             .child(legend_vol_ui)
             .children(subpane_legends)
             .children(liquidity_history_note)
+            .children(flow_history_note)
             .child(gpui::deferred(settings_panel))
             .child(gpui::deferred(self.render_indicator_library(cx)));
 
@@ -5147,6 +5363,19 @@ impl ChartPanel {
                                 });
                             });
                         })
+                })
+                .item({
+                    let view = orderflow_view.clone();
+                    PopupMenuItem::new("Load order-flow history").on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        window.defer(cx, move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.request_orderflow_history(cx);
+                                window.focus(&this.focus_handle);
+                                cx.notify();
+                            });
+                        });
+                    })
                 })
                 .item(PopupMenuItem::separator())
                 .item(PopupMenuItem::label("Analytics"))

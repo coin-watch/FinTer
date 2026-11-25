@@ -35,6 +35,7 @@ use crate::data::orderflow_feed::{
     DerivedDelta, DerivedFlowEvent, DerivedFootprint, DerivedProfile
 };
 use crate::data::tick::{TradeSide, UnifiedTick};
+use crate::data::trade_history::{TradeHistoryError, TradeHistoryPage, parse_trade_history};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,6 +81,23 @@ static BOOK_HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, BookHistoryCac
 
 fn book_history_request_cache() -> &'static Mutex<HashMap<String, BookHistoryCacheEntry>> {
     BOOK_HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Raw-trade history pages are capped at 20k rows, but still larger than book
+/// samples; keep a bounded per-credential cache like the L2 route.
+const TRADE_HISTORY_CACHE_MAX_ENTRIES: usize = 100;
+
+#[derive(Clone)]
+struct TradeHistoryCacheEntry {
+    page: TradeHistoryPage,
+    expires_at: Instant,
+}
+
+static TRADE_HISTORY_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, TradeHistoryCacheEntry>>> =
+    OnceLock::new();
+
+fn trade_history_request_cache() -> &'static Mutex<HashMap<String, TradeHistoryCacheEntry>> {
+    TRADE_HISTORY_REQUEST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Failure modes the chart needs to distinguish for the liquidity history note.
@@ -420,6 +438,45 @@ impl BridgeConfig {
             urlencoding::encode(&self.symbol),
             urlencoding::encode(&format!("Chart · {}", self.symbol)),
         )
+    }
+
+    /// Cursor-paginated raw-trade history (CoinWatch
+    /// `/api/v1/trades/history`).
+    ///
+    /// `cursor` and `since` are mutually exclusive on the backend; when a
+    /// cursor is supplied it already encodes the next page's lower bound, so
+    /// `since` is omitted.
+    pub fn trades_history_url(
+        &self,
+        since: i64,
+        until: i64,
+        limit: usize,
+        order: &str,
+        cursor: Option<&str>,
+    ) -> String {
+        let limit = limit.clamp(1, 20_000);
+        let order = if order.eq_ignore_ascii_case("asc") {
+            "asc"
+        } else {
+            "desc"
+        };
+        let market_type = self.history_market_type();
+        let mut url = format!(
+            "{}/api/v1/trades/history?exchange={}&symbol={}&until={until}&limit={limit}&type={market_type}&order={order}",
+            self.rest_base_url,
+            urlencoding::encode(&self.exchange),
+            urlencoding::encode(&self.symbol),
+        );
+        match cursor.filter(|cursor| !cursor.is_empty()) {
+            Some(cursor) => {
+                url.push_str("&cursor=");
+                url.push_str(&urlencoding::encode(cursor));
+            }
+            None => {
+                url.push_str(&format!("&since={since}"));
+            }
+        }
+        url
     }
 }
 
@@ -2276,6 +2333,156 @@ async fn fetch_book_history(
     Ok(history)
 }
 
+/// Fetch one page of persisted raw trades.
+///
+/// Mirrors [`fetch_book_history`]: cache per credential, refresh once on 401,
+/// surface 402 to the credit store, and map the relay's "not available" 400 to
+/// [`TradeHistoryError::NotAvailable`]. Callers must treat this as metered and
+/// only invoke it on an explicit user action.
+pub async fn fetch_trades_history_page(
+    config: &BridgeConfig,
+    url: &str,
+) -> Result<TradeHistoryPage, TradeHistoryError> {
+    let token = crate::data::session_store::load_session()
+        .ok()
+        .flatten()
+        .map(|session| session.access_token)
+        .or_else(|| config.access_token.clone());
+    let token_digest = token
+        .as_deref()
+        .map(|value| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(value.as_bytes()))
+        })
+        .unwrap_or_else(|| "anonymous".to_string());
+    let cache_key = format!("{token_digest}:{url}");
+    if let Ok(mut cache) = trade_history_request_cache().lock() {
+        cache.retain(|_, entry| entry.expires_at > Instant::now());
+        if let Some(entry) = cache.get(&cache_key) {
+            return Ok(entry.page.clone());
+        }
+    }
+    debug!("gateway: GET {}", url.split('?').next().unwrap_or(url));
+
+    let response = send_ohlcv_request(config, url, token.as_deref())
+        .await
+        .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
+    let (response, cache_key) = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        warn!("gateway: trades history returned 401 — attempting session refresh");
+        match refresh_session_token(config).await {
+            Some(refreshed) => {
+                let digest = {
+                    use sha2::{Digest, Sha256};
+                    format!("{:x}", Sha256::digest(refreshed.as_bytes()))
+                };
+                let retry_key = format!("{digest}:{url}");
+                let retry = send_ohlcv_request(config, url, Some(&refreshed))
+                    .await
+                    .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
+                (retry, retry_key)
+            }
+            None => (response, cache_key),
+        }
+    } else {
+        (response, cache_key)
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error: serde_json::Value = response.json().await.unwrap_or_default();
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Market data request failed");
+        if status.as_u16() == 402
+            || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits")
+        {
+            let balance = error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+            let required = error.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+            crate::data::credits::CreditStore::record(
+                "Chart",
+                message,
+                balance,
+                required,
+                Some(&config.rest_base_url),
+            );
+            return Err(TradeHistoryError::Credits(format!(
+                "{} (balance {}, required {})",
+                message, balance, required
+            )));
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(TradeHistoryError::Auth);
+        }
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && (message.to_ascii_lowercase().contains("not available")
+                || error
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|code| code.contains("not_available")))
+        {
+            return Err(TradeHistoryError::NotAvailable);
+        }
+        return Err(TradeHistoryError::Other(format!(
+            "trade history fetch failed: HTTP {}: {}",
+            status, message
+        )));
+    }
+
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| TradeHistoryError::Other(error.to_string()))?;
+    if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+        let message = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Not enough credits");
+        let balance = value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
+        let required = value.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
+        crate::data::credits::CreditStore::record(
+            "Chart",
+            message,
+            balance,
+            required,
+            Some(&config.rest_base_url),
+        );
+        return Err(TradeHistoryError::Credits(format!(
+            "{} (balance {}, required {})",
+            message, balance, required
+        )));
+    }
+    let page = parse_trade_history(value);
+
+    // Windows touching the live edge can change while the sink catches up;
+    // older windows are immutable enough for a minute.
+    let near_live_edge = page.until > now_ms() - 3 * 60 * 60 * 1000;
+    let ttl = if near_live_edge {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(60)
+    };
+    if let Ok(mut cache) = trade_history_request_cache().lock() {
+        if cache.len() >= TRADE_HISTORY_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest);
+            }
+        }
+        cache.insert(
+            cache_key,
+            TradeHistoryCacheEntry {
+                page: page.clone(),
+                expires_at: Instant::now() + ttl,
+            },
+        );
+    }
+    Ok(page)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -2359,6 +2566,45 @@ mod tests {
         assert!(futures_url.contains("type=future"));
         // The route path stays the same for every market type.
         assert!(futures_url.contains("/api/v1/orderbook/history?"));
+    }
+
+    #[test]
+    fn trades_history_url_matches_the_coinwatch_contract() {
+        let cfg = base_cfg();
+        let url =
+            cfg.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 20_000, "desc", None);
+        assert!(url.starts_with("https://coinwat.ch/api/v1/trades/history?"));
+        assert!(url.contains("exchange=binance"));
+        assert!(url.contains("symbol=BTC%2FUSDT"));
+        assert!(url.contains("since=1700000000000"));
+        assert!(url.contains("until=1700000900000"));
+        assert!(url.contains("limit=20000"));
+        assert!(url.contains("type=spot"));
+        assert!(url.contains("order=desc"));
+
+        // A cursor page must not carry `since`: the relay rejects both.
+        let cursor_url = cfg.trades_history_url(
+            1_700_000_000_000,
+            1_700_000_900_000,
+            20_000,
+            "desc",
+            Some("MTcwMDAwMDAwMDAwMDp0cmFkZS0x"),
+        );
+        assert!(cursor_url.contains("cursor=MTcwMDAwMDAwMDAwMDp0cmFkZS0x"));
+        assert!(!cursor_url.contains("since="));
+
+        let mut perp = base_cfg();
+        perp.exchange = "binanceusdm".to_string();
+        let perp_url =
+            perp.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 20_000, "desc", None);
+        assert!(perp_url.contains("type=swap"));
+
+        // Limits are clamped to the relay's 1..=20000 range and order is
+        // normalised.
+        let clamped =
+            cfg.trades_history_url(1_700_000_000_000, 1_700_000_900_000, 999_999, "ASC", None);
+        assert!(clamped.contains("limit=20000"));
+        assert!(clamped.contains("order=asc"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub mod terminal_audio;
 pub mod terminal_control;
 pub mod theme;
 pub mod tick;
+pub mod trade_history;
 pub mod trade_store;
 pub mod update_checker;
 pub mod update_downloader;

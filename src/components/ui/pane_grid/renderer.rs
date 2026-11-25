@@ -2059,6 +2059,17 @@ impl PaneGridRenderer {
                                                     });
                                                 });
 
+                                                // Explicit raw-trade history for the Order flow menu. The closure spends
+                                                // credits only when the user picks "Load order-flow history".
+                                                let bc_trade_history = bridge_config_clone.clone();
+                                                let load_trade_history: crate::components::ui::chart_panel::TradeHistoryLoader = std::sync::Arc::new(move |since: i64, until: i64, timeframe_ms: i64, done: std::sync::mpsc::Sender<crate::data::trade_history::TradeHistoryOutcome>| {
+                                                    let bc = bc_trade_history.clone();
+                                                    crate::data::client::tokio_runtime().spawn(async move {
+                                                        let outcome = crate::data::trade_history::load_trade_history(&bc, since, until, timeframe_ms).await;
+                                                        let _ = done.send(outcome);
+                                                    });
+                                                });
+
                                                 let bc = bridge_config_clone.clone();
                                                 let feed_clone = feed.clone();
                                                 let load_more: std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync> = std::sync::Arc::new(move |until: i64, done: std::sync::mpsc::Sender<()>| {
@@ -2101,6 +2112,7 @@ impl PaneGridRenderer {
                                                     panel.set_orderflow_feed(orderflow, cx);
                                                     panel.set_liquidity_feed(liquidity, cx);
                                                     panel.on_load_liquidity_history = Some(load_liquidity_history);
+                                                    panel.on_load_trade_history = Some(load_trade_history);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
                                                     panel.set_size(content_w, content_h);
