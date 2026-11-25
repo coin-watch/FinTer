@@ -1,3 +1,4 @@
+pub mod color;
 pub mod drawings;
 pub mod indicators;
 pub mod interaction;

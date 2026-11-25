@@ -22,22 +22,22 @@
 ///   placement, selection, moving, deletion, and persistence.
 /// - **Price Alert Levels** – saved alerts for the pane's exchange/symbol render
 ///   as dashed horizontal lines with Y-axis pills and off-screen edge badges.
-/// - **Indicator Library Modal** – draggable, resizable, searchable modal with
-///   active indicator management and live parameter validation.
+/// - **Title-bar controls** – chart type, indicators, drawings, and view
+///   actions live in the pane title bar; indicator management and drawing
+///   colour open in floating windows rather than inside the chart panel.
 ///
 /// # 60 FPS design
 /// `render()` calls `window.request_animation_frame()` every frame. State
 /// mutations (mouse events) mark the view dirty via `cx.notify()`, which
 /// triggers the next frame immediately.
 use gpui::{
-    AnyElement, App, AppContext, Context, Corner, ElementId, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, PathBuilder, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PathBuilder, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::PixelsExt;
-use gpui_component::Selectable;
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::Button;
 use gpui_component::chart::core::{Ohlcv, PriceScaleMode};
 use gpui_component::chart::elements::{
     ChartEvent, ChartOptions, ChartSnapshot, ChartView, PriceAxisState,
@@ -48,9 +48,6 @@ use gpui_component::chart::{
     OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_component::popover::Popover;
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::theme::ActiveTheme;
 use gpui_component::v_flex;
 
@@ -59,9 +56,7 @@ use crate::chart::drawings::{
 };
 use crate::chart::indicators::{IndicatorCache, validate_params};
 use crate::chart::layout::ChartMetrics;
-use crate::chart::model::{
-    ChartLayout, IndicatorCategory, IndicatorInstance, IndicatorKind, WindowGeometry,
-};
+use crate::chart::model::{ChartLayout, IndicatorCategory, IndicatorInstance, IndicatorKind};
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
@@ -93,14 +88,12 @@ enum LegendSettingsTarget {
     Volume,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ColorPickerDrag {
-    Square,
-    Hue,
-}
-
 pub type TechnicalIndicatorKind = IndicatorKind;
 pub type TechnicalIndicatorCategory = IndicatorCategory;
+
+/// Callback used by title-bar and legend controls to open the floating
+/// indicator window without owning window creation.
+pub type ChartWindowCallback = std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
 
 struct IndicatorLineSpec {
     instance_id: String,
@@ -141,6 +134,9 @@ pub struct ChartPanel {
     /// Called shortly after a new live candle appears so the feed can re-fetch
     /// the just-closed bar from the exchange (final OHLCV + volume).
     pub on_refresh_latest: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Opens the floating indicator window. Set by the pane-grid renderer so
+    /// the chart's `I` shortcut and legend controls do not own window creation.
+    pub on_open_indicators: Option<ChartWindowCallback>,
     /// Timestamp of the newest candle seen on the previous frame, used to
     /// detect a period rollover.
     last_completed_candle_ts: i64,
@@ -168,24 +164,6 @@ pub struct ChartPanel {
     settings_drag_origin_x: f32,
     settings_drag_origin_y: f32,
 
-    // Free-floating Indicator Library Modal
-    pub show_indicator_library: bool,
-    pub library_x: f32,
-    pub library_y: f32,
-    pub library_w: f32,
-    pub library_h: f32,
-    library_dragging: bool,
-    library_resizing: bool,
-    library_drag_start_x: f32,
-    library_drag_start_y: f32,
-    library_drag_origin_x: f32,
-    library_drag_origin_y: f32,
-    pub indicator_library_search: String,
-    pub indicator_library_category: Option<IndicatorCategory>,
-    pub editing_indicator_id: Option<String>,
-    pub editing_param_inputs: BTreeMap<String, String>,
-    pub editing_param_error: Option<String>,
-
     // Drawing Tools
     pub drawings: Vec<DrawingInstance>,
     pub active_drawing_tool: Option<DrawingTool>,
@@ -194,10 +172,6 @@ pub struct ChartPanel {
     pub drawing_color: String,
     pub snap_to_candle: bool,
     drawing_cursor_point: Option<DrawingPoint>,
-    color_picker_drag: Option<ColorPickerDrag>,
-    color_picker_hue: f32,
-    color_picker_square_bounds: gpui::Bounds<Pixels>,
-    color_picker_hue_bounds: gpui::Bounds<Pixels>,
 
     // Persistence & Debounce
     layout_dirty: bool,
@@ -219,6 +193,19 @@ pub struct ChartPanel {
 
 fn chart_v2_enabled() -> bool {
     std::env::var_os("FINTER_CHART_V2").is_some()
+}
+
+/// Duplicate indicators are allowed, so ids must never collide with an
+/// existing instance even after one of several duplicates is removed.
+fn unique_indicator_id(indicators: &[IndicatorInstance], kind: &IndicatorKind) -> String {
+    let base = kind.label().to_lowercase();
+    let mut suffix = indicators.len() + 1;
+    let mut id = format!("{base}-{suffix}");
+    while indicators.iter().any(|instance| instance.id == id) {
+        suffix += 1;
+        id = format!("{base}-{suffix}");
+    }
+    id
 }
 
 fn chart_v2_snapshot(feed: &CandleFeed) -> (ChartSnapshot, u64) {
@@ -473,6 +460,7 @@ impl ChartPanel {
             pane_height: 500.0,
             on_load_more: None,
             on_refresh_latest: None,
+            on_open_indicators: None,
             last_completed_candle_ts: 0,
             history_completion: None,
             history_retry_at: None,
@@ -496,24 +484,6 @@ impl ChartPanel {
             settings_drag_origin_x: 0.0,
             settings_drag_origin_y: 0.0,
 
-            // Floating Indicator Library Modal
-            show_indicator_library: false,
-            library_x: 180.0,
-            library_y: 60.0,
-            library_w: 520.0,
-            library_h: 460.0,
-            library_dragging: false,
-            library_resizing: false,
-            library_drag_start_x: 0.0,
-            library_drag_start_y: 0.0,
-            library_drag_origin_x: 0.0,
-            library_drag_origin_y: 0.0,
-            indicator_library_search: String::new(),
-            indicator_library_category: None,
-            editing_indicator_id: None,
-            editing_param_inputs: BTreeMap::new(),
-            editing_param_error: None,
-
             // Drawing tools
             drawings: Vec::new(),
             active_drawing_tool: None,
@@ -522,10 +492,6 @@ impl ChartPanel {
             drawing_color: "#C4E855".to_string(),
             snap_to_candle: true,
             drawing_cursor_point: None,
-            color_picker_drag: None,
-            color_picker_hue: 0.205,
-            color_picker_square_bounds: gpui::Bounds::default(),
-            color_picker_hue_bounds: gpui::Bounds::default(),
 
             // Persistence
             layout_dirty: false,
@@ -542,7 +508,7 @@ impl ChartPanel {
             self.chart_state.candle_plot_size.get().unwrap_or_else(|| {
                 (
                     (self.pane_width - 64.0).max(80.0),
-                    (self.pane_height - 34.0).max(80.0),
+                    self.pane_height.max(80.0),
                 )
             });
         ChartMetrics::new(self.pane_width, self.pane_height, plot_width, plot_height)
@@ -570,6 +536,127 @@ impl ChartPanel {
 
     pub fn set_candle_type(&mut self, candle_type: CandleType) {
         self.candle_type = candle_type;
+    }
+
+    pub fn candle_type_config(&self) -> &'static str {
+        crate::components::ui::pane_grid::chart_config::candle_type_to_config(self.candle_type)
+    }
+
+    /// Exchange, symbol and timeframe for title-bar/floating-window context.
+    pub fn market_context(&self) -> (&str, &str, &str) {
+        (&self.exchange, &self.symbol, &self.timeframe)
+    }
+
+    pub fn indicator_count(&self) -> usize {
+        self.indicators.len()
+    }
+
+    pub fn indicator_instances(&self) -> &[IndicatorInstance] {
+        &self.indicators
+    }
+
+    pub fn set_drawing_color_hex(&mut self, hex: &str) {
+        self.drawing_color = hex.to_string();
+        self.mark_dirty();
+    }
+
+    pub fn drawing_color_hex(&self) -> &str {
+        &self.drawing_color
+    }
+
+    pub fn snap_to_candle(&self) -> bool {
+        self.snap_to_candle
+    }
+
+    pub fn set_snap_to_candle(&mut self, snap: bool) {
+        self.snap_to_candle = snap;
+        self.mark_dirty();
+    }
+
+    pub fn horizontal_grid_visible(&self) -> bool {
+        self.show_horizontal_grid
+    }
+
+    pub fn toggle_horizontal_grid(&mut self) {
+        self.show_horizontal_grid = !self.show_horizontal_grid;
+        self.mark_dirty();
+    }
+
+    pub fn reset_view_to_latest(&mut self) {
+        let total = self.feed.len();
+        self.chart_state.reset_view(total);
+    }
+
+    /// Reset both the legacy viewport and the opt-in scene-based chart.
+    pub fn reset_view_all(&mut self, cx: &mut Context<Self>) {
+        self.reset_view_to_latest();
+        self.chart_v2.update(cx, |view, cx| view.reset_view(cx));
+    }
+
+    pub fn go_to_latest(&mut self) {
+        let total = self.feed.len();
+        self.chart_state.scroll_to_latest(total);
+        self.chart_state.pinned_to_latest = true;
+    }
+
+    /// Jump to latest on both the legacy viewport and the scene-based chart.
+    pub fn go_to_latest_all(&mut self, cx: &mut Context<Self>) {
+        self.go_to_latest();
+        self.chart_v2
+            .update(cx, |view, cx| view.scroll_to_latest(cx));
+    }
+
+    pub fn active_drawing_tool(&self) -> Option<DrawingTool> {
+        self.active_drawing_tool
+    }
+
+    pub fn chart_focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
+    fn handle_chart_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                let cleared_tool = if self.active_drawing_tool.is_some() {
+                    self.active_drawing_tool = None;
+                    self.drawing_state = DrawingInteractionState::Idle;
+                    true
+                } else if self.selected_drawing_id.is_some() {
+                    self.selected_drawing_id = None;
+                    false
+                } else {
+                    false
+                };
+                cx.notify();
+                if cleared_tool {
+                    // The title-bar Drawings trigger renders the armed tool
+                    // label, so refresh the window that owns that title bar.
+                    window.refresh();
+                }
+            }
+            "backspace" | "delete" => {
+                self.delete_selected_drawing();
+                cx.notify();
+            }
+            "i" => {
+                if let Some(open) = self.on_open_indicators.clone() {
+                    open(window, cx);
+                }
+            }
+            "g" => {
+                self.toggle_horizontal_grid();
+                cx.notify();
+            }
+            "l" => {
+                self.go_to_latest_all(cx);
+                cx.notify();
+            }
+            "f" => {
+                self.reset_view_all(cx);
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     pub fn with_precision(mut self, precision: PrecisionInfo) -> Self {
@@ -625,23 +712,9 @@ impl ChartPanel {
         }
     }
 
-    pub fn open_main_settings(&mut self, cx: &mut Context<Self>) {
-        self.show_indicator_library = true;
-        cx.notify();
-    }
-
     pub fn is_over_modal(&self, x: f32, y: f32) -> bool {
-        if self.library_dragging || self.library_resizing || self.settings_panel_dragging {
+        if self.settings_panel_dragging {
             return true;
-        }
-        if self.show_indicator_library {
-            if x >= self.library_x
-                && x <= self.library_x + self.library_w
-                && y >= self.library_y
-                && y <= self.library_y + self.library_h
-            {
-                return true;
-            }
         }
         if self.active_legend_settings.is_some() {
             if x >= self.settings_panel_x
@@ -666,12 +739,6 @@ impl ChartPanel {
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.v2_manual_price_range = layout.manual_price_range;
         self.v2_percent_anchor = layout.percent_anchor;
-        if let Some(geom) = layout.library_geometry {
-            self.library_x = geom.x;
-            self.library_y = geom.y;
-            self.library_w = geom.width;
-            self.library_h = geom.height;
-        }
     }
 
     pub fn save_layout(&self) {
@@ -693,12 +760,9 @@ impl ChartPanel {
         layout.price_scale_mode = self.v2_price_scale_mode.clone();
         layout.manual_price_range = self.v2_manual_price_range;
         layout.percent_anchor = self.v2_percent_anchor;
-        layout.library_geometry = Some(WindowGeometry {
-            x: self.library_x,
-            y: self.library_y,
-            width: self.library_w,
-            height: self.library_h,
-        });
+        // The in-chart indicator library is gone; keep the field parseable for
+        // old layout files but stop writing a new geometry.
+        layout.library_geometry = None;
         let _ = save_layout(&root, &layout);
     }
 
@@ -707,11 +771,7 @@ impl ChartPanel {
     // -----------------------------------------------------------------------
 
     pub fn add_indicator_instance(&mut self, kind: IndicatorKind) -> String {
-        let id = format!(
-            "{}-{}",
-            kind.label().to_lowercase(),
-            self.indicators.len() + 1
-        );
+        let id = unique_indicator_id(&self.indicators, &kind);
         let instance = IndicatorInstance::new(&id, kind);
         self.indicators.push(instance);
         self.mark_dirty();
@@ -793,103 +853,6 @@ impl ChartPanel {
     // Indicator Calculation & Colors
     // -----------------------------------------------------------------------
 
-    fn parse_hex_color(hex: &str) -> Option<gpui::Hsla> {
-        let h = hex.trim_start_matches('#');
-        if h.len() == 6 {
-            let r = u8::from_str_radix(&h[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&h[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&h[4..6], 16).ok()?;
-            Some(gpui::rgba((r as u32) << 24 | (g as u32) << 16 | (b as u32) << 8 | 0xff).into())
-        } else {
-            None
-        }
-    }
-
-    fn drawing_color_hsv(&self) -> (f32, f32, f32) {
-        let color = Self::parse_hex_color(&self.drawing_color)
-            .unwrap_or_else(|| gpui::Hsla::from(gpui::rgba(0xc4e855ff)));
-        let rgb = color.to_rgb();
-        let max = rgb.r.max(rgb.g.max(rgb.b));
-        let min = rgb.r.min(rgb.g.min(rgb.b));
-        let delta = max - min;
-        let hue = if delta <= f32::EPSILON {
-            self.color_picker_hue
-        } else if max == rgb.r {
-            ((rgb.g - rgb.b) / delta).rem_euclid(6.0) / 6.0
-        } else if max == rgb.g {
-            (((rgb.b - rgb.r) / delta) + 2.0) / 6.0
-        } else {
-            (((rgb.r - rgb.g) / delta) + 4.0) / 6.0
-        };
-        let saturation = if max <= f32::EPSILON {
-            0.0
-        } else {
-            delta / max
-        };
-        (hue, saturation, max)
-    }
-
-    fn hsv_color(hue: f32, saturation: f32, value: f32) -> gpui::Hsla {
-        let hue = hue.rem_euclid(1.0);
-        let saturation = saturation.clamp(0.0, 1.0);
-        let value = value.clamp(0.0, 1.0);
-        let chroma = value * saturation;
-        let sector = hue * 6.0;
-        let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
-        let (r, g, b) = match sector.floor() as i32 {
-            0 => (chroma, x, 0.0),
-            1 => (x, chroma, 0.0),
-            2 => (0.0, chroma, x),
-            3 => (0.0, x, chroma),
-            4 => (x, 0.0, chroma),
-            _ => (chroma, 0.0, x),
-        };
-        let m = value - chroma;
-        gpui::Hsla::from(gpui::Rgba {
-            r: r + m,
-            g: g + m,
-            b: b + m,
-            a: 1.0,
-        })
-    }
-
-    fn set_drawing_color_hsv(&mut self, hue: f32, saturation: f32, value: f32) {
-        self.color_picker_hue = hue.clamp(0.0, 1.0);
-        let rgb = Self::hsv_color(hue, saturation, value).to_rgb();
-        self.drawing_color = format!(
-            "#{:02X}{:02X}{:02X}",
-            (rgb.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (rgb.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-        );
-    }
-
-    fn update_color_picker(&mut self, position: Point<Pixels>, target: ColorPickerDrag) {
-        let (hue, saturation, value) = self.drawing_color_hsv();
-        match target {
-            ColorPickerDrag::Square => {
-                let bounds = &self.color_picker_square_bounds;
-                if bounds.size.width.as_f32() <= 0.0 || bounds.size.height.as_f32() <= 0.0 {
-                    return;
-                }
-                let x = ((position.x - bounds.origin.x).as_f32() / bounds.size.width.as_f32())
-                    .clamp(0.0, 1.0);
-                let y = ((position.y - bounds.origin.y).as_f32() / bounds.size.height.as_f32())
-                    .clamp(0.0, 1.0);
-                self.set_drawing_color_hsv(hue, x, 1.0 - y);
-            }
-            ColorPickerDrag::Hue => {
-                let bounds = &self.color_picker_hue_bounds;
-                if bounds.size.width.as_f32() <= 0.0 {
-                    return;
-                }
-                let x = ((position.x - bounds.origin.x).as_f32() / bounds.size.width.as_f32())
-                    .clamp(0.0, 1.0);
-                self.set_drawing_color_hsv(x, saturation, value);
-            }
-        }
-    }
-
     fn indicator_color(kind: IndicatorKind, index: usize) -> gpui::Hsla {
         let palette: &[u32] = match kind {
             IndicatorKind::Ma => &[0xf4a261ff, 0x2a9d8fff, 0xe76f51ff],
@@ -899,7 +862,7 @@ impl ChartPanel {
             IndicatorKind::Kdj => &[0xf72585ff, 0x7209b7ff, 0x4cc9f0ff],
             IndicatorKind::Rsi => &[0xffb703ff],
             IndicatorKind::Vol => &[0xb185d2ff],
-            _ => &[0xC4E855ff, 0x00F0FFff, 0xFFD600ff, 0xFF0055ff],
+            _ => &[0xc4e855ff, 0x00f0ffff, 0xffd600ff, 0xff0055ff],
         };
         gpui::rgba(palette[index % palette.len()]).into()
     }
@@ -941,7 +904,7 @@ impl ChartPanel {
 
             for spec in computed.iter() {
                 let color = if ind.style.color != "#C4E855" && !ind.style.color.is_empty() {
-                    Self::parse_hex_color(&ind.style.color).unwrap_or_else(|| {
+                    crate::chart::color::hex_to_hsla(&ind.style.color).unwrap_or_else(|| {
                         Self::indicator_color(ind.kind.clone(), spec.color_offset + ind_idx)
                     })
                 } else {
@@ -1094,13 +1057,15 @@ impl Render for ChartPanel {
             let palette = ChartPalette::from_theme(&cx.theme().colors);
             self.chart_v2
                 .update(cx, |view, cx| view.set_palette_if_changed(palette, cx));
-            let toolbar = self.render_chart_toolbar(cx);
-            return v_flex()
+            let root = v_flex()
                 .size_full()
                 .bg(cx.theme().colors.background)
-                .child(toolbar)
-                .child(div().flex_1().min_h_0().child(self.chart_v2.clone()))
-                .into_any_element();
+                .track_focus(&self.focus_handle)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    this.handle_chart_key(ev, window, cx);
+                }))
+                .child(div().flex_1().min_h_0().child(self.chart_v2.clone()));
+            return root.into_any_element();
         }
 
         // The feed watcher and interaction handlers notify this entity. Avoid
@@ -1560,13 +1525,11 @@ impl Render for ChartPanel {
                                         .hover(|s| s.text_color(cx.theme().colors.foreground))
                                         .on_mouse_down(
                                             gpui::MouseButton::Left,
-                                            cx.listener({
-                                                let id = ind_id_str.clone();
-                                                move |this, _ev, _win, cx| {
-                                                    cx.stop_propagation();
-                                                    this.editing_indicator_id = Some(id.clone());
-                                                    this.show_indicator_library = true;
-                                                    cx.notify();
+                                            cx.listener(|this, _ev, window, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(open) = this.on_open_indicators.clone()
+                                                {
+                                                    open(window, cx);
                                                 }
                                             }),
                                         )
@@ -2135,7 +2098,7 @@ impl Render for ChartPanel {
 
                         for d in drawings.iter().chain(preview_drawing.as_ref()) {
                             let is_selected = selected_id.as_deref() == Some(&d.id);
-                            let color = Self::parse_hex_color(&d.style.color)
+                            let color = crate::chart::color::hex_to_hsla(&d.style.color)
                                 .unwrap_or(gpui::rgba(0xc4e855ff).into());
 
                             match d.tool {
@@ -2354,16 +2317,6 @@ impl Render for ChartPanel {
             }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
                 let pos: Point<Pixels> = ev.position;
-                if this.library_dragging {
-                    this.chart_state.crosshair_pos = None;
-                    this.library_x =
-                        this.library_drag_origin_x + pos.x.as_f32() - this.library_drag_start_x;
-                    this.library_y =
-                        this.library_drag_origin_y + pos.y.as_f32() - this.library_drag_start_y;
-                    this.mark_dirty();
-                    cx.notify();
-                    return;
-                }
                 if this.settings_panel_dragging {
                     this.chart_state.crosshair_pos = None;
                     this.settings_panel_x =
@@ -2374,16 +2327,8 @@ impl Render for ChartPanel {
                     cx.notify();
                     return;
                 }
-                if this.library_resizing {
-                    this.chart_state.crosshair_pos = None;
-                    this.library_w = (pos.x.as_f32() - this.library_x).max(360.0);
-                    this.library_h = (pos.y.as_f32() - this.library_y).max(280.0);
-                    this.mark_dirty();
-                    cx.notify();
-                    return;
-                }
 
-                // If cursor is over indicators & strategies window or settings window, stop interacting with chart module
+                // If cursor is over the legend settings window, stop interacting with chart module
                 if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
                     if this.chart_state.crosshair_pos.is_some() {
                         this.chart_state.crosshair_pos = None;
@@ -2661,8 +2606,6 @@ impl Render for ChartPanel {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseUpEvent, _window, cx| {
-                    this.library_dragging = false;
-                    this.library_resizing = false;
                     this.settings_panel_dragging = false;
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
@@ -2677,8 +2620,6 @@ impl Render for ChartPanel {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &MouseUpEvent, _window, cx| {
-                    this.library_dragging = false;
-                    this.library_resizing = false;
                     this.settings_panel_dragging = false;
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
@@ -2712,45 +2653,8 @@ impl Render for ChartPanel {
                 }
                 cx.notify();
             }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                match ev.keystroke.key.as_str() {
-                    "escape" => {
-                        if this.show_indicator_library {
-                            this.show_indicator_library = false;
-                        } else if this.active_drawing_tool.is_some() {
-                            this.active_drawing_tool = None;
-                            this.drawing_state = DrawingInteractionState::Idle;
-                        } else if this.selected_drawing_id.is_some() {
-                            this.selected_drawing_id = None;
-                        }
-                        cx.notify();
-                    }
-                    "backspace" | "delete" => {
-                        this.delete_selected_drawing();
-                        cx.notify();
-                    }
-                    "i" => {
-                        this.show_indicator_library = !this.show_indicator_library;
-                        cx.notify();
-                    }
-                    "g" => {
-                        this.show_horizontal_grid = !this.show_horizontal_grid;
-                        this.mark_dirty();
-                        cx.notify();
-                    }
-                    "l" => {
-                        let total = this.feed.len();
-                        this.chart_state.scroll_to_latest(total);
-                        this.chart_state.pinned_to_latest = true;
-                        cx.notify();
-                    }
-                    "f" => {
-                        let total = this.feed.len();
-                        this.chart_state.reset_view(total);
-                        cx.notify();
-                    }
-                    _ => {}
-                }
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.handle_chart_key(ev, window, cx);
             }))
             .overflow_hidden()
             .child(chart)
@@ -2758,8 +2662,7 @@ impl Render for ChartPanel {
             .child(legend_ui)
             .child(legend_vol_ui)
             .children(subpane_legends)
-            .child(gpui::deferred(settings_panel))
-            .child(gpui::deferred(self.render_indicator_library(cx)));
+            .child(gpui::deferred(settings_panel));
 
         let root = v_flex()
             .id("chart_panel_root")
@@ -2775,1138 +2678,9 @@ impl Render for ChartPanel {
                         cx.notify();
                     }
                 }
-            }))
-            .child(self.render_chart_toolbar(cx));
+            }));
 
         root.child(chart_area).into_any_element()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Toolbar & Modals
-// ---------------------------------------------------------------------------
-
-impl ChartPanel {
-    fn render_chart_toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let colors = &cx.theme().colors;
-        let w = if self.last_chart_width > 0.0 {
-            self.last_chart_width
-        } else {
-            self.chart_state
-                .candle_plot_size
-                .get()
-                .map(|(w, _)| w)
-                .unwrap_or(800.0)
-        };
-
-        // Breakpoints for dynamic responsiveness
-        let is_wide = w >= 780.0;
-        let is_medium = w >= 520.0 && w < 780.0;
-        let _is_compact = w >= 360.0 && w < 520.0;
-        let is_ultra_compact = w < 360.0;
-        let is_short = self.pane_height > 0.0 && self.pane_height < 140.0;
-        let toolbar_h = if is_short { px(28.0) } else { px(34.0) };
-        let icon = |path: &'static str| gpui_component::Icon::default().path(path).size(px(15.0));
-        let active_bg = colors.primary.opacity(0.14);
-        let active_fg = colors.primary;
-
-        let toolbar_button = |id: &'static str, path: &'static str, label: &'static str| {
-            Button::new(id)
-                .icon(icon(path))
-                .compact()
-                .ghost()
-                .tooltip(label)
-        };
-
-        let drawing_button = |tool: Option<DrawingTool>,
-                              id: &'static str,
-                              path: &'static str,
-                              label: &'static str| {
-            let active = self.active_drawing_tool == tool;
-            toolbar_button(id, path, label)
-                .selected(active)
-                .when(active, |button| button.bg(active_bg).text_color(active_fg))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
-                    this.set_active_drawing_tool(tool);
-                    cx.notify();
-                }))
-        };
-
-        let selected_tool = self.active_drawing_tool;
-        let drawing_view = cx.entity().downgrade();
-        let more_drawings = toolbar_button(
-            "toolbar_more_drawings",
-            "icons/trending-up.svg",
-            selected_tool.map(|tool| tool.label()).unwrap_or("Drawings"),
-        )
-        .selected(selected_tool.is_some())
-        .when(selected_tool.is_some(), |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip(
-            selected_tool
-                .map(|tool| tool.label())
-                .unwrap_or("Drawing tools"),
-        )
-        .dropdown_caret(true)
-        .dropdown_menu(move |mut menu, _, _| {
-            for tool in std::iter::once(None).chain(DrawingTool::all().into_iter().map(Some)) {
-                let view = drawing_view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(tool.map(|tool| tool.label()).unwrap_or("Pointer"))
-                        .checked(selected_tool == tool)
-                        .on_click(move |_, window, cx| {
-                            let view = view.clone();
-                            window.defer(cx, move |window, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    this.set_active_drawing_tool(tool);
-                                    window.focus(&this.focus_handle);
-                                    cx.notify();
-                                });
-                            });
-                        }),
-                );
-            }
-            menu
-        });
-
-        let separator = || div().w(px(1.0)).h(px(18.0)).bg(colors.border);
-
-        let indicators = toolbar_button(
-            "toolbar_btn_indicators",
-            "icons/chart-pie.svg",
-            "Indicators",
-        )
-        .selected(self.show_indicator_library)
-        .when(self.show_indicator_library, |button| {
-            button.bg(active_bg).text_color(active_fg)
-        })
-        .tooltip("Indicators (I)")
-        .on_click(cx.listener(|this, _event, _window, cx| {
-            this.show_indicator_library = !this.show_indicator_library;
-            cx.notify();
-        }));
-
-        let candle_label = |kind: CandleType| match kind {
-            CandleType::Solid => "Candles",
-            CandleType::HeikinAshi => "Heikin Ashi",
-            CandleType::Stroke => "Stroke",
-            CandleType::UpStroke => "Up stroke",
-            CandleType::DownStroke => "Down stroke",
-            CandleType::Ohlc => "OHLC",
-            CandleType::Area => "Area",
-        };
-        let chart_type_view = cx.entity().downgrade();
-        let current_candle_type = self.candle_type;
-        let chart_type = toolbar_button(
-            "toolbar_chart_type",
-            "icons/chart-candlestick.svg",
-            candle_label(current_candle_type),
-        )
-        .tooltip(format!("Chart type: {}", candle_label(current_candle_type)))
-        .dropdown_caret(true)
-        .dropdown_menu(move |mut menu, _, _| {
-            for kind in [
-                CandleType::Solid,
-                CandleType::HeikinAshi,
-                CandleType::Stroke,
-                CandleType::UpStroke,
-                CandleType::DownStroke,
-                CandleType::Ohlc,
-                CandleType::Area,
-            ] {
-                let view = chart_type_view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(candle_label(kind))
-                        .checked(current_candle_type == kind)
-                        .on_click(move |_, window, cx| {
-                            let view = view.clone();
-                            window.defer(cx, move |window, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    this.set_candle_type(kind);
-                                    window.focus(&this.focus_handle);
-                                    cx.notify();
-                                });
-                            });
-                        }),
-                );
-            }
-            menu
-        });
-
-        let current_hex = self.drawing_color.clone();
-        let current_hsv = self.drawing_color_hsv();
-        let parsed_color =
-            Self::parse_hex_color(&current_hex).unwrap_or(gpui::rgba(0xc4e855ff).into());
-        let color_view = cx.entity().downgrade();
-
-        let color_trigger = Button::new("toolbar_drawing_color")
-            .icon(icon("icons/palette.svg"))
-            .compact()
-            .ghost()
-            .tooltip(format!("Drawing color ({})", self.drawing_color))
-            .child(
-                div()
-                    .w(px(10.0))
-                    .h(px(10.0))
-                    .bg(parsed_color)
-                    .border_1()
-                    .border_color(colors.foreground.opacity(0.7)),
-            );
-
-        let color_picker = Popover::new(ElementId::Name("toolbar-color-popover".into()))
-            .anchor(Corner::TopLeft)
-            .trigger(color_trigger)
-            .content(move |_state, window, cx| {
-                let view = color_view.clone();
-                let selected_hex = current_hex.clone();
-                let theme = &cx.theme().colors;
-                let selected_color = ChartPanel::parse_hex_color(&selected_hex)
-                    .unwrap_or(gpui::rgba(0xc4e855ff).into());
-                let (selected_hue, selected_saturation, selected_value) = current_hsv;
-                let square_marker_x = selected_saturation * 204.0;
-                let square_marker_y = (1.0 - selected_value) * 154.0;
-                let hue_marker_x = selected_hue * 204.0;
-                let square_drag_view = view.clone();
-                let hue_drag_view = view.clone();
-                let palettes: &[(&str, &[&str])] = &[
-                    (
-                        "Quick picks",
-                        &["#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF"],
-                    ),
-                    (
-                        "Greens",
-                        &["#00E676", "#2EBD85", "#C4E855", "#AEEA00", "#76FF03"],
-                    ),
-                    (
-                        "Blues & violet",
-                        &["#00F0FF", "#00B0FF", "#2979FF", "#651FFF", "#3D5AFE"],
-                    ),
-                    (
-                        "Warm accents",
-                        &["#FFEA00", "#FFD600", "#FF9100", "#FF6D00", "#FF3D00"],
-                    ),
-                    (
-                        "Pink & red",
-                        &["#FF0055", "#F6465D", "#FF1744", "#F50057", "#D500F9"],
-                    ),
-                    (
-                        "Neutral",
-                        &["#FFFFFF", "#ECEFF1", "#90A4AE", "#546E7A", "#263238"],
-                    ),
-                ];
-
-                div()
-                    .w(px(238.0))
-                    .max_h((window.viewport_size().height - px(64.0)).max(px(80.0)))
-                    .overflow_y_scrollbar()
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .text_xs()
-                    .on_mouse_move({
-                        let view = view.clone();
-                        move |event: &MouseMoveEvent, _window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                if let Some(target) = this.color_picker_drag {
-                                    cx.stop_propagation();
-                                    this.update_color_picker(event.position, target);
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
-                    .on_mouse_up(MouseButton::Left, {
-                        let view = view.clone();
-                        move |_event, _window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                if this.color_picker_drag.is_some() {
-                                    cx.stop_propagation();
-                                    this.color_picker_drag = None;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .pb(px(10.0))
-                            .border_b_1()
-                            .border_color(theme.border.opacity(0.55))
-                            .child(
-                                div()
-                                    .w(px(38.0))
-                                    .h(px(38.0))
-                                    .flex_shrink_0()
-                                    .bg(selected_color)
-                                    .border_1()
-                                    .border_color(theme.foreground.opacity(0.45)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Drawing color"),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(theme.primary)
-                                            .child(selected_hex.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .child("Used for new drawings"),
-                                    ),
-                            ),
-                    )
-                    .child({
-                        let hue_color = ChartPanel::hsv_color(selected_hue, 1.0, 1.0);
-                        let marker_x = square_marker_x - 6.0;
-                        let marker_y = square_marker_y - 6.0;
-                        let field_view = view.clone();
-                        div()
-                            .id("drawing-color-square")
-                            .relative()
-                            .w(px(204.0))
-                            .h(px(154.0))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(theme.border)
-                            .cursor_crosshair()
-                            .on_mouse_down(MouseButton::Left, {
-                                let view = square_drag_view.clone();
-                                move |event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    let _ = view.update(cx, |this, cx| {
-                                        this.color_picker_drag = Some(ColorPickerDrag::Square);
-                                        this.update_color_picker(
-                                            event.position,
-                                            ColorPickerDrag::Square,
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .on_mouse_move({
-                                let view = square_drag_view.clone();
-                                move |event: &MouseMoveEvent, _window, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        if this.color_picker_drag == Some(ColorPickerDrag::Square) {
-                                            cx.stop_propagation();
-                                            this.update_color_picker(
-                                                event.position,
-                                                ColorPickerDrag::Square,
-                                            );
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            })
-                            .on_mouse_up(MouseButton::Left, {
-                                let view = square_drag_view.clone();
-                                move |_event, _window, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        if this.color_picker_drag == Some(ColorPickerDrag::Square) {
-                                            cx.stop_propagation();
-                                            this.color_picker_drag = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            })
-                            .child(
-                                gpui::canvas(
-                                    move |bounds, _, cx| {
-                                        let _ = field_view.update(cx, |this, _| {
-                                            this.color_picker_square_bounds = bounds;
-                                        });
-                                    },
-                                    move |bounds, _, window, _cx| {
-                                        const COLUMNS: usize = 34;
-                                        const ROWS: usize = 26;
-                                        for row in 0..ROWS {
-                                            for column in 0..COLUMNS {
-                                                let saturation =
-                                                    column as f32 / (COLUMNS - 1) as f32;
-                                                let value = 1.0 - row as f32 / (ROWS - 1) as f32;
-                                                let color = ChartPanel::hsv_color(
-                                                    selected_hue,
-                                                    saturation,
-                                                    value,
-                                                );
-                                                let x0 = bounds.origin.x
-                                                    + bounds.size.width
-                                                        * (column as f32 / COLUMNS as f32);
-                                                let y0 = bounds.origin.y
-                                                    + bounds.size.height
-                                                        * (row as f32 / ROWS as f32);
-                                                let x1 = bounds.origin.x
-                                                    + bounds.size.width
-                                                        * ((column + 1) as f32 / COLUMNS as f32);
-                                                let y1 = bounds.origin.y
-                                                    + bounds.size.height
-                                                        * ((row + 1) as f32 / ROWS as f32);
-                                                window.paint_quad(gpui::fill(
-                                                    gpui::Bounds::from_corners(
-                                                        gpui::point(x0, y0),
-                                                        gpui::point(x1, y1),
-                                                    ),
-                                                    color,
-                                                ));
-                                            }
-                                        }
-                                    },
-                                )
-                                .absolute()
-                                .size_full(),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(marker_x))
-                                    .top(px(marker_y))
-                                    .w(px(12.0))
-                                    .h(px(12.0))
-                                    .border_2()
-                                    .border_color(gpui::Hsla::white())
-                                    .bg(hue_color.opacity(0.2))
-                                    .shadow_sm(),
-                            )
-                    })
-                    .child({
-                        let hue_view = view.clone();
-                        div()
-                            .id("drawing-color-hue")
-                            .relative()
-                            .w(px(204.0))
-                            .h(px(16.0))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(theme.border)
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, {
-                                let view = hue_drag_view.clone();
-                                move |event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    let _ = view.update(cx, |this, cx| {
-                                        this.color_picker_drag = Some(ColorPickerDrag::Hue);
-                                        this.update_color_picker(
-                                            event.position,
-                                            ColorPickerDrag::Hue,
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                            })
-                            .on_mouse_move({
-                                let view = hue_drag_view.clone();
-                                move |event: &MouseMoveEvent, _window, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        if this.color_picker_drag == Some(ColorPickerDrag::Hue) {
-                                            cx.stop_propagation();
-                                            this.update_color_picker(
-                                                event.position,
-                                                ColorPickerDrag::Hue,
-                                            );
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            })
-                            .on_mouse_up(MouseButton::Left, {
-                                let view = hue_drag_view.clone();
-                                move |_event, _window, cx| {
-                                    let _ = view.update(cx, |this, cx| {
-                                        if this.color_picker_drag == Some(ColorPickerDrag::Hue) {
-                                            cx.stop_propagation();
-                                            this.color_picker_drag = None;
-                                            cx.notify();
-                                        }
-                                    });
-                                }
-                            })
-                            .child(
-                                gpui::canvas(
-                                    move |bounds, _, cx| {
-                                        let _ = hue_view.update(cx, |this, _| {
-                                            this.color_picker_hue_bounds = bounds;
-                                        });
-                                    },
-                                    move |bounds, _, window, _cx| {
-                                        const STEPS: usize = 36;
-                                        for step in 0..STEPS {
-                                            let hue = step as f32 / STEPS as f32;
-                                            let x0 = bounds.origin.x + bounds.size.width * hue;
-                                            let x1 = bounds.origin.x
-                                                + bounds.size.width
-                                                    * ((step + 1) as f32 / STEPS as f32);
-                                            window.paint_quad(gpui::fill(
-                                                gpui::Bounds::from_corners(
-                                                    gpui::point(x0, bounds.origin.y),
-                                                    gpui::point(
-                                                        x1,
-                                                        bounds.origin.y + bounds.size.height,
-                                                    ),
-                                                ),
-                                                ChartPanel::hsv_color(hue, 1.0, 1.0),
-                                            ));
-                                        }
-                                    },
-                                )
-                                .absolute()
-                                .size_full(),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(hue_marker_x - 2.0))
-                                    .top(px(1.0))
-                                    .w(px(4.0))
-                                    .h(px(14.0))
-                                    .border_1()
-                                    .border_color(gpui::Hsla::white())
-                                    .bg(gpui::Hsla::transparent_black()),
-                            )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pt(px(2.0))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.muted_foreground)
-                                    .child("Quick picks"),
-                            )
-                            .children(palettes[0].1.iter().enumerate().map(|(index, &hex)| {
-                                let view = view.clone();
-                                let hex_str = hex.to_string();
-                                let is_active = selected_hex.eq_ignore_ascii_case(hex);
-                                let swatch_color = ChartPanel::parse_hex_color(hex)
-                                    .unwrap_or(gpui::rgba(0xffffffff).into());
-                                div()
-                                    .id(ElementId::Name(
-                                        format!("drawing-color-quick-{}", index).into(),
-                                    ))
-                                    .cursor_pointer()
-                                    .w(px(22.0))
-                                    .h(px(22.0))
-                                    .bg(swatch_color)
-                                    .border_1()
-                                    .border_color(if is_active {
-                                        theme.foreground
-                                    } else {
-                                        theme.border.opacity(0.65)
-                                    })
-                                    .when(is_active, |this| this.border_2())
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(is_active, |this| {
-                                                this.child(
-                                                    gpui_component::Icon::default()
-                                                        .path("icons/check.svg")
-                                                        .size(px(12.0))
-                                                        .text_color(if hex == "#FFFFFF" {
-                                                            gpui::Hsla::from(gpui::rgba(0x263238ff))
-                                                        } else {
-                                                            gpui::Hsla::from(gpui::rgba(0xffffffff))
-                                                        }),
-                                                )
-                                            }),
-                                    )
-                                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                        let view = view.clone();
-                                        let hex_str = hex_str.clone();
-                                        window.defer(cx, move |window, cx| {
-                                            let _ = view.update(cx, |this, cx| {
-                                                this.drawing_color = hex_str;
-                                                this.color_picker_drag = None;
-                                                window.focus(&this.focus_handle);
-                                                cx.notify();
-                                            });
-                                        });
-                                    })
-                            })),
-                    )
-                    .into_any_element()
-            });
-
-        let snap = toolbar_button("toolbar_snap", "icons/magnet.svg", "Snap")
-            .selected(self.snap_to_candle)
-            .when(self.snap_to_candle, |button| {
-                button.bg(active_bg).text_color(active_fg)
-            })
-            .tooltip("Snap drawings to candles")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.snap_to_candle = !this.snap_to_candle;
-                cx.notify();
-            }));
-
-        let reset = toolbar_button("toolbar_reset_view", "icons/undo-2.svg", "Reset")
-            .tooltip("Reset view (F)")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                let total = this.feed.len();
-                this.chart_state.reset_view(total);
-                cx.notify();
-            }));
-
-        let grid = toolbar_button("toolbar_grid", "icons/crosshair.svg", "Grid")
-            .selected(self.show_horizontal_grid)
-            .when(self.show_horizontal_grid, |button| {
-                button
-                    .bg(colors.muted.opacity(0.3))
-                    .text_color(colors.foreground)
-            })
-            .tooltip("Horizontal grid (G)")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.show_horizontal_grid = !this.show_horizontal_grid;
-                this.mark_dirty();
-                cx.notify();
-            }));
-
-        let clear = toolbar_button("toolbar_clear_drawings", "icons/delete.svg", "Clear")
-            .tooltip("Clear all drawings")
-            .on_click(cx.listener(|this, _event, _window, cx| {
-                this.clear_all_drawings();
-                cx.notify();
-            }));
-
-        div()
-            .h(toolbar_h)
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .overflow_hidden()
-            .gap(px(2.0))
-            .px(if is_wide { px(8.0) } else { px(4.0) })
-            .border_b_1()
-            .border_color(colors.border)
-            .bg(colors.background)
-            .text_xs()
-            .on_mouse_move(cx.listener(|this, _ev: &MouseMoveEvent, _win, cx| {
-                if this.chart_state.crosshair_pos.is_some() || this.drawing_cursor_point.is_some() {
-                    this.chart_state.crosshair_pos = None;
-                    this.drawing_cursor_point = None;
-                    cx.notify();
-                }
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .flex_shrink_0()
-                    .child(indicators)
-                    .child(chart_type)
-                    .when(!is_ultra_compact, |this| this.child(separator()))
-                    .child(drawing_button(
-                        None,
-                        "toolbar_pointer",
-                        "icons/mouse-pointer.svg",
-                        "Pointer",
-                    ))
-                    .when(!is_ultra_compact, |this| {
-                        this.child(drawing_button(
-                            Some(DrawingTool::Trendline),
-                            "toolbar_trendline",
-                            "icons/trending-up.svg",
-                            "Trend",
-                        ))
-                    })
-                    .when(is_wide || is_medium, |this| {
-                        this.child(drawing_button(
-                            Some(DrawingTool::HorizontalLine),
-                            "toolbar_horizontal",
-                            "icons/minus.svg",
-                            "Horizontal",
-                        ))
-                    })
-                    .when(is_wide, |this| {
-                        this.child(drawing_button(
-                            Some(DrawingTool::VerticalLine),
-                            "toolbar_vertical",
-                            "icons/arrow-up.svg",
-                            "Vertical",
-                        ))
-                        .child(drawing_button(
-                            Some(DrawingTool::Ray),
-                            "toolbar_ray",
-                            "icons/arrow-right.svg",
-                            "Ray",
-                        ))
-                        .child(drawing_button(
-                            Some(DrawingTool::Fibonacci),
-                            "toolbar_fibonacci",
-                            "icons/sort-ascending.svg",
-                            "Fib",
-                        ))
-                        .child(drawing_button(
-                            Some(DrawingTool::PriceChannel),
-                            "toolbar_channel",
-                            "icons/frame.svg",
-                            "Channel",
-                        ))
-                        .child(drawing_button(
-                            Some(DrawingTool::Text),
-                            "toolbar_text",
-                            "icons/a-large-small.svg",
-                            "Text",
-                        ))
-                    })
-                    .when(!is_wide, |this| this.child(more_drawings))
-                    .when(is_wide || is_medium, |this| {
-                        this.child(drawing_button(
-                            Some(DrawingTool::LongPosition),
-                            "toolbar_long",
-                            "icons/arrow-up.svg",
-                            "Long",
-                        ))
-                        .child(drawing_button(
-                            Some(DrawingTool::ShortPosition),
-                            "toolbar_short",
-                            "icons/arrow-down.svg",
-                            "Short",
-                        ))
-                    })
-                    .when(!is_ultra_compact, |this| this.child(separator()))
-                    .child(color_picker)
-                    .when(!is_ultra_compact, |this| this.child(snap))
-                    .when(!is_ultra_compact, |this| this.child(separator()))
-                    .child(reset)
-                    .when(is_wide || is_medium, |this| this.child(grid))
-                    .when(!is_ultra_compact || w >= 260.0, |this| this.child(clear)),
-            )
-    }
-
-    fn render_indicator_library(&self, cx: &Context<Self>) -> AnyElement {
-        if !self.show_indicator_library {
-            return div().into_any_element();
-        }
-
-        let colors = &cx.theme().colors;
-        let categories = [
-            (None, "All"),
-            (Some(IndicatorCategory::Trend), "Trend"),
-            (Some(IndicatorCategory::Momentum), "Momentum"),
-            (Some(IndicatorCategory::Volatility), "Volatility"),
-            (Some(IndicatorCategory::Volume), "Volume"),
-        ];
-
-        let available_kinds: Vec<IndicatorKind> = IndicatorKind::all()
-            .into_iter()
-            .filter(|k| {
-                if let Some(cat) = self.indicator_library_category {
-                    if k.category() != cat {
-                        return false;
-                    }
-                }
-                if !self.indicator_library_search.is_empty() {
-                    let q = self.indicator_library_search.to_lowercase();
-                    return k.label().to_lowercase().contains(&q)
-                        || k.category().label().to_lowercase().contains(&q);
-                }
-                true
-            })
-            .collect();
-
-        div()
-            .absolute()
-            .top(px(self.library_y))
-            .left(px(self.library_x))
-            .w(px(self.library_w))
-            .h(px(self.library_h))
-            .border_1()
-            .border_color(colors.border)
-            .bg(colors.background)
-            .shadow_lg()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .text_sm()
-            .cursor_default()
-            .on_mouse_move(cx.listener(|this, _ev: &MouseMoveEvent, _win, cx| {
-                cx.stop_propagation();
-                if this.chart_state.crosshair_pos.is_some() {
-                    this.chart_state.crosshair_pos = None;
-                    cx.notify();
-                }
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|_this, _ev, _win, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(|_this, _ev, _win, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(|_this, _ev, _win, cx| {
-                    cx.stop_propagation();
-                }),
-            )
-            .on_scroll_wheel(cx.listener(|_this, _ev, _win, cx| {
-                cx.stop_propagation();
-            }))
-            // Draggable Modal Header
-            .child(
-                div()
-                    .h(px(36.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .cursor_grab()
-                    .bg(colors.muted.opacity(0.15))
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, ev: &MouseDownEvent, _win, cx| {
-                            cx.stop_propagation();
-                            this.library_dragging = true;
-                            this.library_drag_start_x = ev.position.x.as_f32();
-                            this.library_drag_start_y = ev.position.y.as_f32();
-                            this.library_drag_origin_x = this.library_x;
-                            this.library_drag_origin_y = this.library_y;
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(colors.foreground)
-                            .child("INDICATORS & STRATEGIES"),
-                    )
-                    .child(
-                        div()
-                            .id("indicator_modal_close_btn")
-                            .cursor_pointer()
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .hover(|s| s.bg(colors.muted.opacity(0.2)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _ev, _win, cx| {
-                                    cx.stop_propagation();
-                                    this.show_indicator_library = false;
-                                    cx.notify();
-                                }),
-                            )
-                            .child("✕"),
-                    ),
-            )
-            // Category Tabs
-            .child(
-                div()
-                    .h(px(32.0))
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .border_b_1()
-                    .border_color(colors.border)
-                    .children(categories.into_iter().map(|(cat, label)| {
-                        let is_active = self.indicator_library_category == cat;
-                        div()
-                            .cursor_pointer()
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .bg(if is_active {
-                                colors.primary.opacity(0.14)
-                            } else {
-                                gpui::transparent_black()
-                            })
-                            .text_color(if is_active {
-                                colors.primary
-                            } else {
-                                colors.muted_foreground
-                            })
-                            .hover(|s| {
-                                s.bg(colors.muted.opacity(0.2))
-                                    .text_color(colors.foreground)
-                            })
-                            .font_weight(if is_active {
-                                gpui::FontWeight::BOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _win, cx| {
-                                    cx.stop_propagation();
-                                    this.indicator_library_category = cat;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(label)
-                    })),
-            )
-            // Content Body
-            .child(
-                div()
-                    .id("library-scroll")
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .p(px(12.0))
-                    .gap(px(10.0))
-                    .overflow_y_scroll()
-                    // Active on Chart section
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(format!(
-                                        "ACTIVE ON CHART ({})",
-                                        self.indicators.len()
-                                    )),
-                            )
-                            .children(self.indicators.iter().map(|ind| {
-                                let ind_id = ind.id.clone();
-                                let is_editing = self.editing_indicator_id.as_deref() == Some(&ind_id);
-
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .p(px(6.0))
-                                    .bg(colors.muted.opacity(0.15))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                                    .child(ind.display_label()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(6.0))
-                                                    // Toggle Visibility
-                                                    .child(
-                                                        div()
-                                                            .cursor_pointer()
-                                                            .text_color(colors.muted_foreground)
-                                                            .hover(|s| s.text_color(colors.foreground))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener({
-                                                                    let id = ind_id.clone();
-                                                                    move |this, _ev, _win, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.toggle_indicator_instance(&id);
-                                                                        cx.notify();
-                                                                    }
-                                                                }),
-                                                            )
-                                                            .child(if ind.visible { "👁" } else { "👁‍🗨" }),
-                                                    )
-                                                    // Settings Expander
-                                                    .child(
-                                                        div()
-                                                            .cursor_pointer()
-                                                            .text_color(colors.muted_foreground)
-                                                            .hover(|s| s.text_color(colors.foreground))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener({
-                                                                    let id = ind_id.clone();
-                                                                    move |this, _ev, _win, cx| {
-                                                                        cx.stop_propagation();
-                                                                        if this.editing_indicator_id.as_deref() == Some(&id) {
-                                                                            this.editing_indicator_id = None;
-                                                                        } else {
-                                                                            this.editing_indicator_id = Some(id.clone());
-                                                                            if let Some(target) = this.indicators.iter().find(|i| i.id == id) {
-                                                                                this.editing_param_inputs = target.params.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
-                                                                            }
-                                                                        }
-                                                                        cx.notify();
-                                                                    }
-                                                                }),
-                                                            )
-                                                            .child("⚙"),
-                                                    )
-                                                    // Remove Instance
-                                                    .child(
-                                                        div()
-                                                            .cursor_pointer()
-                                                            .text_color(colors.bearish)
-                                                            .hover(|s| s.text_color(colors.bearish.opacity(0.8)))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener({
-                                                                    let id = ind_id.clone();
-                                                                    move |this, _ev, _win, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.remove_indicator_instance(&id);
-                                                                        cx.notify();
-                                                                    }
-                                                                }),
-                                                            )
-                                                            .child("✕"),
-                                                    ),
-                                            ),
-                                    )
-                                    .children(if is_editing {
-                                        Some(
-                                            div()
-                                                .pt(px(6.0))
-                                                .border_t_1()
-                                                .border_color(colors.border)
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(4.0))
-                                                .text_xs()
-                                                .children(ind.params.iter().map(|(p_name, _val)| {
-                                                    let val_str = self.editing_param_inputs.get(p_name).cloned().unwrap_or_default();
-                                                    let param_key = p_name.clone();
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .child(div().child(p_name.clone()))
-                                                        .child(
-                                                            div()
-                                                                .px(px(6.0))
-                                                                .py(px(2.0))
-                                                                .bg(colors.muted.opacity(0.3))
-                                                                .child(format!("{}: {}", param_key, val_str))
-                                                        )
-                                                }))
-                                                .children(self.editing_param_error.as_ref().map(|err| {
-                                                    div().text_color(colors.bearish).child(err.clone())
-                                                }))
-                                        )
-                                    } else {
-                                        None
-                                    })
-                            })),
-                    )
-                    // Available Library section
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_xs()
-                                    .text_color(colors.muted_foreground)
-                                    .child(format!(
-                                        "AVAILABLE INDICATORS ({})",
-                                        available_kinds.len()
-                                    )),
-                            )
-                            .children(available_kinds.into_iter().map(|kind| {
-                                let label = SharedString::from(kind.label().to_string());
-                                let cat_label = kind.category().label();
-                                let k = kind.clone();
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .p(px(6.0))
-                                    .bg(colors.muted.opacity(0.08))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                                    .child(label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .px(px(4.0))
-                                                    .py(px(1.0))
-                                                    .bg(colors.muted.opacity(0.2))
-                                                    .text_color(colors.muted_foreground)
-                                                    .child(cat_label),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .cursor_pointer()
-                                            .px(px(8.0))
-                                            .py(px(2.0))
-                                            .bg(colors.primary.opacity(0.2))
-                                            .text_color(colors.primary)
-                                            .hover(|s| {
-                                                s.bg(colors.primary.opacity(0.3))
-                                                    .text_color(colors.foreground)
-                                            })
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _ev, _win, cx| {
-                                                    cx.stop_propagation();
-                                                    this.add_indicator_instance(k.clone());
-                                                    cx.notify();
-                                                }),
-                                            )
-                                            .child("+ Add"),
-                                    )
-                            })),
-                    ),
-            )
-            // Footer resize handle
-            .child(
-                div()
-                    .h(px(16.0))
-                    .w_full()
-                    .flex()
-                    .justify_end()
-                    .items_center()
-                    .pr(px(4.0))
-                    .cursor_nwse_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _ev: &MouseDownEvent, _win, cx| {
-                            cx.stop_propagation();
-                            this.library_resizing = true;
-                            cx.notify();
-                        }),
-                    )
-                    .child(div().w(px(8.0)).h(px(8.0)).bg(colors.muted_foreground)),
-            )
-            .into_any_element()
     }
 }
 
@@ -4036,19 +2810,19 @@ mod tests {
     }
 
     #[test]
-    fn test_color_picker_hex_parsing() {
-        let colors = [
-            "#C4E855", "#00F0FF", "#FFD600", "#FF0055", "#FFFFFF", "#00E676", "#2EBD85", "#2979FF",
-            "#FF3D00", "#ECEFF1",
-        ];
-        for hex in colors {
-            assert!(ChartPanel::parse_hex_color(hex).is_some());
-        }
-    }
-
-    #[test]
     fn test_new_chart_has_no_default_indicators() {
         let layout = ChartLayout::new("binance", "BTC/USDT", "1m");
         assert!(layout.indicators.is_empty());
+    }
+
+    #[test]
+    fn duplicate_indicator_ids_do_not_collide_after_removal() {
+        let mut indicators = vec![IndicatorInstance::new("ema-1", IndicatorKind::Ema)];
+        let next = unique_indicator_id(&indicators, &IndicatorKind::Ema);
+        assert_eq!(next, "ema-2");
+        indicators.push(IndicatorInstance::new(next, IndicatorKind::Ema));
+        indicators.retain(|instance| instance.id != "ema-1");
+        let next = unique_indicator_id(&indicators, &IndicatorKind::Ema);
+        assert_eq!(next, "ema-3");
     }
 }

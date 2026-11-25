@@ -12,6 +12,16 @@ Existing layout files still load: the removed order-flow fields are simply ignor
 
 The standalone **Depth of Market** (order book) and **Time & Sales** (trade tape) panes are unaffected and continue to stream from the gateway's `orderbook` and `trades` subscriptions. The backend `GET /api/v1/trades/history` contract is unchanged; the desktop client no longer calls it.
 
+## Chart controls moved to the pane title bar
+
+Chart features no longer use the 34 px in-chart toolbar or the old in-chart indicator/color popovers. Each chart pane now shows four separate controls next to the timeframe buttons: **Type**, **Indicators**, **Drawings**, and **View**. The Type, Drawings, and View controls are dropdown menus; **Indicators** and **Drawing color** open transient floating OS windows bound to that pane.
+
+The indicator window manages active studies, parameter editing with inline validation, visibility, removal, and adding new studies. The drawing-colour window owns the HSV square, hue strip, hex preview, and a single compact palette grid; the chosen colour applies to new drawings and updates the Drawings menu swatch. `I` opens the indicator window, and the existing `G`/`F`/`L` chart shortcuts continue to work, including on the opt-in `FINTER_CHART_V2` path.
+
+The four title-bar triggers keep their full names in the tooltip and menu but use short labels on the bar (for example `Solid`, `Heikin`), and indicator category tags are neutral chips: colour stays reserved for market direction, armed tools and alerts.
+
+Existing chart layout files still load unchanged. `library_geometry` remains in the layout model for compatibility but is no longer written or used by the chart panel.
+
 ## Chart core (experimental, opt-in)
 
 A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, indicators, volume, and history paging. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.

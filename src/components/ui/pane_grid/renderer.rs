@@ -10,6 +10,10 @@ use gpui_component::popover::Popover;
 use gpui_component::menu::{DropdownMenu, GroupListPopup};
 
 use crate::components::ui::pane_grid::drag_view::{DragView, DragContent};
+use crate::components::ui::pane_grid::chart_config::{
+    CANDLE_TYPES, candle_type_from_config,
+};
+use crate::components::ui::pane_grid::chart_menus::render_chart_controls;
 
 
 
@@ -193,7 +197,7 @@ fn infer_market_type(exchange: &str, symbol: &str) -> crate::data::trade_store::
     MarketType::default_for_exchange(&exchange)
 }
 
-fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Value, window: &mut Window, cx: &mut App) {
+pub(super) fn update_pane_config(pane_id: String, key: &'static str, value: serde_json::Value, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |_window, cx| {
         let mut config = serde_json::Map::new();
         config.insert(key.to_string(), value);
@@ -239,16 +243,6 @@ fn update_exchange_config(pane_id: String, exchange: String, window: &mut Window
         });
     });
 }
-
-const CANDLE_TYPES: [(&str, &str); 7] = [
-    ("candle_solid", "Candle Solid"),
-    ("candle_stroke", "Candle Stroke"),
-    ("candle_up_stroke", "Candle Up Stroke"),
-    ("candle_down_stroke", "Candle Down Stroke"),
-    ("heikin_ashi", "Heikin-Ashi"),
-    ("ohlc", "OHLC"),
-    ("area", "Area"),
-];
 
 fn timezone_choices() -> &'static [(&'static str, &'static str)] {
     &[
@@ -385,19 +379,6 @@ fn symbol_choices_for_market(
         symbol_choices(&exchange)
     } else {
         filtered
-    }
-}
-
-fn candle_type_from_config(value: &str) -> gpui_component::chart::CandleType {
-    match value {
-        "candle_stroke" => gpui_component::chart::CandleType::Stroke,
-        "candle_up_stroke" => gpui_component::chart::CandleType::UpStroke,
-        "candle_down_stroke" => gpui_component::chart::CandleType::DownStroke,
-        "ohlc" => gpui_component::chart::CandleType::Ohlc,
-        "area" => gpui_component::chart::CandleType::Area,
-        "heikin_ashi" => gpui_component::chart::CandleType::HeikinAshi,
-        "candle_solid" => gpui_component::chart::CandleType::Solid,
-        _ => gpui_component::chart::CandleType::Solid,
     }
 }
 
@@ -712,6 +693,32 @@ impl PaneGridRenderer {
             serde_json::json!({"pane_id": pane_id, "type": "fear_greed", "data": state.entity.read(cx).agent_snapshot()})
         }).collect::<Vec<_>>();
         serde_json::json!({"tickers": tickers, "charts": charts, "order_books": order_books, "tapes": tapes, "news": news, "fear_greed": fear_greed})
+    }
+
+    /// Clone the chart entity for a pane without holding a `chart_views` borrow
+    /// while the caller mutates layout state.
+    pub fn chart_for_pane(
+        &self,
+        pane_id: &str,
+    ) -> Option<Entity<crate::components::ui::chart_panel::ChartPanel>> {
+        self.chart_views
+            .borrow()
+            .get(pane_id)
+            .map(|state| state.entity.clone())
+    }
+
+    /// Recursively look up the module type for a pane id in the current tree.
+    pub fn pane_module_type(&self, pane_id: &str) -> Option<String> {
+        fn find(node: &PaneNode, pane_id: &str) -> Option<String> {
+            match node {
+                PaneNode::Pane { id, data } if id == pane_id => {
+                    Some(data.module_type.clone().unwrap_or_default())
+                }
+                PaneNode::Pane { .. } => None,
+                PaneNode::Split { a, b, .. } => find(a, pane_id).or_else(|| find(b, pane_id)),
+            }
+        }
+        self.tree.as_ref().and_then(|tree| find(tree, pane_id))
     }
 
     pub fn set_agent_context(&mut self, context: serde_json::Value, cx: &mut Context<Self>) {
@@ -1111,6 +1118,8 @@ impl PaneGridRenderer {
                 let current_timezone = config_str(config_map, "timezone", &self.timezone);
 
                 let is_active = self.active_pane_id.as_ref() == Some(&pane_id);
+                let grid_entity = cx.entity();
+                let chart_entity = self.chart_for_pane(&pane_id);
                 let matrix_hover = self.matrix_hover.clone();
                 let is_dragged = *self.dragged_pane.borrow() == Some(pane_id.clone());
                 let border_color = if is_active {
@@ -1339,7 +1348,7 @@ impl PaneGridRenderer {
                                             "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "1w", "1M",
                                         ];
 
-                                        if current_size.width < 340.0 {
+                                        if current_size.width < 520.0 {
                                             let pane_id = pane_id.clone();
                                             let current_tf = current_timeframe.clone();
                                             this.child(
@@ -1542,6 +1551,17 @@ impl PaneGridRenderer {
                                                     ))
                                             )
                                         }
+                                    })
+                                    .when(module_type.to_lowercase() == "chart", |this| {
+                                        this.child(render_chart_controls(
+                                            &pane_id,
+                                            &grid_entity,
+                                            chart_entity.as_ref(),
+                                            current_size.width,
+                                            is_active,
+                                            title_fg,
+                                            &*cx,
+                                        ))
                                     }),
                             )
                             // Toolbar
@@ -2055,6 +2075,22 @@ impl PaneGridRenderer {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
+                                                    let grid = grid_entity.downgrade();
+                                                    let pane = pane_id.clone();
+                                                    panel.on_open_indicators = Some(std::sync::Arc::new(move |window, cx| {
+                                                        let Some(grid) = grid.upgrade() else {
+                                                            return;
+                                                        };
+                                                        crate::components::ui::chart_tools::open_chart_tool_window(
+                                                            crate::components::ui::chart_tools::ChartToolKind::Indicators,
+                                                            crate::components::ui::chart_tools::ChartPaneBinding {
+                                                                grid,
+                                                                pane_id: pane.clone(),
+                                                            },
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }));
                                                     panel.set_size(content_w, content_h);
                                                     panel
                                                 });
@@ -2074,6 +2110,10 @@ impl PaneGridRenderer {
                                                     _bridge: std::sync::Arc::new(bridge),
                                                 };
                                                 chart_map.insert(pane_id.clone(), state);
+                                                // The title-bar controls were rendered before the
+                                                // chart entity existed. Re-render once so they can
+                                                // bind to it instead of staying disabled.
+                                                cx.notify();
                                                 cached_panel(chart_panel)
                                             }
                                             Err(e) => {

@@ -41,7 +41,7 @@ impl ChartMetrics {
         let plot_height = if plot_height.is_finite() && plot_height > 0.0 {
             plot_height
         } else {
-            (pane_height - 34.0).max(80.0)
+            pane_height.max(80.0)
         };
 
         let scale = ((pane_width / 1000.0).min(pane_height / 700.0)).clamp(0.75, 1.35);
@@ -80,5 +80,11 @@ mod tests {
         assert!(metrics.plot_width > 0.0);
         assert!(metrics.plot_height > 0.0);
         assert!(!metrics.compact);
+    }
+
+    #[test]
+    fn fallback_plot_height_does_not_reserve_toolbar_space() {
+        let metrics = ChartMetrics::new(900.0, 500.0, 0.0, 0.0);
+        assert_eq!(metrics.plot_height, 500.0);
     }
 }

@@ -3,6 +3,7 @@ pub mod agent_panel;
 pub mod alerts_panel;
 pub mod avatar;
 pub mod chart_panel;
+pub mod chart_tools;
 pub mod clock_panel;
 pub mod credit_alert;
 pub mod dashboard_manager;
@@ -54,4 +55,3 @@ impl SelectItem for ExchangeSelectItem {
         &self.id
     }
 }
-
