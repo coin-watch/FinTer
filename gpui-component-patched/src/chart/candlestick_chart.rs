@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::chart_state::{ChartOverlayAction, ChartOverlayHitbox, ChartState};
+use super::core::{timeframe_interval_ms, timestamp_at_buffer_index};
 use super::linear_scale::LinearScale;
 
 // ---------------------------------------------------------------------------
@@ -133,6 +134,9 @@ where
     volume: Option<Rc<dyn Fn(&T) -> f64>>,
     /// Body width as a fraction of the per-candle slot width (0.0–1.0).
     body_width_ratio: f32,
+    /// Selected timeframe (for example `1m`, `4h`, `1M`). Used to extrapolate
+    /// timestamps for crosshair slots outside the loaded buffer.
+    timeframe: Option<String>,
     /// Interactive viewport / crosshair state.
     state: Option<ChartState>,
     /// Optional price formatter (for labels and tooltip).
@@ -176,6 +180,7 @@ where
             close: None,
             volume: None,
             body_width_ratio: 0.8,
+            timeframe: None,
             state: None,
             format_price: None,
             format_timestamp_short: None,
@@ -241,6 +246,15 @@ where
 
     pub fn body_width_ratio(mut self, ratio: f32) -> Self {
         self.body_width_ratio = ratio;
+        self
+    }
+
+    /// Set the selected timeframe (for example `1m`, `4h`, `1M`).
+    ///
+    /// The crosshair uses this to extrapolate a timestamp for slots outside
+    /// the loaded candle buffer instead of relying only on a median interval.
+    pub fn timeframe(mut self, timeframe: impl Into<String>) -> Self {
+        self.timeframe = Some(timeframe.into());
         self
     }
 
@@ -405,8 +419,11 @@ where
             }
         }
 
+        // Prefer the exact selected timeframe; a single candle has no median
+        // and sparse history can produce a misleading one.
+        let timeframe = self.timeframe.as_deref().unwrap_or("");
         let n = timestamps.len();
-        let interval_ms: i64 = if n >= 2 {
+        let median_interval_ms: i64 = if n >= 2 {
             let mut gaps: Vec<i64> = timestamps
                 .windows(2)
                 .map(|w| (w[1] - w[0]).abs())
@@ -417,6 +434,7 @@ where
         } else {
             60_000 // default 1m
         };
+        let interval_ms = timeframe_interval_ms(timeframe).unwrap_or(median_interval_ms);
 
         // Determine Y-axis width dynamically based on the longest price label.
         let all_y_vals: Vec<f64> = visible
@@ -1236,7 +1254,7 @@ where
             }
         }
 
-        // 6. X-axis tick labels (slot-based, evenly spaced)
+        // 6. X-axis tick labels (continuous slot indices, including blank time)
         // ------------------------------------------------------------------ //
         {
             let origin = bounds.origin;
@@ -1245,21 +1263,41 @@ where
             // Space labels out so they never collide: at most one label per
             // `min_label_spacing` pixels of chart width.
             let min_label_spacing = 80.0f32;
-            let max_ticks = ((chart_w / min_label_spacing).floor() as usize).max(2);
-            let step = (visible.len() / max_ticks).max(1);
+            let viewport_offset = self
+                .state
+                .as_ref()
+                .map(|st| st.viewport_offset)
+                .unwrap_or(0.0);
+            let visible_slots = self
+                .state
+                .as_ref()
+                .map(|st| st.visible_count.max(1))
+                .unwrap_or_else(|| visible_count_f.round().max(1.0) as usize);
+            let ticks = build_x_time_ticks(
+                &timestamps,
+                vis_start,
+                viewport_offset,
+                visible_slots,
+                chart_w,
+                slot_w,
+                timeframe,
+                interval_ms,
+                min_label_spacing,
+            );
 
             let mut last_drawn_ts: Option<i64> = None;
-            for i in (0..visible.len()).step_by(step) {
-                let ts = timestamps[i];
-                let px_x = (i as f32 + shift_candles + 0.5) * slot_w;
-                let abs_x = origin.x.as_f32() + px_x;
+            for tick in ticks {
+                let ts = tick.timestamp;
+                let abs_x = origin.x.as_f32() + tick.x;
                 let label: SharedString = self
                     .format_timestamp_short
                     .as_ref()
                     .map(|formatter| formatter(ts, best_interval, last_drawn_ts))
-                    .unwrap_or_else(|| format_timestamp_short(ts, best_interval, last_drawn_ts).into());
+                    .unwrap_or_else(|| {
+                        format_timestamp_short(ts, best_interval, last_drawn_ts).into()
+                    });
                 let lw = label.len() as f32 * CHAR_WIDTH_EST;
-                let lx = abs_x - lw / 2.0;
+                let lx = clamp_label_left(abs_x, lw, origin.x.as_f32(), chart_w);
                 let lbounds = Bounds::from_corners(
                     gpui::point(px(lx), px(axis_y + 2.0)),
                     gpui::point(px(lx + lw + 4.0), px(axis_y + 14.0)),
@@ -1953,136 +1991,134 @@ where
                 let cursor_rel = cursor - origin;
                 let cursor_x_in_chart = cursor_rel.x.as_f32();
                 if cursor_x_in_chart >= 0.0 && cursor_x_in_chart <= chart_w {
-                    // Snap to the candle slot under the cursor.
-                    let idx_f = (cursor_x_in_chart / slot_w) - shift_candles;
-                    let idx_signed = idx_f.floor() as isize;
-                    let idx_opt = if idx_signed >= 0 && (idx_signed as usize) < visible.len() {
-                        Some(idx_signed as usize)
+                    // Snap to the candle-slot cell under the cursor, including
+                    // blank past/future cells that have no loaded candle.
+                    let offset = st.viewport_offset;
+                    let total = self.data.len();
+                    let slot = slot_at(cursor_x_in_chart, slot_w, offset);
+                    let rel = slot - vis_start as i64;
+                    let in_range = slot >= 0 && (slot as usize) < total;
+                    let ts =
+                        timestamp_at_buffer_index(&timestamps, rel as f64, timeframe, interval_ms)
+                            .unwrap_or_else(|| timestamps.first().copied().unwrap_or(0));
+                    if in_range {
+                        st.crosshair_index.set(Some(slot as usize));
                     } else {
-                        None
-                    };
+                        st.crosshair_index.set(None);
+                    }
 
-                    if let Some(idx) = idx_opt {
-                        if idx < visible.len() {
-                            let abs_idx = st.visible_range(self.data.len()).start + idx;
-                            st.crosshair_index.set(Some(abs_idx));
+                    // Snap X to the slot centre (also works outside the buffer).
+                    let cx_px =
+                        ((((slot as f64) - offset) + 0.5) as f32 * slot_w).clamp(0.0, chart_w);
 
-                            let ts = timestamps[idx];
+                    // Klinechart-style crosshair (dashed, neutral color)
+                    let mut crosshair_color = crosshair_line;
+                    // opacity is handled by the color itself in coinwatch, but we can set 0.8
+                    crosshair_color.a = 0.8;
+                    let dash_len = 6.0;
+                    let gap_len = 4.0;
 
-                            // Snap X to the candle centre.
-                            let cx_px =
-                                centres_x.get(idx).copied().unwrap_or(cursor_rel.x.as_f32());
+                    // Vertical dashed hairline
+                    let vx = origin.x.as_f32() + cx_px;
+                    let mut y_curr = origin.y.as_f32();
+                    // Vertical line spans full chart (candles + volume), stops at the bottom axis gap.
+                    let y_end = origin.y.as_f32() + full_h - AXIS_GAP;
+                    let mut vl = PathBuilder::stroke(px(1.5));
+                    while y_curr < y_end {
+                        vl.move_to(gpui::point(px(vx), px(y_curr)));
+                        let next_y = (y_curr + dash_len).min(y_end);
+                        vl.line_to(gpui::point(px(vx), px(next_y)));
+                        y_curr = next_y + gap_len;
+                    }
+                    if let Ok(p) = vl.build() {
+                        window.paint_path(p, crosshair_color);
+                    }
 
-                            // Klinechart-style crosshair (dashed, neutral color)
-                            let mut crosshair_color = crosshair_line;
-                            // opacity is handled by the color itself in coinwatch, but we can set 0.8
-                            crosshair_color.a = 0.8;
-                            let dash_len = 6.0;
-                            let gap_len = 4.0;
-
-                            // Vertical dashed hairline
-                            let vx = origin.x.as_f32() + cx_px;
-                            let mut y_curr = origin.y.as_f32();
-                            // Vertical line spans full chart (candles + volume), stops at the bottom axis gap.
-                            let y_end = origin.y.as_f32() + full_h - AXIS_GAP;
-                            let mut vl = PathBuilder::stroke(px(1.5));
-                            while y_curr < y_end {
-                                vl.move_to(gpui::point(px(vx), px(y_curr)));
-                                let next_y = (y_curr + dash_len).min(y_end);
-                                vl.line_to(gpui::point(px(vx), px(next_y)));
-                                y_curr = next_y + gap_len;
-                            }
-                            if let Ok(p) = vl.build() {
-                                window.paint_path(p, crosshair_color);
-                            }
-
-                            // Horizontal dashed hairline
-                            let cy_rel = cursor_rel.y.as_f32();
-                            if cy_rel >= 0.0 && cy_rel <= full_h - AXIS_GAP {
-                                let hy = origin.y.as_f32() + cy_rel;
-                                let mut x_curr = origin.x.as_f32();
-                                let x_end = origin.x.as_f32() + chart_w;
-                                let mut hl = PathBuilder::stroke(px(1.5));
-                                while x_curr < x_end {
-                                    hl.move_to(gpui::point(px(x_curr), px(hy)));
-                                    let next_x = (x_curr + dash_len).min(x_end);
-                                    hl.line_to(gpui::point(px(next_x), px(hy)));
-                                    x_curr = next_x + gap_len;
-                                }
-                                if let Ok(p) = hl.build() {
-                                    window.paint_path(p, crosshair_color);
-                                }
-
-                                // Crosshair pill on Y-axis
-                                let cy_abs = origin.y.as_f32() + cy_rel;
-                                let mut pl_txt: gpui::SharedString = "".into();
-                                if cy_rel <= candle_h {
-                                    let price_at_cursor = y_scale.inverse(cy_rel);
-                                    pl_txt = self.price_str(price_at_cursor);
-                                } else {
-                                    // Find which subpane we are in
-                                    for (y0, pane_h, p_min, p_max) in &subpane_bounds {
-                                        let y0 = *y0;
-                                        if cy_abs >= y0 && cy_abs <= y0 + pane_h {
-                                            let rel = (cy_abs - y0) / pane_h;
-                                            let v_val = p_max - (rel as f64) * (p_max - p_min);
-                                            pl_txt = format!("{:.2}", v_val).into();
-                                            break;
-                                        }
-                                    }
-                                    
-                                    // If not found in indicator bounds, maybe it's explicit volume
-                                    if pl_txt.is_empty() && self.volume.is_some() {
-                                        let v_y0 = origin.y.as_f32() + candle_h + VOLUME_GAP;
-                                        let pane_h = avail * subpane_ratios[0];
-                if cy_abs >= v_y0 && cy_abs <= v_y0 + pane_h {
-                                            let vols: Vec<f64> = visible.iter().map(|d| self.volume.as_ref().unwrap()(d)).collect();
-                                            let max_vol = vols.iter().cloned().fold(0.0_f64, f64::max);
-                                            let vol_cy = cy_abs - v_y0;
-                                            let v_val = max_vol - (vol_cy / pane_h) as f64 * max_vol;
-                                            pl_txt = format_volume(v_val).into();
-                                        }
-                                    }
-                                }
-                                
-                                if !pl_txt.is_empty() {
-                                    crosshair_price_badge = Some((pl_txt, crosshair_bg, hy));
-                                }
-                            }
-
-                            // --- X-axis timestamp pill ---
-                            {
-                                let ts_label: SharedString = self
-                                    .format_timestamp_short
-                                    .as_ref()
-                                    .map(|formatter| formatter(ts, best_interval, None))
-                                    .unwrap_or_else(|| {
-                                        format_timestamp_short(ts, best_interval, None).into()
-                                    });
-                                let pill_w =
-                                    (ts_label.len() as f32 * CHAR_WIDTH_EST + 10.0).max(50.0);
-                                let pill_h = 14.0_f32;
-                                let axis_y = origin.y.as_f32() + full_h - AXIS_GAP;
-                                let pill_x = (vx - pill_w / 2.0)
-                                    .max(origin.x.as_f32())
-                                    .min(origin.x.as_f32() + chart_w - pill_w);
-                                let pill_bounds = Bounds::from_corners(
-                                    gpui::point(px(pill_x), px(axis_y + 1.0)),
-                                    gpui::point(px(pill_x + pill_w), px(axis_y + pill_h + 1.0)),
-                                );
-                                window.paint_quad(fill(pill_bounds, cx.theme().foreground));
-                                paint_text_line(
-                                    ts_label,
-                                    gpui::point(px(pill_x + 3.0), px(axis_y + 2.0)),
-                                    cx.theme().background,
-                                    pill_bounds,
-                                    window,
-                                    cx,
-                                );
-                            }
-
-
+                    // Horizontal dashed hairline
+                    let cy_rel = cursor_rel.y.as_f32();
+                    if cy_rel >= 0.0 && cy_rel <= full_h - AXIS_GAP {
+                        let hy = origin.y.as_f32() + cy_rel;
+                        let mut x_curr = origin.x.as_f32();
+                        let x_end = origin.x.as_f32() + chart_w;
+                        let mut hl = PathBuilder::stroke(px(1.5));
+                        while x_curr < x_end {
+                            hl.move_to(gpui::point(px(x_curr), px(hy)));
+                            let next_x = (x_curr + dash_len).min(x_end);
+                            hl.line_to(gpui::point(px(next_x), px(hy)));
+                            x_curr = next_x + gap_len;
                         }
+                        if let Ok(p) = hl.build() {
+                            window.paint_path(p, crosshair_color);
+                        }
+
+                        // Crosshair pill on Y-axis
+                        let cy_abs = origin.y.as_f32() + cy_rel;
+                        let mut pl_txt: gpui::SharedString = "".into();
+                        if cy_rel <= candle_h {
+                            let price_at_cursor = y_scale.inverse(cy_rel);
+                            pl_txt = self.price_str(price_at_cursor);
+                        } else {
+                            // Find which subpane we are in
+                            for (y0, pane_h, p_min, p_max) in &subpane_bounds {
+                                let y0 = *y0;
+                                if cy_abs >= y0 && cy_abs <= y0 + pane_h {
+                                    let rel = (cy_abs - y0) / pane_h;
+                                    let v_val = p_max - (rel as f64) * (p_max - p_min);
+                                    pl_txt = format!("{:.2}", v_val).into();
+                                    break;
+                                }
+                            }
+
+                            // If not found in indicator bounds, maybe it's explicit volume
+                            if pl_txt.is_empty() && self.volume.is_some() {
+                                let v_y0 = origin.y.as_f32() + candle_h + VOLUME_GAP;
+                                let pane_h = avail * subpane_ratios[0];
+                                if cy_abs >= v_y0 && cy_abs <= v_y0 + pane_h {
+                                    let vols: Vec<f64> = visible
+                                        .iter()
+                                        .map(|d| self.volume.as_ref().unwrap()(d))
+                                        .collect();
+                                    let max_vol = vols.iter().cloned().fold(0.0_f64, f64::max);
+                                    let vol_cy = cy_abs - v_y0;
+                                    let v_val = max_vol - (vol_cy / pane_h) as f64 * max_vol;
+                                    pl_txt = format_volume(v_val).into();
+                                }
+                            }
+                        }
+
+                        if !pl_txt.is_empty() {
+                            crosshair_price_badge = Some((pl_txt, crosshair_bg, hy));
+                        }
+                    }
+
+                    // --- X-axis timestamp pill ---
+                    {
+                        let ts_label: SharedString = self
+                            .format_timestamp_short
+                            .as_ref()
+                            .map(|formatter| formatter(ts, best_interval, None))
+                            .unwrap_or_else(|| {
+                                format_timestamp_short(ts, best_interval, None).into()
+                            });
+                        let pill_w = (ts_label.len() as f32 * CHAR_WIDTH_EST + 10.0).max(50.0);
+                        let pill_h = 14.0_f32;
+                        let axis_y = origin.y.as_f32() + full_h - AXIS_GAP;
+                        let pill_x = (vx - pill_w / 2.0)
+                            .max(origin.x.as_f32())
+                            .min(origin.x.as_f32() + chart_w - pill_w);
+                        let pill_bounds = Bounds::from_corners(
+                            gpui::point(px(pill_x), px(axis_y + 1.0)),
+                            gpui::point(px(pill_x + pill_w), px(axis_y + pill_h + 1.0)),
+                        );
+                        window.paint_quad(fill(pill_bounds, cx.theme().foreground));
+                        paint_text_line(
+                            ts_label,
+                            gpui::point(px(pill_x + 3.0), px(axis_y + 2.0)),
+                            cx.theme().background,
+                            pill_bounds,
+                            window,
+                            cx,
+                        );
                     }
                 }
             }
@@ -2370,6 +2406,14 @@ fn format_price_inline(v: f64) -> String {
     }
 }
 
+/// Candle-slot cell under a pixel X, including blank past/future slots.
+fn slot_at(cursor_x: f32, slot_w: f32, offset: f64) -> i64 {
+    if !cursor_x.is_finite() || !slot_w.is_finite() || slot_w <= 0.0 || !offset.is_finite() {
+        return 0;
+    }
+    (((cursor_x as f64) / (slot_w as f64)) + offset).floor() as i64
+}
+
 /// Compact volume string (e.g. 1_234_567 → "1.23M").
 fn format_volume(v: f64) -> String {
     if v >= 1_000_000_000.0 {
@@ -2420,6 +2464,124 @@ fn format_countdown_duration(remaining_secs: i64) -> String {
     format!("{}s", seconds)
 }
 
+/// One X-axis label position in the continuous candle-slot space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct XTimeTick {
+    /// Buffer index the label represents (may be negative or past the buffer).
+    buffer_index: isize,
+    timestamp: i64,
+    /// Pixel X relative to the candle plot's left edge.
+    x: f32,
+}
+
+/// Build X-axis tick positions across the visible slot window.
+///
+/// Walks continuous buffer indices across the viewport, including one slot
+/// outside it on each side, so blank past/future regions still receive labels.
+/// The walk starts at the first index whose centre is inside the plot and skips
+/// anything off-plot; a final tick is added when the cadence grid stops short of
+/// the blank future margin. Indices outside `visible_timestamps` are
+/// extrapolated by [`timestamp_at_buffer_index`] using the selected timeframe.
+#[allow(clippy::too_many_arguments)]
+fn build_x_time_ticks(
+    visible_timestamps: &[i64],
+    buffer_start: usize,
+    viewport_offset: f64,
+    visible_count: usize,
+    chart_w: f32,
+    slot_w: f32,
+    timeframe: &str,
+    interval_ms: i64,
+    min_label_spacing: f32,
+) -> Vec<XTimeTick> {
+    if visible_timestamps.is_empty()
+        || !viewport_offset.is_finite()
+        || !chart_w.is_finite()
+        || chart_w <= 0.0
+        || !slot_w.is_finite()
+        || slot_w <= 0.0
+    {
+        return Vec::new();
+    }
+
+    let slot_columns = (chart_w as f64 / slot_w as f64).max(1.0);
+    // Requested walk bounds: one slot before the viewport through one slot
+    // after it, further trimmed to slots whose centres land inside the plot.
+    let requested_start = viewport_offset.floor() as isize - 1;
+    let requested_end = (viewport_offset + visible_count.max(1) as f64).ceil() as isize + 1;
+    let first_on_plot =
+        ((viewport_offset - 0.5).ceil() as isize).clamp(requested_start, requested_end);
+    let last_on_plot = ((viewport_offset + slot_columns - 0.5).floor() as isize)
+        .clamp(first_on_plot, requested_end);
+
+    let step = ((min_label_spacing.max(1.0) / slot_w).ceil() as isize).max(1);
+    let mut ticks = Vec::new();
+    let mut index = first_on_plot;
+    while index <= last_on_plot {
+        let relative = index - buffer_start as isize;
+        if let Some(timestamp) =
+            timestamp_at_buffer_index(visible_timestamps, relative as f64, timeframe, interval_ms)
+        {
+            let x = ((index as f64 - viewport_offset) + 0.5) as f32 * slot_w;
+            if x >= 0.0 && x <= chart_w {
+                ticks.push(XTimeTick {
+                    buffer_index: index,
+                    timestamp,
+                    x,
+                });
+            }
+        }
+        let Some(next) = index.checked_add(step) else {
+            break;
+        };
+        index = next;
+    }
+
+    // The cadence grid can end before the blank-future margin. Keep an edge
+    // label there so the axis never stops at the newest candle while the plot
+    // still shows blank time.
+    let future_start = buffer_start as isize + visible_timestamps.len() as isize;
+    if last_on_plot >= future_start && !ticks.iter().any(|tick| tick.buffer_index >= future_start) {
+        let relative = last_on_plot - buffer_start as isize;
+        if let Some(timestamp) =
+            timestamp_at_buffer_index(visible_timestamps, relative as f64, timeframe, interval_ms)
+        {
+            let edge = XTimeTick {
+                buffer_index: last_on_plot,
+                timestamp,
+                x: ((last_on_plot as f64 - viewport_offset) + 0.5) as f32 * slot_w,
+            };
+            // At wide zoom the edge label can sit close to the last regular
+            // tick. Replace that tick rather than painting two overlapping
+            // labels; spacing to the tick before it only grows.
+            if ticks
+                .last()
+                .is_some_and(|prev| edge.x - prev.x < min_label_spacing.max(1.0))
+            {
+                if let Some(prev) = ticks.last_mut() {
+                    *prev = edge;
+                }
+            } else if ticks
+                .last()
+                .is_none_or(|prev| prev.buffer_index != edge.buffer_index)
+            {
+                ticks.push(edge);
+            }
+        }
+    }
+    ticks
+}
+
+/// Clamp a centred tick label's left edge into the candle plot.
+///
+/// Keeps edge labels from spilling into the price rail or past the left edge.
+/// When the label is wider than the plot, it stays anchored at the plot's left
+/// edge rather than producing an inverted clamp range.
+fn clamp_label_left(abs_x: f32, label_w: f32, plot_left: f32, chart_w: f32) -> f32 {
+    let max_lx = (plot_left + chart_w - label_w - 4.0).max(plot_left);
+    (abs_x - label_w / 2.0).clamp(plot_left, max_lx)
+}
+
 /// Short timestamp: HH:MM (suitable for intraday views).
 fn format_timestamp_short(ts_ms: i64, _interval: f64, _prev: Option<i64>) -> String {
     let ts_secs = ts_ms / 1_000;
@@ -2451,4 +2613,243 @@ fn format_timestamp_long(ts_ms: i64) -> String {
         rem -= days;
     }
     format!("{} {:02} {:02}:{:02}", months[month_idx], rem + 1, h, m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINUTE: i64 = 60_000;
+
+    fn timestamps(count: usize) -> Vec<i64> {
+        const BASE: i64 = 1_700_000_000_000;
+        (0..count).map(|i| BASE + i as i64 * MINUTE).collect()
+    }
+
+    #[test]
+    fn slot_at_handles_blank_past_and_future_slots() {
+        let slot_w = 8.0;
+        assert_eq!(slot_at(0.0, slot_w, 0.0), 0);
+        assert_eq!(slot_at(4.0, slot_w, 0.0), 0);
+        assert_eq!(slot_at(12.0, slot_w, 0.0), 1);
+
+        assert_eq!(slot_at(0.0, slot_w, -3.0), -3);
+        assert_eq!(slot_at(4.0, slot_w, -3.0), -3);
+
+        assert_eq!(slot_at(799.0, slot_w, 100.0), 199);
+        assert_eq!(slot_at(0.0, slot_w, 150.0), 150);
+    }
+
+    #[test]
+    fn slot_at_handles_degenerate_slot_width() {
+        assert_eq!(slot_at(10.0, 0.0, 5.0), 0);
+        assert_eq!(slot_at(f32::NAN, 8.0, 5.0), 0);
+    }
+
+    #[test]
+    fn x_ticks_extend_into_blank_past() {
+        let ts = timestamps(20);
+        let slot_w = 800.0 / 12.0;
+        let ticks = build_x_time_ticks(&ts, 0, -3.0, 12, 800.0, slot_w, "1m", MINUTE, 80.0);
+        assert!(
+            ticks.iter().any(|tick| tick.buffer_index < 0),
+            "blank past must receive a label: {ticks:?}"
+        );
+        assert!(ticks.iter().all(|tick| tick.x >= 0.0 && tick.x <= 800.0));
+    }
+
+    #[test]
+    fn x_ticks_extend_into_blank_future() {
+        let all = timestamps(20);
+        let visible_start = 11;
+        let visible = &all[visible_start..];
+        let slot_w = 800.0 / 12.0;
+        let ticks = build_x_time_ticks(
+            visible,
+            visible_start,
+            11.0,
+            12,
+            800.0,
+            slot_w,
+            "1m",
+            MINUTE,
+            80.0,
+        );
+        let future = ticks
+            .iter()
+            .find(|tick| tick.buffer_index >= 20)
+            .expect("blank future must receive a label");
+        let expected = all[19] + (future.buffer_index as i64 - 19) * MINUTE;
+        assert_eq!(future.timestamp, expected);
+        assert!(ticks.iter().all(|tick| tick.x >= 0.0 && tick.x <= 800.0));
+    }
+
+    #[test]
+    fn x_ticks_use_timeframe_for_single_candle() {
+        let ts = [1_700_000_000_000_i64];
+        let slot_w = 800.0 / 12.0;
+        let ticks = build_x_time_ticks(&ts, 0, 0.0, 12, 800.0, slot_w, "1h", MINUTE, 80.0);
+        let future = ticks
+            .iter()
+            .find(|tick| tick.buffer_index > 0)
+            .expect("future tick for a single candle");
+        assert_eq!(
+            future.timestamp,
+            ts[0] + future.buffer_index as i64 * 3_600_000
+        );
+    }
+
+    #[test]
+    fn x_ticks_cover_blank_margins_at_realistic_density() {
+        let all = timestamps(200);
+        let slot_w = 800.0 / 100.0;
+
+        let past = build_x_time_ticks(&all, 0, -3.0, 100, 800.0, slot_w, "1m", MINUTE, 80.0);
+        assert!(
+            past.iter()
+                .any(|tick| tick.buffer_index < 0 && tick.x >= 0.0 && tick.x <= 800.0),
+            "blank past needs a label: {past:?}"
+        );
+
+        let offset = 200.0 - 100.0 + 3.0;
+        let visible = &all[offset as usize..];
+        let future = build_x_time_ticks(
+            visible,
+            offset as usize,
+            offset,
+            100,
+            800.0,
+            slot_w,
+            "1m",
+            MINUTE,
+            80.0,
+        );
+        assert!(
+            future
+                .iter()
+                .any(|tick| tick.buffer_index >= 200 && tick.x >= 0.0 && tick.x <= 800.0),
+            "blank future needs a label: {future:?}"
+        );
+    }
+
+    #[test]
+    fn x_ticks_edge_label_does_not_overlap_the_previous_tick() {
+        // Wide zoom: 300 slots across 800 px, so the edge label lands only a
+        // few slots after the last regular cadence tick. A long date label is
+        // much wider than that gap, so the previous tick must be replaced.
+        let all = timestamps(350);
+        let visible_count = 300;
+        let slot_w = 800.0 / visible_count as f32;
+        let offset = (all.len() - visible_count + 3) as f64;
+        let visible = &all[offset as usize..];
+        let min_spacing = 80.0;
+
+        let ticks = build_x_time_ticks(
+            visible,
+            offset as usize,
+            offset,
+            visible_count,
+            800.0,
+            slot_w,
+            "1d",
+            86_400_000,
+            min_spacing,
+        );
+
+        let future_start = all.len() as isize;
+        let edge = ticks
+            .iter()
+            .find(|tick| tick.buffer_index >= future_start)
+            .expect("blank future needs an edge label");
+        assert_eq!(edge.buffer_index, future_start + 2);
+        // The edge label replaced the regular tick that would have overlapped,
+        // so no other tick is within the minimum label spacing.
+        for tick in &ticks {
+            if tick.buffer_index != edge.buffer_index {
+                assert!(
+                    (edge.x - tick.x).abs() >= min_spacing - 1e-3,
+                    "edge label overlaps {tick:?}: {ticks:?}"
+                );
+            }
+        }
+        for pair in ticks.windows(2) {
+            assert!(
+                pair[1].x - pair[0].x >= min_spacing - 1e-3,
+                "ticks are too close: {pair:?} in {ticks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn x_label_clamp_keeps_edge_labels_inside_the_plot() {
+        let label_w = 66.0;
+        let plot_left = 12.0;
+        let chart_w = 800.0;
+
+        // Right edge: centred would spill into the price rail.
+        let right = clamp_label_left(plot_left + chart_w - 1.0, label_w, plot_left, chart_w);
+        assert_eq!(right, plot_left + chart_w - label_w - 4.0);
+        assert!(right + label_w + 4.0 <= plot_left + chart_w);
+
+        // Left edge: centred would spill past the plot's left edge.
+        let left = clamp_label_left(plot_left + 1.0, label_w, plot_left, chart_w);
+        assert_eq!(left, plot_left);
+
+        // Plot narrower than the label: stay anchored at the left edge.
+        let narrow = clamp_label_left(plot_left + 30.0, label_w, plot_left, 20.0);
+        assert_eq!(narrow, plot_left);
+    }
+
+    #[test]
+    fn x_ticks_cover_the_restored_viewport_edges() {
+        let all = timestamps(200);
+        let slot_w = 8.0;
+
+        // Far future: clamp_offset caps at total - 2, leaving two candles.
+        let future_offset = (all.len() - 2) as f64;
+        let future_visible = &all[all.len() - 2..];
+        let future = build_x_time_ticks(
+            future_visible,
+            all.len() - 2,
+            future_offset,
+            100,
+            800.0,
+            slot_w,
+            "1m",
+            MINUTE,
+            80.0,
+        );
+        assert!(
+            future
+                .iter()
+                .any(|tick| tick.buffer_index >= all.len() as isize && tick.x >= 0.0),
+            "blank future needs a label at the restored clamp: {future:?}"
+        );
+
+        // Far past: clamp_offset caps at 2 - visible_count.
+        let past_offset = 2.0 - 100.0;
+        let past_visible = &all[..102];
+        let past = build_x_time_ticks(
+            past_visible,
+            0,
+            past_offset,
+            100,
+            800.0,
+            slot_w,
+            "1m",
+            MINUTE,
+            80.0,
+        );
+        assert!(
+            past.iter()
+                .any(|tick| tick.buffer_index < 0 && tick.x >= 0.0),
+            "blank past needs a label at the restored clamp: {past:?}"
+        );
+    }
+
+    #[test]
+    fn x_ticks_are_empty_for_degenerate_inputs() {
+        assert!(build_x_time_ticks(&[], 0, 0.0, 12, 800.0, 10.0, "1m", MINUTE, 80.0).is_empty());
+        assert!(build_x_time_ticks(&[0], 0, 0.0, 12, 0.0, 10.0, "1m", MINUTE, 80.0).is_empty());
+    }
 }

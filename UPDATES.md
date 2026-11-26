@@ -22,6 +22,12 @@ The four title-bar triggers keep their full names in the tooltip and menu but us
 
 Existing chart layout files still load unchanged. `library_geometry` remains in the layout model for compatibility but is no longer written or used by the chart panel.
 
+## Blank-time axis labels and crosshair
+
+The legacy chart now keeps drawing time-axis labels across the blank past/future regions of the plot, using the selected timeframe (`1M` steps calendar months). Labels keep the existing tick style and are clamped inside the plot, so the axis does not stop at the first or last loaded candle; no synthetic candles are drawn.
+
+The crosshair also travels across the whole plot into candle slots that have not been formed or loaded yet. In blank space it keeps drawing the hairlines and price badge and shows the slot's extrapolated timestamp in the existing X-axis timestamp pill. The OHLC legend continues to fall back to the newest candle, and the candle series itself is unchanged: panning still stops with two candles visible at the oldest/newest edge. The v2 engine already behaved this way.
+
 ## Chart core (experimental, opt-in)
 
 A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, indicators, volume, and history paging. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.

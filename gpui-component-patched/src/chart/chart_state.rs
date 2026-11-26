@@ -284,15 +284,17 @@ mod tests {
         s.visible_count = 50;
         s.viewport_offset = 999.0;
         s.clamp_offset(100);
-        assert_eq!(s.viewport_offset, 50.0);
+        // Stop at the newest two candles: 100 - 2.
+        assert_eq!(s.viewport_offset, 98.0);
     }
 
     #[test]
-    fn scroll_by_clamps_to_zero() {
+    fn scroll_by_clamps_to_past_bound() {
         let mut s = ChartState::new();
         s.viewport_offset = 5.0;
-        s.scroll_by(-100.0, 200);
-        assert_eq!(s.viewport_offset, 0.0);
+        s.scroll_by(-200.0, 200);
+        // Stop at the oldest two candles: 2 - visible_count.
+        assert_eq!(s.viewport_offset, -98.0);
     }
 
     #[test]

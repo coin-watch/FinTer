@@ -38,8 +38,29 @@ removed the left blank margin. That alters the legacy (non-v2) viewport, so the
 change was reverted in the merge commit; `clamp_offset` keeps its original
 `total - 2` / `2 - visible_count` bounds. Re-landing it is a separate UX change.
 
+## `src/chart/core/time.rs`
+
+Pure additions: `timeframe_interval_ms()` maps a selected timeframe to an exact
+uniform interval, and `timestamp_at_buffer_index()` resolves an in-range or
+out-of-buffer candle slot to a timestamp. Past/future slots step the selected
+timeframe (calendar months for `1M` via `chrono`), and unknown timeframes fall
+back to a supplied median interval. Both the legacy X-axis labels and the
+crosshair use these helpers for blank past/future slots; no synthetic candles
+are drawn.
+
 ## `src/chart/candlestick_chart.rs`
 
+- **Blank-time X labels.** The X-axis walks continuous candle-slot indices
+  across the viewport, including slots before the first and after the last
+  loaded candle. Labels use the existing formatter/colour, are clamped inside
+  the plot, and replace the previous tick when a synthetic blank-future edge
+  label would overlap it. No placeholder candles are drawn.
+- **Crosshair into unformed time.** The crosshair snaps to the candle-slot cell
+  under the cursor even when that slot has no loaded candle. In blank past or
+  future space it keeps painting the hairlines, price badge, and X-axis
+  timestamp pill using `timestamp_at_buffer_index`; `crosshair_index` stays
+  `None` so the OHLC legend keeps falling back to the newest candle. The candle
+  series itself still clamps to two candles at the buffer edges.
 - **Subpane zero line.** `draw_lines` paints a faint zero baseline for any pane
   whose auto-scaled domain includes zero (for example histogram indicator
   panes). This is otherwise unchanged chart behaviour.

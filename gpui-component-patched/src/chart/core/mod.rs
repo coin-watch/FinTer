@@ -25,5 +25,8 @@ pub use layout::{
 pub use scale::{PriceScale, PriceScaleMode, Tick, nice_ticks};
 pub use series::{EnvelopeBar, LodLevel, Ohlcv, build_envelope};
 pub use spring::Spring;
-pub use time::{TIME_INTERVALS_MS, align_down, align_up, choose_time_interval};
+pub use time::{
+    TIME_INTERVALS_MS, align_down, align_up, choose_time_interval, timeframe_interval_ms,
+    timestamp_at_buffer_index,
+};
 pub use viewport::{Viewport, ViewportLimits, ViewportOverflow};

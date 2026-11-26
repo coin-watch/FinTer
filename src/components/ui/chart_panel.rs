@@ -38,7 +38,9 @@ use gpui::{
 };
 use gpui_component::PixelsExt;
 use gpui_component::button::Button;
-use gpui_component::chart::core::{Ohlcv, PriceScaleMode};
+use gpui_component::chart::core::{
+    Ohlcv, PriceScaleMode, timeframe_interval_ms, timestamp_at_buffer_index,
+};
 use gpui_component::chart::elements::{
     ChartEvent, ChartOptions, ChartSnapshot, ChartView, PriceAxisState,
 };
@@ -1868,6 +1870,7 @@ impl Render for ChartPanel {
             .low(|c: &OhlcvCandle| c.low)
             .close(|c: &OhlcvCandle| c.close)
             .body_width_ratio(0.7)
+            .timeframe(self.timeframe.clone())
             .candle_type(candle_type)
             .show_horizontal_grid(self.show_horizontal_grid)
             .chart_state(chart_st.clone())
@@ -2391,27 +2394,46 @@ impl Render for ChartPanel {
 
                     // Slot-accurate timestamp: the chart lays candles out on
                     // discrete slots (see `candlestick_chart.rs`), so snap to
-                    // the candle under the cursor instead of interpolating on a
-                    // continuous time axis (which drifts across data gaps).
+                    // the slot under the cursor. Blank past/future slots use
+                    // the same timeframe extrapolation as the crosshair pill.
                     let visible = this.feed.visible_slice(&this.chart_state);
                     let chart_w = sz.0;
-                    let mut snapped = None;
-                    if !visible.is_empty() && chart_w > 0.0 {
+                    let ts = if !visible.is_empty() && chart_w > 0.0 {
                         let visible_count_f = this.chart_state.visible_count.max(1) as f32;
                         let slot_w = (chart_w / visible_count_f).max(1.0);
-                        let actual_start =
-                            (this.chart_state.viewport_offset.floor() as isize).max(0) as f32;
-                        let shift_candles = actual_start - this.chart_state.viewport_offset as f32;
-                        let idx = (((mouse_x - orig.0) / slot_w) - shift_candles).floor() as isize;
-                        if idx >= 0 && (idx as usize) < visible.len() {
-                            snapped = Some(visible[idx as usize].timestamp);
+                        let offset = this.chart_state.viewport_offset;
+                        let vis_start =
+                            this.chart_state.visible_range(this.feed.len()).start as i64;
+                        let slot = ((((mouse_x - orig.0) as f64) / (slot_w as f64)) + offset)
+                            .floor() as i64;
+                        let rel = slot - vis_start;
+                        let interval = timeframe_interval_ms(&this.timeframe).unwrap_or(60_000);
+                        if rel >= 0 && (rel as usize) < visible.len() {
+                            visible[rel as usize].timestamp
+                        } else if rel < 0 {
+                            let first = visible.first().map(|c| c.timestamp).unwrap_or(0);
+                            timestamp_at_buffer_index(
+                                &[first],
+                                rel as f64,
+                                &this.timeframe,
+                                interval,
+                            )
+                            .unwrap_or(first)
+                        } else {
+                            let last = visible.last().map(|c| c.timestamp).unwrap_or(0);
+                            let future = rel - (visible.len() as i64 - 1);
+                            timestamp_at_buffer_index(
+                                &[last],
+                                future as f64,
+                                &this.timeframe,
+                                interval,
+                            )
+                            .unwrap_or(last)
                         }
-                    }
-
-                    let ts = snapped.unwrap_or_else(|| {
+                    } else {
                         let frac_x = ((mouse_x - orig.0) / sz.0.max(1.0)).clamp(0.0, 1.0) as f64;
                         (ts_min + frac_x * (ts_max - ts_min)).round() as i64
-                    });
+                    };
 
                     this.drawing_cursor_point = Some(DrawingPoint {
                         timestamp: ts,
