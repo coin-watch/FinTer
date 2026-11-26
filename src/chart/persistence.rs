@@ -199,19 +199,33 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         object.insert("show_delta".into(), serde_json::json!(true));
         object.insert("show_profile".into(), serde_json::json!(true));
-        object.insert("show_footprint".into(), serde_json::json!(true));
         object.insert("show_liquidity".into(), serde_json::json!(true));
         object.insert("show_l1".into(), serde_json::json!(true));
-        object.insert(
-            "footprint".into(),
-            serde_json::json!({"mode": "volume", "show_poc": true}),
-        );
+        object.insert("show_imbalance_stacks".into(), serde_json::json!(true));
         let path = layout_path(&root, "binance", "BTC/USDT", "1h");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let loaded = load_layout(&root, "binance", "BTC/USDT", "1h");
         assert_eq!(loaded, layout);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn footprint_settings_in_file_are_restored() {
+        let root = root();
+        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1h");
+        layout.show_footprint = true;
+        layout.footprint.mode = crate::chart::model::FootprintMode::Volume;
+        layout.footprint.ticks_per_row = 25;
+        layout.footprint.show_summary = false;
+        let path = layout_path(&root, "binance", "BTC/USDT", "1h");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&layout).unwrap()).unwrap();
+
+        let loaded = load_layout(&root, "binance", "BTC/USDT", "1h");
+        assert!(loaded.show_footprint);
+        assert_eq!(loaded.footprint, layout.footprint);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -47,8 +47,9 @@ use gpui_component::chart::elements::{
 };
 use gpui_component::chart::theme::ChartPalette;
 use gpui_component::chart::{
-    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle,
-    MAX_VISIBLE, MIN_VISIBLE, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
+    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
+    FootprintCellSpec, IndicatorStyle, MAX_VISIBLE, MIN_VISIBLE, OrderOverlaySpec, PaneTarget,
+    PositionOverlaySpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::theme::ActiveTheme;
@@ -57,17 +58,22 @@ use gpui_component::v_flex;
 use crate::chart::drawings::{
     DrawingInstance, DrawingInteractionState, DrawingPoint, DrawingTool, hit_test_drawings,
 };
+use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid};
 use crate::chart::indicators::{IndicatorCache, validate_params};
 use crate::chart::layout::ChartMetrics;
-use crate::chart::model::{ChartLayout, IndicatorCategory, IndicatorInstance, IndicatorKind};
+use crate::chart::model::{
+    ChartLayout, FootprintMode, FootprintSettings, IndicatorCategory, IndicatorInstance,
+    IndicatorKind,
+};
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
+use crate::data::orderflow_feed::{FootprintFeed, FootprintSnapshot};
 use crate::data::price_format::format_price;
 use crate::klinechart;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -97,6 +103,36 @@ pub type TechnicalIndicatorCategory = IndicatorCategory;
 /// Callback used by title-bar and legend controls to open the floating
 /// indicator window without owning window creation.
 pub type ChartWindowCallback = std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
+
+/// Compact volume label used inside footprint cells.
+fn compact_flow(value: f64) -> String {
+    let value = value.abs();
+    if value >= 1_000_000_000.0 {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    } else if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}K", value / 1_000.0)
+    } else if value >= 100.0 {
+        format!("{value:.0}")
+    } else if value >= 1.0 {
+        format!("{value:.1}")
+    } else if value > 0.0 {
+        format!("{value:.2}")
+    } else {
+        "0".to_string()
+    }
+}
+
+/// Compact signed delta label used inside footprint cells.
+fn compact_delta(value: f64) -> String {
+    if value.abs() < 1e-9 {
+        "0".to_string()
+    } else {
+        let sign = if value > 0.0 { "+" } else { "-" };
+        format!("{sign}{}", compact_flow(value.abs()))
+    }
+}
 
 struct IndicatorLineSpec {
     instance_id: String,
@@ -248,6 +284,11 @@ pub struct ChartPanel {
     last_cursor_x: f32,
     /// Current chart rendering style
     candle_type: CandleType,
+    /// Historical + live footprint feed, attached while the footprint style is
+    /// available. Kept alive by the pane even when another style is selected.
+    footprint_feed: Option<FootprintFeed>,
+    /// Footprint cell mode, analytics and per-row tick density.
+    footprint_settings: FootprintSettings,
     /// Show/hide horizontal dashed guide lines in plot area.
     show_horizontal_grid: bool,
     /// IANA timezone used for chart labels and crosshair timestamps.
@@ -521,6 +562,8 @@ impl ChartPanel {
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
             candle_type: CandleType::Solid,
+            footprint_feed: None,
+            footprint_settings: FootprintSettings::default(),
             show_horizontal_grid: false,
             timezone: "UTC".into(),
             pane_width: 800.0,
@@ -610,11 +653,75 @@ impl ChartPanel {
     }
 
     pub fn set_candle_type(&mut self, candle_type: CandleType) {
+        let previous = self.candle_type;
         self.candle_type = candle_type;
+        if candle_type == CandleType::Footprint && previous != CandleType::Footprint {
+            self.ensure_footprint_density();
+        }
     }
 
     pub fn candle_type_config(&self) -> &'static str {
         crate::components::ui::pane_grid::chart_config::candle_type_to_config(self.candle_type)
+    }
+
+    /// True when the footprint renderer is selected.
+    pub fn show_footprint(&self) -> bool {
+        self.candle_type == CandleType::Footprint
+    }
+
+    /// Footprint cells need enough horizontal room for two numeric columns.
+    fn ensure_footprint_density(&mut self) {
+        if self.chart_state.visible_count > 20 {
+            self.chart_state.visible_count = 20;
+        }
+    }
+
+    /// Attach the historical + live footprint feed for this pane.
+    pub fn set_footprint_feed(&mut self, feed: FootprintFeed, cx: &mut Context<Self>) {
+        let version = feed.version_handle();
+        self.footprint_feed = Some(feed);
+        cx.spawn(async move |this, cx| {
+            let mut last = u64::MAX;
+            loop {
+                let failed = this
+                    .update(cx, |panel, cx| {
+                        let current = version.load(std::sync::atomic::Ordering::Relaxed);
+                        if current != last {
+                            last = current;
+                            if panel.show_footprint() {
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .is_err();
+                if failed {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    pub fn footprint_settings(&self) -> &FootprintSettings {
+        &self.footprint_settings
+    }
+
+    pub fn set_footprint_settings(&mut self, settings: FootprintSettings) {
+        self.footprint_settings = settings;
+        self.mark_dirty();
+    }
+
+    pub fn set_footprint_mode(&mut self, mode: FootprintMode) {
+        self.footprint_settings.mode = mode;
+        self.mark_dirty();
+    }
+
+    pub fn set_footprint_ticks_per_row(&mut self, ticks_per_row: u32) {
+        self.footprint_settings.ticks_per_row = ticks_per_row.max(1);
+        self.mark_dirty();
     }
 
     /// Exchange, symbol and timeframe for title-bar/floating-window context.
@@ -814,6 +921,7 @@ impl ChartPanel {
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.manual_price_range = layout.manual_price_range;
         self.v2_percent_anchor = layout.percent_anchor;
+        self.footprint_settings = layout.footprint;
     }
 
     pub fn save_layout(&self) {
@@ -827,7 +935,10 @@ impl ChartPanel {
             CandleType::Ohlc => "ohlc".into(),
             CandleType::Area => "area".into(),
             CandleType::HeikinAshi => "heikin_ashi".into(),
+            CandleType::Footprint => "footprint".into(),
         };
+        layout.show_footprint = self.show_footprint();
+        layout.footprint = self.footprint_settings.clone();
         layout.show_grid = self.show_horizontal_grid;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
@@ -1013,6 +1124,188 @@ impl ChartPanel {
         (lines, subpane_idx)
     }
 
+    /// Price span of one footprint row. When the exchange tick is known this
+    /// is `tick_size * ticks_per_row`; otherwise derive a readable fallback
+    /// from the visible candle range.
+    fn footprint_row_size(&self, candles: &[OhlcvCandle]) -> f64 {
+        let ticks_per_row = self.footprint_settings.ticks_per_row.max(1) as f64;
+        if let Some(tick) = self
+            .precision
+            .as_ref()
+            .and_then(|precision| precision.tick_size)
+            .filter(|tick| tick.is_finite() && *tick > 0.0)
+        {
+            return tick * ticks_per_row;
+        }
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for candle in candles {
+            if candle.low.is_finite() && candle.high.is_finite() {
+                min = min.min(candle.low);
+                max = max.max(candle.high);
+            }
+        }
+        if !min.is_finite() || !max.is_finite() || max <= min {
+            return 0.0;
+        }
+        // Aim for roughly 60 rows at the current zoom, scaled by the density
+        // preference (more ticks per row -> fewer, wider rows).
+        ((max - min) / (60.0 / ticks_per_row).max(1.0)).max(f64::MIN_POSITIVE)
+    }
+
+    fn compute_footprint_cells(
+        &self,
+        candles: &[OhlcvCandle],
+        snapshot: Option<&FootprintSnapshot>,
+        bullish: gpui::Hsla,
+        bearish: gpui::Hsla,
+    ) -> Vec<FootprintCellSpec> {
+        if !self.show_footprint() {
+            return Vec::new();
+        }
+        if matches!(self.timeframe.as_str(), "1w" | "1M") {
+            return Vec::new();
+        }
+        let Some(snapshot) = snapshot else {
+            return Vec::new();
+        };
+        if snapshot.bars.is_empty() || candles.is_empty() {
+            return Vec::new();
+        }
+
+        let range = self.chart_state.visible_range(candles.len());
+        let visible = &candles[range];
+        if visible.is_empty() {
+            return Vec::new();
+        }
+        let timestamps: HashSet<i64> = visible.iter().map(|candle| candle.timestamp).collect();
+
+        let (price_min, price_max) = match self.chart_state.candle_price_range.get() {
+            Some((min, max)) if min.is_finite() && max.is_finite() && max > min => (min, max),
+            _ => {
+                let mut min = f64::INFINITY;
+                let mut max = f64::NEG_INFINITY;
+                for candle in visible {
+                    if candle.low.is_finite() && candle.high.is_finite() {
+                        min = min.min(candle.low);
+                        max = max.max(candle.high);
+                    }
+                }
+                if !min.is_finite() || !max.is_finite() || max <= min {
+                    return Vec::new();
+                }
+                (min, max)
+            }
+        };
+
+        let plot_h = self
+            .chart_state
+            .candle_plot_size
+            .get()
+            .map(|(_, height)| height)
+            .unwrap_or(self.pane_height * 0.7)
+            .max(120.0);
+        let min_row_h = self.footprint_settings.min_row_height.max(6.0);
+        let max_rows = (plot_h / min_row_h).floor().clamp(12.0, 96.0) as usize;
+        let tick_size = self
+            .precision
+            .as_ref()
+            .and_then(|precision| precision.tick_size)
+            .filter(|tick| tick.is_finite() && *tick > 0.0);
+
+        let grid = build_footprint_grid(&FootprintBuildInput {
+            bars: &snapshot.bars,
+            timestamps: &timestamps,
+            price_min,
+            price_max,
+            max_rows,
+            tick_size,
+            ticks_per_row: self.footprint_settings.ticks_per_row,
+            show_value_area: self.footprint_settings.show_value_area,
+            show_imbalance: self.footprint_settings.show_imbalance,
+            imbalance_ratio: self.footprint_settings.imbalance_ratio,
+        });
+
+        let mut cells = Vec::new();
+        for bar in &grid.bars {
+            let max_abs_delta = bar
+                .rows
+                .iter()
+                .map(|row| row.delta().abs())
+                .fold(0.0, f64::max)
+                .max(1e-9);
+            for row in &bar.rows {
+                let delta = row.delta();
+                let intensity = (delta.abs() / max_abs_delta).clamp(0.0, 1.0) as f32;
+                let base = if delta >= 0.0 { bullish } else { bearish };
+                let alpha = 0.08 + 0.20 * intensity + if bar.is_closed { 0.0 } else { 0.05 };
+                let background = base.opacity(alpha.min(0.45));
+                let (left_text, right_text, single_text) = match self.footprint_settings.mode {
+                    FootprintMode::BidAsk => (
+                        compact_flow(row.sell).into(),
+                        compact_flow(row.buy).into(),
+                        compact_delta(delta).into(),
+                    ),
+                    FootprintMode::Delta => ("".into(), "".into(), compact_delta(delta).into()),
+                    FootprintMode::Volume => {
+                        ("".into(), "".into(), compact_flow(row.volume()).into())
+                    }
+                };
+                let single_color = if delta >= 0.0 { bullish } else { bearish };
+                cells.push(FootprintCellSpec {
+                    timestamp_ms: bar.timestamp,
+                    price_low: row.price_low,
+                    price_high: row.price_high,
+                    left_text,
+                    right_text,
+                    single_text,
+                    left_color: bearish.opacity(0.95),
+                    right_color: bullish.opacity(0.95),
+                    single_color,
+                    background,
+                    is_poc: self.footprint_settings.show_poc && row.is_poc,
+                    is_vah: self.footprint_settings.show_value_area && row.is_vah,
+                    is_val: self.footprint_settings.show_value_area && row.is_val,
+                    imbalance: if self.footprint_settings.show_imbalance {
+                        row.imbalance
+                    } else {
+                        0
+                    },
+                    is_live: !bar.is_closed,
+                });
+            }
+        }
+        cells
+    }
+
+    /// One-line note for guest/unauthenticated/credit states and unsupported
+    /// timeframes. Kept out of the empty/error paths so the candles stay usable.
+    fn footprint_note(&self, snapshot: Option<&FootprintSnapshot>) -> Option<String> {
+        if !self.show_footprint() {
+            return None;
+        }
+        if chart_v2_enabled() {
+            return Some(
+                "Footprint is unavailable in the experimental chart renderer. Showing candles."
+                    .to_string(),
+            );
+        }
+        if matches!(self.timeframe.as_str(), "1w" | "1M") {
+            return Some("Footprint does not support weekly or monthly timeframes.".to_string());
+        }
+        let snapshot = snapshot?;
+        if let Some(note) = snapshot.status.note() {
+            return Some(note.to_string());
+        }
+        if snapshot.partial {
+            return Some(
+                "Footprint history is partial: only the persisted 14-day trade window is available."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Helper Methods
     // -----------------------------------------------------------------------
@@ -1132,6 +1425,30 @@ impl Render for ChartPanel {
             let palette = ChartPalette::from_theme(&cx.theme().colors);
             self.chart_v2
                 .update(cx, |view, cx| view.set_palette_if_changed(palette, cx));
+            let v2_note = self.footprint_note(None);
+            let chart_container = div()
+                .flex_1()
+                .w_full()
+                .min_h_0()
+                .relative()
+                .child(self.chart_v2.clone());
+            let chart_container = if let Some(note) = v2_note {
+                chart_container.child(
+                    div()
+                        .absolute()
+                        .bottom(px(10.0))
+                        .left(px(12.0))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(4.0))
+                        .bg(cx.theme().colors.background.opacity(0.85))
+                        .text_xs()
+                        .text_color(cx.theme().colors.muted_foreground)
+                        .child(note),
+                )
+            } else {
+                chart_container
+            };
             let root = v_flex()
                 .size_full()
                 .bg(cx.theme().colors.background)
@@ -1139,7 +1456,7 @@ impl Render for ChartPanel {
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                     this.handle_chart_key(ev, window, cx);
                 }))
-                .child(div().flex_1().min_h_0().child(self.chart_v2.clone()));
+                .child(chart_container);
             return root.into_any_element();
         }
 
@@ -1157,6 +1474,7 @@ impl Render for ChartPanel {
         self.check_debounced_save();
 
         let (candles_snap, feed_version) = self.feed.snapshot_with_version();
+        let footprint_snapshot = self.footprint_feed.as_ref().map(|feed| feed.snapshot());
         let metrics = self.chart_metrics();
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
         if current_oldest > 0 && current_oldest != self.oldest_loaded_ts {
@@ -1307,6 +1625,21 @@ impl Render for ChartPanel {
             self.chart_state.clamp_offset(total);
         }
 
+        if self.show_footprint() {
+            if let Some(feed) = &self.footprint_feed {
+                let range = self.chart_state.visible_range(total);
+                if !range.is_empty() {
+                    let visible = &candles[range.clone()];
+                    let since = visible.first().map(|candle| candle.timestamp).unwrap_or(0);
+                    let last_end = visible.last().map(|candle| candle.timestamp).unwrap_or(0);
+                    let interval = timeframe_interval_ms(&self.timeframe).unwrap_or(60_000);
+                    let until = last_end.saturating_add(interval);
+                    let row_size = self.footprint_row_size(visible);
+                    feed.request_visible(since, until, range.len().saturating_add(8), row_size);
+                }
+            }
+        }
+
         let chart_st = self.chart_state.clone();
         let candle_type = self.candle_type;
         let precision = self.precision.clone();
@@ -1320,6 +1653,13 @@ impl Render for ChartPanel {
         // Compute parameterized indicators with the versioned cache.
         let (indicator_lines, subpane_count) =
             self.compute_indicators_for_chart(&candles, feed_version);
+        let footprint_cells = self.compute_footprint_cells(
+            &candles,
+            footprint_snapshot.as_ref(),
+            cx.theme().bullish,
+            cx.theme().bearish,
+        );
+        let footprint_note = self.footprint_note(footprint_snapshot.as_ref());
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;
@@ -1509,6 +1849,68 @@ impl Render for ChartPanel {
                                 .child(div().text_color(c_color).child(change_str)),
                         )
                 );
+
+            if self.show_footprint() && self.footprint_settings.show_summary {
+                if let Some(bar) = footprint_snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .bars
+                        .iter()
+                        .find(|bar| bar.timestamp == c.timestamp)
+                }) {
+                    let delta = bar.delta();
+                    let delta_color = if delta >= 0.0 {
+                        cx.theme().bullish
+                    } else {
+                        cx.theme().bearish
+                    };
+                    let volume = if bar.total_volume > 0.0 {
+                        bar.total_volume
+                    } else {
+                        bar.volume()
+                    };
+                    let poc = bar
+                        .poc
+                        .map(|price| format_price(price, precision.as_ref()))
+                        .unwrap_or_else(|| "—".to_string());
+                    let status_color = if bar.is_closed {
+                        cx.theme().colors.muted_foreground
+                    } else {
+                        cx.theme().primary
+                    };
+                    legend = legend.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_xs()
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child("FP"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(delta_color)
+                                    .child(format!("Δ {}", compact_delta(delta))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!("Vol {}", compact_flow(volume))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(cx.theme().colors.muted_foreground)
+                                    .child(format!("POC {poc}")),
+                            )
+                            .child(div().text_color(status_color).child(if bar.is_closed {
+                                "CLOSED"
+                            } else {
+                                "LIVE"
+                            })),
+                    );
+                }
+            }
 
             let active_timestamp = c.timestamp;
             let mut subpane_legends_map: std::collections::BTreeMap<usize, (f32, Vec<AnyElement>)> =
@@ -1933,10 +2335,12 @@ impl Render for ChartPanel {
         // Candlestick chart construction
         let current_mark = candles.last().map(|c| c.close).unwrap_or(0.0);
         let show_candles = self.show_main_series;
+        let footprint_active = self.show_footprint() && !footprint_cells.is_empty();
         let mut chart = CandlestickChart::new(candles)
-            .show_candles(show_candles)
+            .show_candles(show_candles && !footprint_active)
             .subpane_count(subpane_count)
             .show_volume_pane(has_vol)
+            .footprint_cells(footprint_cells)
             .timestamp_ms(|c: &OhlcvCandle| c.timestamp)
             .open(|c: &OhlcvCandle| c.open)
             .high(|c: &OhlcvCandle| c.high)
@@ -2927,6 +3331,19 @@ impl Render for ChartPanel {
             .child(legend_ui)
             .child(legend_vol_ui)
             .children(subpane_legends)
+            .children(footprint_note.map(|note| {
+                div()
+                    .absolute()
+                    .bottom(px(26.0))
+                    .left(px(12.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(4.0))
+                    .bg(cx.theme().colors.background.opacity(0.85))
+                    .text_xs()
+                    .text_color(cx.theme().colors.muted_foreground)
+                    .child(note)
+            }))
             .child(gpui::deferred(settings_panel));
 
         let root = v_flex()
@@ -3047,6 +3464,7 @@ mod tests {
             CandleType::DownStroke,
             CandleType::Ohlc,
             CandleType::Area,
+            CandleType::Footprint,
         ] {
             let label = match candle_type {
                 CandleType::Solid => "Candles",
@@ -3056,6 +3474,7 @@ mod tests {
                 CandleType::DownStroke => "Down stroke",
                 CandleType::Ohlc => "OHLC",
                 CandleType::Area => "Area",
+                CandleType::Footprint => "Footprint",
             };
             assert!(!label.is_empty());
         }
@@ -3153,7 +3572,7 @@ mod tests {
     fn price_axis_anchor_uses_the_rendered_scale_inset() {
         // Reproduce the state captured during paint: a 10 px top inset maps
         // the top pixel slightly above the price range's max.
-        let mut state = ChartState::new();
+        let state = ChartState::new();
         state.candle_plot_origin.set(Some((10.0, 20.0)));
         state.candle_plot_size.set(Some((800.0, 400.0)));
         state.candle_price_range.set(Some((100.0, 200.0)));

@@ -7,7 +7,7 @@
 use gpui_component::chart::CandleType;
 
 /// Config value + display label, in menu order.
-pub const CANDLE_TYPES: [(&str, &str); 7] = [
+pub const CANDLE_TYPES: [(&str, &str); 8] = [
     ("candle_solid", "Candle Solid"),
     ("candle_stroke", "Candle Stroke"),
     ("candle_up_stroke", "Candle Up Stroke"),
@@ -15,12 +15,13 @@ pub const CANDLE_TYPES: [(&str, &str); 7] = [
     ("heikin_ashi", "Heikin-Ashi"),
     ("ohlc", "OHLC"),
     ("area", "Area"),
+    ("footprint", "Footprint"),
 ];
 
 /// Title-bar Type menu grouping. The grouping is intentionally different from
 /// the storage order: Heikin-Ashi is a candle style, while the line/area group
 /// holds the hollow/stroke variants and the area chart.
-pub const CANDLE_TYPE_GROUPS: [(&str, &[(&str, &str)]); 2] = [
+pub const CANDLE_TYPE_GROUPS: [(&str, &[(&str, &str)]); 3] = [
     (
         "Candles",
         &[("candle_solid", "Solid"), ("heikin_ashi", "Heikin-Ashi")],
@@ -35,6 +36,7 @@ pub const CANDLE_TYPE_GROUPS: [(&str, &[(&str, &str)]); 2] = [
             ("area", "Area"),
         ],
     ),
+    ("Order flow", &[("footprint", "Footprint")]),
 ];
 
 /// Parse the persisted pane-config value. Unknown values fall back to solid
@@ -47,6 +49,7 @@ pub fn candle_type_from_config(value: &str) -> CandleType {
         "ohlc" => CandleType::Ohlc,
         "area" => CandleType::Area,
         "heikin_ashi" => CandleType::HeikinAshi,
+        "footprint" => CandleType::Footprint,
         "candle_solid" => CandleType::Solid,
         _ => CandleType::Solid,
     }
@@ -62,6 +65,7 @@ pub fn candle_type_to_config(candle_type: CandleType) -> &'static str {
         CandleType::HeikinAshi => "heikin_ashi",
         CandleType::Ohlc => "ohlc",
         CandleType::Area => "area",
+        CandleType::Footprint => "footprint",
     }
 }
 
@@ -84,6 +88,13 @@ mod tests {
             assert_eq!(candle_type_to_config(candle_type), config);
             assert_eq!(candle_type_label(config), label);
         }
+    }
+
+    #[test]
+    fn footprint_style_persists() {
+        assert_eq!(candle_type_from_config("footprint"), CandleType::Footprint);
+        assert_eq!(candle_type_to_config(CandleType::Footprint), "footprint");
+        assert_eq!(candle_type_label("footprint"), "Footprint");
     }
 
     #[test]

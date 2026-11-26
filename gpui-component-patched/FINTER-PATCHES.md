@@ -80,6 +80,12 @@ are drawn.
   and `candle_price_range`; `None` or an invalid range keeps auto-fit. Paint
   also writes the shared `chart_bounds` cell so `ChartPanel` can hit-test the
   axis rails.
+- **Footprint candle style.** `CandleType::Footprint` and `FootprintCellSpec`
+  carry pre-computed cells from FinTer's `chart::footprint` module. Paint draws
+  the per-row background, POC border, VAH/VAL lines, imbalance stripe, and the
+  left/right/single numeric labels, dropping columns before they overflow a
+  narrow cell. FinTer builds the cells so the vendored crate stays free of
+  market-data and bar-bucketing logic.
 
 Manual checks on desktop where possible:
 

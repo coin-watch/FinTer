@@ -4,11 +4,19 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Footprint candle style (historical + live)
+
+The chart Type menu now includes **Footprint**. It renders the restored bid × ask grid (bid volume left in red, ask volume right in green), per-row imbalance stripes, a POC border, VAH/VAL row lines, and a per-bar delta/volume/POC footer. Delta and total-volume-only modes are available, and the Type menu exposes ticks-per-row plus POC, value-area, imbalance, and summary toggles.
+
+History comes from CoinWatch's metered `GET /api/v1/orderflow/footprint` route for the visible bar range. Requests are debounced, cancelled when the viewport moves, and cached for 60 seconds; live `footprint` snapshots from the gateway overwrite the in-progress bar and are ignored once a bar is closed. Guest sessions, missing API origins, and HTTP 401/402 degrade to candles with a note instead of retrying. Weekly and monthly timeframes are rejected by the backend, so FinTer shows a note and keeps candles. Under `FINTER_CHART_V2` the footprint style falls back to the v2 candle path with a note.
+
+Unknown-aggressor volume is counted in totals but excluded from delta. **Limitation:** historical footprint depth equals CoinWatch's persisted trade window (14 days); older ranges return a partial window, which the chart notes.
+
 ## Chart order flow removed
 
-Order-flow functionality was removed from the chart and data layers. The chart no longer renders a footprint grid, Delta/CVD sub-panes, a volume profile, L1 best-bid/ask step lines, or a resting-liquidity heatmap, and the **Order flow** toolbar menu and its `V`/`D`/`P`/`H`/`B` shortcuts are gone. The derived `delta`/`footprint`/`profile` gateway subscriptions, the historical L2/L1 book routes, and the raw-trade history replay used only by those overlays were removed with their modules.
+The old order-flow overlay stack was removed from the chart and data layers. The chart no longer renders Delta/CVD sub-panes, a volume profile, L1 best-bid/ask step lines, or a resting-liquidity heatmap, and the **Order flow** toolbar menu and its `V`/`D`/`P`/`H`/`B` shortcuts are gone. The derived `delta`/`profile` gateway subscriptions, the historical L2/L1 book routes, and the raw-trade history replay used only by those overlays were removed with their modules. The footprint candle style above is the restored exception and uses its own history route and live feed.
 
-Existing layout files still load: the removed order-flow fields are simply ignored on read, and the `schema_version` and price-scale fields are unchanged, so no migration is required.
+Existing layout files still load: removed overlay fields are ignored on read, while `show_footprint` and `footprint` are restored with `#[serde(default)]` so layouts written without them keep their defaults. The `schema_version` and price-scale fields are unchanged, so no migration is required.
 
 The standalone **Depth of Market** (order book) and **Time & Sales** (trade tape) panes are unaffected and continue to stream from the gateway's `orderbook` and `trades` subscriptions. The backend `GET /api/v1/trades/history` contract is unchanged; the desktop client no longer calls it.
 

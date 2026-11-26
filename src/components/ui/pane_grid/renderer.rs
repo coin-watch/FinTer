@@ -25,6 +25,8 @@ pub struct ChartViewState {
     pub symbol: String,
     pub timeframe: String,
     pub chart_type: String,
+    /// Whether the live bridge was started with the footprint subscription.
+    pub footprint: bool,
     pub entity: Entity<crate::components::ui::chart_panel::ChartPanel>,
     pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
 }
@@ -1987,12 +1989,15 @@ impl PaneGridRenderer {
                                     // Older FinTer layouts used `timeframe`; web layouts use `interval`.
                                     let timeframe = config_str(config, "interval", &config_str(config, "timeframe", "1m"));
                                     let chart_type = config_str(config, "type", "candle_solid");
+                                    let wants_footprint = chart_type == "footprint";
 
                                     let mut chart_map = self.chart_views.borrow_mut();
                                     
                                     // 1. If only the chart_type changed, don't recreate the data bridge, just update the property.
+                                    // The footprint style owns a live subscription, so toggling
+                                    // into or out of it must recreate the bridge.
                                     if let Some(existing) = chart_map.get_mut(&pane_id) {
-                                        if existing.exchange == exchange && existing.symbol == symbol && existing.timeframe == timeframe && existing.chart_type != chart_type {
+                                        if existing.exchange == exchange && existing.symbol == symbol && existing.timeframe == timeframe && existing.chart_type != chart_type && existing.footprint == wants_footprint {
                                             existing.chart_type = chart_type.clone();
                                             let candle_type = candle_type_from_config(&chart_type);
                                             existing.entity.update(cx, |chart, _| {
@@ -2002,7 +2007,7 @@ impl PaneGridRenderer {
                                     }
 
                                     let needs_recreate = match chart_map.get(&pane_id) {
-                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol || existing.timeframe != timeframe,
+                                        Some(existing) => existing.exchange != exchange || existing.symbol != symbol || existing.timeframe != timeframe || existing.footprint != wants_footprint,
                                         None => true,
                                     };
 
@@ -2014,6 +2019,7 @@ impl PaneGridRenderer {
                                         bridge_config.trades = false;
                                         bridge_config.orderbook = false;
                                         bridge_config.ticker = true;
+                                        bridge_config.footprint = wants_footprint;
                                         if timeframe == "1s" {
                                             bridge_config.fetch_history = false;
                                             bridge_config.kline = false;
@@ -2096,6 +2102,16 @@ impl PaneGridRenderer {
                                                 });
                                                 let timezone = self.timezone.clone();
                                                 let candle_type = candle_type_from_config(&chart_type);
+                                                if wants_footprint {
+                                                    let footprint_feed =
+                                                        crate::data::orderflow_feed::FootprintFeed::new(
+                                                            bridge.subscribe_footprint(),
+                                                            bridge_config_clone.clone(),
+                                                        );
+                                                    chart_panel.update(cx, |chart, cx| {
+                                                        chart.set_footprint_feed(footprint_feed, cx);
+                                                    });
+                                                }
                                                 chart_panel.update(cx, |chart, _| {
                                                     chart.set_context(exchange.clone(), symbol.clone());
                                                     chart.set_timezone(timezone);
@@ -2106,6 +2122,7 @@ impl PaneGridRenderer {
                                                     symbol: symbol.clone(),
                                                     timeframe: timeframe.clone(),
                                                     chart_type: chart_type.clone(),
+                                                    footprint: wants_footprint,
                                                     entity: chart_panel.clone(),
                                                     _bridge: std::sync::Arc::new(bridge),
                                                 };

@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 use crate::data::client::{service_base_url, tokio_runtime};
 use crate::data::models::OhlcvCandle;
 use crate::data::orderbook::{OrderBook, PriceLevel};
+use crate::data::orderflow_feed::FootprintMessage;
 use crate::data::tick::{TradeSide, UnifiedTick};
 
 // ---------------------------------------------------------------------------
@@ -208,6 +209,8 @@ pub struct BridgeConfig {
     pub trades: bool,
     pub orderbook: bool,
     pub kline: bool,
+    /// Subscribe to derived footprint bars for the chart footprint style.
+    pub footprint: bool,
     pub fetch_history: bool,
     /// Trade snapshot size requested at subscribe time.
     pub trade_limit: u32,
@@ -231,6 +234,7 @@ impl BridgeConfig {
             trades: true,
             orderbook: true,
             kline: true,
+            footprint: false,
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
@@ -325,6 +329,7 @@ pub struct Bridge {
     trade_sender: broadcast::Sender<Arc<UnifiedTick>>,
     ob_sender: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    footprint_sender: broadcast::Sender<Arc<FootprintMessage>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
     last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -349,6 +354,7 @@ impl Bridge {
         let (trade_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ob_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let (ohlcv_sender, _) = broadcast::channel(OHLCV_BROADCAST_CAPACITY);
+        let (footprint_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let cancel_token = CancellationToken::new();
         let last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -361,6 +367,7 @@ impl Bridge {
         let trade_tx = trade_sender.clone();
         let ob_tx = ob_sender.clone();
         let ohlcv_tx = ohlcv_sender.clone();
+        let footprint_tx = footprint_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
         let tick_cache = Arc::clone(&last_tick);
@@ -373,6 +380,7 @@ impl Bridge {
                 trade_tx,
                 ob_tx,
                 ohlcv_tx,
+                footprint_tx,
                 token,
                 history_cache,
                 tick_cache,
@@ -386,6 +394,7 @@ impl Bridge {
             trade_sender,
             ob_sender,
             ohlcv_sender,
+            footprint_sender,
             last_ohlcv_history,
             last_tick,
             last_orderbook,
@@ -453,6 +462,11 @@ impl Bridge {
         rx
     }
 
+    /// Subscribe to derived footprint snapshots for the live in-progress bar.
+    pub fn subscribe_footprint(&self) -> broadcast::Receiver<Arc<FootprintMessage>> {
+        self.footprint_sender.subscribe()
+    }
+
     /// Number of active trade tick subscribers.
     pub fn subscriber_count(&self) -> usize {
         self.tick_sender.receiver_count()
@@ -474,6 +488,7 @@ async fn supervision_loop(
     trade_tx: broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    footprint_tx: broadcast::Sender<Arc<FootprintMessage>>,
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -509,6 +524,7 @@ async fn supervision_loop(
             &trade_tx,
             &ob_tx,
             &ohlcv_tx,
+            &footprint_tx,
             &cancel_token,
             &history_cache,
             &last_tick_cache,
@@ -578,6 +594,11 @@ enum Requirement<'a> {
         timeframe: &'a str,
         lookback: u32,
     },
+    Footprint {
+        exchange: &'a str,
+        symbol: &'a str,
+        timeframe: &'a str,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -598,6 +619,7 @@ enum StreamChannel {
     Trades,
     Orderbook,
     Ohlcv,
+    Footprint,
 }
 
 impl StreamChannel {
@@ -607,6 +629,7 @@ impl StreamChannel {
             Self::Trades => "trades",
             Self::Orderbook => "orderbook",
             Self::Ohlcv => "kline",
+            Self::Footprint => "footprint",
         }
     }
 
@@ -616,6 +639,7 @@ impl StreamChannel {
             "trades" | "tape" => Some(Self::Trades),
             "orderbook" | "book" => Some(Self::Orderbook),
             "kline" | "ohlcv" | "chart" => Some(Self::Ohlcv),
+            "footprint" => Some(Self::Footprint),
             _ => None,
         }
     }
@@ -630,6 +654,8 @@ fn channel_for_feed(feed: &str) -> Option<StreamChannel> {
         Some(StreamChannel::Orderbook)
     } else if feed.starts_with("ohlcv:") || feed.starts_with("candles:") {
         Some(StreamChannel::Ohlcv)
+    } else if feed.starts_with("footprint:") {
+        Some(StreamChannel::Footprint)
     } else {
         None
     }
@@ -786,6 +812,7 @@ async fn connect_and_stream(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -901,9 +928,23 @@ async fn connect_and_stream(
             .send(Message::Text(serde_json::to_string(&frame)?))
             .await?;
     }
+    if config.footprint {
+        let frame = SubscribeFrame {
+            op: "sub",
+            id: StreamChannel::Footprint.id(),
+            requirement: Requirement::Footprint {
+                exchange: &config.exchange,
+                symbol: &config.symbol,
+                timeframe: &config.timeframe,
+            },
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&frame)?))
+            .await?;
+    }
     debug!(
-        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={})",
-        config.ticker, config.kline, config.orderbook, config.trades
+        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={}, footprint={})",
+        config.ticker, config.kline, config.orderbook, config.trades, config.footprint
     );
 
     let mut feed_channels: HashMap<String, StreamChannel> = HashMap::new();
@@ -922,6 +963,7 @@ async fn connect_and_stream(
                     && !config.kline
                     && !config.orderbook
                     && !config.trades
+                    && !config.footprint
                 {
                     continue;
                 }
@@ -949,6 +991,7 @@ async fn connect_and_stream(
                             trade_tx,
                             ob_tx,
                             ohlcv_tx,
+                            footprint_tx,
                             history_cache,
                             last_tick_cache,
                             last_ob_cache,
@@ -1012,6 +1055,7 @@ fn handle_gateway_frame(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
@@ -1065,6 +1109,7 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
+                    footprint_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1109,6 +1154,7 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
+                    footprint_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1167,10 +1213,18 @@ fn dispatch_new_data(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
+    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
+    if channel == StreamChannel::Footprint {
+        for message in FootprintMessage::parse_items(&data) {
+            let _ = footprint_tx.send(Arc::new(message));
+        }
+        return;
+    }
+
     let envelope = serde_json::json!({
         "type": "data",
         "channel": channel.id(),
@@ -1858,6 +1912,7 @@ mod tests {
             trades: true,
             orderbook: true,
             kline: true,
+            footprint: false,
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
@@ -1882,6 +1937,7 @@ mod tests {
         let (trades, mut trade_rx) = broadcast::channel(16);
         let (books, _) = broadcast::channel(16);
         let (candles, mut candle_rx) = broadcast::channel(16);
+        let (footprints, mut footprint_rx) = broadcast::channel(16);
         let history = Arc::new(std::sync::Mutex::new(None));
         let last_tick = Arc::new(std::sync::Mutex::new(None));
         let last_book = Arc::new(std::sync::Mutex::new(None));
@@ -1900,6 +1956,7 @@ mod tests {
                 &trades,
                 &books,
                 &candles,
+                &footprints,
                 &history,
                 &last_tick,
                 &last_book,
@@ -1944,6 +2001,23 @@ mod tests {
         let candle = candle_rx.try_recv().expect("candle");
         assert_eq!(candle[0].timestamp, 1_700_000_060_000);
         assert!((candle[0].close - 114.0).abs() < f64::EPSILON);
+
+        assert_eq!(
+            frame(
+                r#"{"op":"ack","id":"footprint","feed":"footprint:binance:BTC/USDT:1m","seq":5}"#
+            ),
+            None
+        );
+        assert_eq!(
+            frame(
+                r#"{"op":"delta","feed":"footprint:binance:BTC/USDT:1m","seq":6,"data":{"type":"footprint","timeframe":"1m","bar_start":1700000060000,"bar_end":1700000120000,"rows":[{"price_low":100,"price_high":101,"buy":2,"sell":1,"buy_count":2,"sell_count":1}],"poc":100.5,"vah":101,"val":100,"delta":1,"total_volume":3,"row_size":1,"is_closed":false}}"#
+            ),
+            None
+        );
+        let footprint = footprint_rx.try_recv().expect("footprint");
+        assert_eq!(footprint.bar_start, 1_700_000_060_000);
+        assert_eq!(footprint.rows.len(), 1);
+        assert!(!footprint.is_closed);
 
         // A missing sequence returns the pane id that must be resynced.
         assert_eq!(
@@ -2170,6 +2244,7 @@ mod tests {
         let (trade_tx, _) = broadcast::channel(16);
         let (ob_tx, _) = broadcast::channel(16);
         let (ohlcv_tx, _) = broadcast::channel(16);
+        let (footprint_tx, _) = broadcast::channel(16);
 
         let cached_tick = Arc::new(UnifiedTick::new("binance", "BTC/USDT", 68500.0, 1.0, TradeSide::Buy, 1000));
         let cached_book = Arc::new(OrderBook::new(
@@ -2185,6 +2260,7 @@ mod tests {
             trade_sender: trade_tx,
             ob_sender: ob_tx,
             ohlcv_sender: ohlcv_tx,
+            footprint_sender: footprint_tx,
             last_ohlcv_history: Arc::new(std::sync::Mutex::new(None)),
             last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
             last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),
