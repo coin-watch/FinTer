@@ -330,7 +330,9 @@ impl State {
                 self.bars.insert(timestamp, flow);
             }
         }
-        self.partial |= history.partial;
+        // One active viewport request is applied at a time (stale responses are
+        // discarded by generation), so the newest window's partial flag wins.
+        self.partial = history.partial;
         self.status = FootprintStatus::Ready;
         self.evict();
     }
@@ -746,15 +748,22 @@ pub fn footprint_history_url(
     limit: usize,
 ) -> String {
     format!(
-        "{}/api/v1/orderflow/footprint?exchange={}&symbol={}&type=spot&timeframe={}&since={since}&until={until}&row_size={}&limit={}&module={}&source=native",
+        "{}/api/v1/orderflow/footprint?exchange={}&symbol={}&type={}&timeframe={}&since={since}&until={until}&row_size={}&limit={}&module={}&source=native",
         config.rest_base_url.trim_end_matches('/'),
         urlencoding::encode(&config.exchange.to_lowercase()),
         encode_symbol(&config.symbol),
+        market_type_for_symbol(&config.symbol),
         urlencoding::encode(timeframe),
         row_size,
         limit,
         urlencoding::encode(&format!("Chart · {} ({})", config.symbol, timeframe)),
     )
+}
+
+/// `type` mirrors the unified-symbol market class. Perp/swap symbols carry a
+/// `:` settlement suffix (`BTC/USDT:USDT`); everything else is spot.
+fn market_type_for_symbol(symbol: &str) -> &'static str {
+    if symbol.contains(':') { "swap" } else { "spot" }
 }
 
 fn encode_symbol(symbol: &str) -> String {
@@ -1053,11 +1062,47 @@ mod tests {
             "{url}"
         );
         assert!(url.contains("symbol=BTC/USDT:USDT"), "{url}");
+        assert!(url.contains("type=swap"), "{url}");
         assert!(url.contains("timeframe=1m"), "{url}");
         assert!(url.contains("since=1000"), "{url}");
         assert!(url.contains("until=2000"), "{url}");
         assert!(url.contains("row_size=0.5"), "{url}");
         assert!(url.contains("limit=20"), "{url}");
         assert!(url.contains("source=native"), "{url}");
+    }
+
+    #[test]
+    fn history_url_marks_spot_symbols_as_spot() {
+        let mut cfg = config();
+        cfg.rest_base_url = "https://staging.coinwat.ch".into();
+        cfg.symbol = "BTC/USDT".into();
+        let url = footprint_history_url(&cfg, "1m", 1_000, 2_000, 0.5, 20);
+        assert!(url.contains("symbol=BTC/USDT"), "{url}");
+        assert!(url.contains("type=spot"), "{url}");
+        assert!(!url.contains("type=swap"), "{url}");
+    }
+
+    #[test]
+    fn a_complete_window_clears_a_previous_partial_flag() {
+        let feed = empty(config());
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.apply_history(&FootprintHistory {
+                data: vec![history_bar(60_000, true)],
+                partial: true,
+                ..FootprintHistory::default()
+            });
+        }
+        assert!(feed.snapshot().partial);
+
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.apply_history(&FootprintHistory {
+                data: vec![history_bar(120_000, true)],
+                partial: false,
+                ..FootprintHistory::default()
+            });
+        }
+        assert!(!feed.snapshot().partial);
     }
 }
