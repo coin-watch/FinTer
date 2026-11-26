@@ -18,7 +18,9 @@ pub use candlestick_chart::{
     paint_text_line_centered, AlertOverlaySpec, CandleType, CandlestickChart, IndicatorStyle,
     OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
 };
-pub use chart_state::{ChartOverlayAction, ChartOverlayHitbox, ChartState};
+pub use chart_state::{
+    ChartOverlayAction, ChartOverlayHitbox, ChartState, MAX_VISIBLE, MIN_VISIBLE,
+};
 pub use line_chart::LineChart;
 pub use linear_scale::LinearScale;
 pub use pie_chart::PieChart;

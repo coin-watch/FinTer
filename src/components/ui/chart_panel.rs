@@ -39,7 +39,8 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::button::Button;
 use gpui_component::chart::core::{
-    Ohlcv, PriceScaleMode, timeframe_interval_ms, timestamp_at_buffer_index,
+    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span,
+    timeframe_interval_ms, timestamp_at_buffer_index,
 };
 use gpui_component::chart::elements::{
     ChartEvent, ChartOptions, ChartSnapshot, ChartView, PriceAxisState,
@@ -47,7 +48,7 @@ use gpui_component::chart::elements::{
 use gpui_component::chart::theme::ChartPalette;
 use gpui_component::chart::{
     AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle,
-    OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
+    MAX_VISIBLE, MIN_VISIBLE, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::theme::ActiveTheme;
@@ -108,6 +109,64 @@ struct IndicatorLineSpec {
     pane: PaneTarget,
 }
 
+/// In-progress axis drag for the legacy `CandlestickChart` renderer.
+///
+/// Mirrors v2's `AxisDrag` but stores the values the legacy `ChartState`
+/// needs (visible count / viewport offset) instead of `Viewport` slots.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LegacyAxisDrag {
+    Price {
+        start_y: f32,
+        start_range: (f64, f64),
+        anchor_price: f64,
+        moved: bool,
+    },
+    Time {
+        start_x: f32,
+        start_visible: f64,
+        anchor_pos: f64,
+        anchor_frac: f32,
+        moved: bool,
+    },
+}
+
+/// Hit-test the legacy chart's axis rails in window-space pixels.
+///
+/// `origin` is the candle plot origin and `plot_size` is `(chart_w, candle_h)`
+/// captured during paint. The price rail starts 4 px left of the plot's right
+/// edge; the time rail is the 4 px above the bottom axis strip. Pure so it can
+/// be unit-tested without a window.
+fn axis_at_point(
+    origin: (f32, f32),
+    plot_size: (f32, f32),
+    bounds_bottom: f32,
+    x: f32,
+    y: f32,
+) -> Option<AxisHandle> {
+    let (origin_x, origin_y) = origin;
+    let (chart_w, candle_h) = plot_size;
+    if !origin_x.is_finite()
+        || !origin_y.is_finite()
+        || !chart_w.is_finite()
+        || !candle_h.is_finite()
+        || !bounds_bottom.is_finite()
+        || !x.is_finite()
+        || !y.is_finite()
+        || chart_w <= 0.0
+        || candle_h <= 0.0
+    {
+        return None;
+    }
+
+    if x >= origin_x + chart_w - 4.0 && y >= origin_y && y <= origin_y + candle_h {
+        return Some(AxisHandle::Price);
+    }
+    if y >= bounds_bottom - AXIS_GAP - 4.0 && x >= origin_x - 4.0 && x <= origin_x + chart_w + 4.0 {
+        return Some(AxisHandle::Time);
+    }
+    None
+}
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -123,13 +182,17 @@ pub struct ChartPanel {
     focus_handle: FocusHandle,
     /// Interactive viewport + crosshair state.
     chart_state: ChartState,
+    /// Axis rail under the pointer, used for cursor + press handling.
+    hover_axis: Option<AxisHandle>,
+    /// Active price/time axis drag, if any.
+    axis_drag: Option<LegacyAxisDrag>,
     /// Experimental scene-based chart (enabled with `FINTER_CHART_V2=1`).
     chart_v2: gpui::Entity<ChartView>,
     /// Cheap change key for the v2 chart snapshot/options.
     last_v2_key: String,
     /// Persisted v2 price scale mode and range.
     v2_price_scale_mode: String,
-    v2_manual_price_range: Option<(f64, f64)>,
+    manual_price_range: Option<(f64, f64)>,
     v2_percent_anchor: Option<f64>,
     pub on_load_more:
         Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
@@ -287,10 +350,10 @@ impl ChartPanel {
         let palette = ChartPalette::from_theme(&cx.theme().colors);
         let mode = chart_v2_scale_mode(
             &self.v2_price_scale_mode,
-            self.v2_manual_price_range,
+            self.manual_price_range,
             self.v2_percent_anchor,
         );
-        let axis_state = match self.v2_manual_price_range {
+        let axis_state = match self.manual_price_range {
             Some((min, max)) if min.is_finite() && max.is_finite() && max > min => {
                 PriceAxisState::Manual { min, max }
             }
@@ -314,7 +377,7 @@ impl ChartPanel {
             self.show_horizontal_grid,
             version,
             self.v2_price_scale_mode,
-            self.v2_manual_price_range,
+            self.manual_price_range,
             self.v2_percent_anchor
         );
     }
@@ -404,7 +467,7 @@ impl ChartPanel {
             cx.new(|cx| ChartView::new(v2_snapshot, ChartOptions::default(), v2_palette, cx));
         let last_v2_key = String::new();
         let v2_price_scale_mode = "linear".to_string();
-        let v2_manual_price_range = None;
+        let manual_price_range = None;
         let v2_percent_anchor = None;
         cx.subscribe(&chart_v2, |panel, _, event: &ChartEvent, cx| {
             if let ChartEvent::ScaleChanged { mode, manual } = event {
@@ -416,11 +479,11 @@ impl ChartPanel {
                 };
                 let anchor = mode.anchor();
                 if panel.v2_price_scale_mode != name
-                    || panel.v2_manual_price_range != *manual
+                    || panel.manual_price_range != *manual
                     || panel.v2_percent_anchor != anchor
                 {
                     panel.v2_price_scale_mode = name.to_string();
-                    panel.v2_manual_price_range = *manual;
+                    panel.manual_price_range = *manual;
                     panel.v2_percent_anchor = anchor;
                     panel.mark_dirty();
                     cx.spawn(async move |this, cx| {
@@ -448,10 +511,12 @@ impl ChartPanel {
             precision: None,
             focus_handle: cx.focus_handle(),
             chart_state: ChartState::new(),
+            hover_axis: None,
+            axis_drag: None,
             chart_v2,
             last_v2_key,
             v2_price_scale_mode,
-            v2_manual_price_range,
+            manual_price_range,
             v2_percent_anchor,
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
@@ -514,6 +579,14 @@ impl ChartPanel {
                 )
             });
         ChartMetrics::new(self.pane_width, self.pane_height, plot_width, plot_height)
+    }
+
+    /// Which axis rail (if any) is under a window-space point.
+    fn axis_at(&self, x: f32, y: f32) -> Option<AxisHandle> {
+        let origin = self.chart_state.candle_plot_origin.get()?;
+        let size = self.chart_state.candle_plot_size.get()?;
+        let bounds = self.chart_state.chart_bounds.get()?;
+        axis_at_point(origin, size, bounds.bottom().as_f32(), x, y)
     }
 
     fn settings_panel_width(&self) -> f32 {
@@ -739,7 +812,7 @@ impl ChartPanel {
         self.drawings = layout.drawings;
         self.show_horizontal_grid = layout.show_grid;
         self.v2_price_scale_mode = layout.price_scale_mode;
-        self.v2_manual_price_range = layout.manual_price_range;
+        self.manual_price_range = layout.manual_price_range;
         self.v2_percent_anchor = layout.percent_anchor;
     }
 
@@ -760,7 +833,7 @@ impl ChartPanel {
         layout.indicators = self.indicators.clone();
         layout.drawings = self.drawings.clone();
         layout.price_scale_mode = self.v2_price_scale_mode.clone();
-        layout.manual_price_range = self.v2_manual_price_range;
+        layout.manual_price_range = self.manual_price_range;
         layout.percent_anchor = self.v2_percent_anchor;
         // The in-chart indicator library is gone; keep the field parseable for
         // old layout files but stop writing a new geometry.
@@ -1050,7 +1123,7 @@ impl Render for ChartPanel {
                 self.show_horizontal_grid,
                 self.feed.version(),
                 self.v2_price_scale_mode,
-                self.v2_manual_price_range,
+                self.manual_price_range,
                 self.v2_percent_anchor
             );
             if key != self.last_v2_key {
@@ -1874,6 +1947,7 @@ impl Render for ChartPanel {
             .candle_type(candle_type)
             .show_horizontal_grid(self.show_horizontal_grid)
             .chart_state(chart_st.clone())
+            .manual_price_range(self.manual_price_range)
             .volume(|c: &OhlcvCandle| c.volume)
             .format_timestamp_short({
                 let timezone = self.timezone.clone();
@@ -2293,6 +2367,12 @@ impl Render for ChartPanel {
             near || self.chart_state.is_dragging_separator.is_some()
         };
 
+        let active_axis = match self.axis_drag {
+            Some(LegacyAxisDrag::Price { .. }) => Some(AxisHandle::Price),
+            Some(LegacyAxisDrag::Time { .. }) => Some(AxisHandle::Time),
+            None => self.hover_axis,
+        };
+
         let mut chart_area = div()
             .id("chart_interactive_area")
             .flex_1()
@@ -2300,7 +2380,11 @@ impl Render for ChartPanel {
             .min_h_0()
             .relative();
 
-        if is_near_separator {
+        if active_axis == Some(AxisHandle::Price) {
+            chart_area = chart_area.cursor_row_resize();
+        } else if active_axis == Some(AxisHandle::Time) {
+            chart_area = chart_area.cursor_col_resize();
+        } else if is_near_separator {
             chart_area = chart_area.cursor_row_resize();
         } else {
             chart_area = chart_area.cursor_crosshair();
@@ -2309,6 +2393,7 @@ impl Render for ChartPanel {
         let chart_area = chart_area
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !*hovered {
+                    this.hover_axis = None;
                     if this.chart_state.crosshair_pos.is_some()
                         || this.drawing_cursor_point.is_some()
                     {
@@ -2337,6 +2422,65 @@ impl Render for ChartPanel {
                         this.chart_state.crosshair_pos = None;
                         cx.notify();
                     }
+                    return;
+                }
+
+                // Axis rails take priority over separators / panning.
+                if let Some(mut drag) = this.axis_drag {
+                    let x = pos.x.as_f32();
+                    let y = pos.y.as_f32();
+                    let total = this.feed.len();
+                    match &mut drag {
+                        LegacyAxisDrag::Price {
+                            start_y,
+                            start_range,
+                            anchor_price,
+                            moved,
+                        } => {
+                            let dy = y - *start_y;
+                            if *moved || dy.abs() >= 2.0 {
+                                *moved = true;
+                                let range = drag_price_range(
+                                    PriceScaleMode::Linear,
+                                    *start_range,
+                                    *anchor_price,
+                                    dy,
+                                );
+                                if range.0.is_finite() && range.1.is_finite() && range.1 > range.0 {
+                                    this.manual_price_range = Some(range);
+                                }
+                            }
+                        }
+                        LegacyAxisDrag::Time {
+                            start_x,
+                            start_visible,
+                            anchor_pos,
+                            anchor_frac,
+                            moved,
+                        } => {
+                            let dx = x - *start_x;
+                            if *moved || dx.abs() >= 2.0 {
+                                *moved = true;
+                                let new_span = drag_time_span(
+                                    *start_visible,
+                                    dx,
+                                    MIN_VISIBLE as f64,
+                                    MAX_VISIBLE as f64,
+                                );
+                                this.chart_state.resize_span(new_span, total, *anchor_frac);
+                                // Keep the original pointer anchor fixed even if the
+                                // buffer-edge clamp moved the viewport last frame.
+                                this.chart_state.viewport_offset = *anchor_pos
+                                    - (this.chart_state.visible_count as f64 - 1.0)
+                                        * *anchor_frac as f64;
+                                this.chart_state.clamp_offset(total);
+                            }
+                        }
+                    }
+                    this.axis_drag = Some(drag);
+                    this.chart_state.crosshair_pos = None;
+                    this.drawing_cursor_point = None;
+                    cx.notify();
                     return;
                 }
 
@@ -2376,6 +2520,33 @@ impl Render for ChartPanel {
                     this.chart_state.pinned_to_latest = false;
                     cx.notify();
                     return;
+                }
+
+                // Track which axis rail the pointer is over. Clear the
+                // crosshair while over a rail so axis drags feel distinct.
+                let hover = this.axis_at(pos.x.as_f32(), pos.y.as_f32());
+                let hover_changed = this.hover_axis != hover;
+                this.hover_axis = hover;
+                if hover.is_some() {
+                    this.chart_state.crosshair_pos = None;
+                    this.drawing_cursor_point = None;
+                    // Preserve wheel-zoom anchoring over the rails: the wheel
+                    // handler still reads the last cursor fraction.
+                    this.last_cursor_x = pos.x.as_f32();
+                    if let Some(w) = this.chart_state.chart_height.get() {
+                        if w > 0.0 && this.last_chart_width > 0.0 {
+                            this.chart_state
+                                .last_cursor_frac
+                                .set((pos.x.as_f32() / this.last_chart_width).clamp(0.0, 1.0));
+                        }
+                    }
+                    if hover_changed {
+                        cx.notify();
+                    }
+                    return;
+                }
+                if hover_changed {
+                    cx.notify();
                 }
 
                 // Compute cursor data point (timestamp, price)
@@ -2485,6 +2656,68 @@ impl Render for ChartPanel {
                                     .cancel_order(&order_id);
                             }
                         }
+                        cx.notify();
+                        return;
+                    }
+
+                    // Axis rails: double-click resets, single press starts a drag.
+                    if let Some(axis) = this.axis_at(pos.x.as_f32(), pos.y.as_f32()) {
+                        if ev.click_count >= 2 {
+                            match axis {
+                                AxisHandle::Price => {
+                                    this.manual_price_range = None;
+                                    this.mark_dirty();
+                                }
+                                AxisHandle::Time => {
+                                    let total = this.feed.len();
+                                    this.chart_state.reset_view(total);
+                                }
+                            }
+                            this.axis_drag = None;
+                            this.chart_state.crosshair_pos = None;
+                            this.drawing_cursor_point = None;
+                            cx.notify();
+                            return;
+                        }
+
+                        let origin = this.chart_state.candle_plot_origin.get();
+                        let size = this.chart_state.candle_plot_size.get();
+                        match axis {
+                            AxisHandle::Price => {
+                                if let Some(range) = this.chart_state.candle_price_range.get() {
+                                    if let Some(anchor_price) =
+                                        this.chart_state.y_to_price(pos.y.as_f32())
+                                    {
+                                        this.axis_drag = Some(LegacyAxisDrag::Price {
+                                            start_y: pos.y.as_f32(),
+                                            start_range: range,
+                                            anchor_price,
+                                            moved: false,
+                                        });
+                                    }
+                                }
+                            }
+                            AxisHandle::Time => {
+                                if let (Some((ox, _oy)), Some((chart_w, _h))) = (origin, size) {
+                                    let visible_count = this.chart_state.visible_count.max(1);
+                                    let anchor_frac = (((pos.x.as_f32() - ox) / chart_w.max(1.0))
+                                        .clamp(0.0, 1.0))
+                                        as f32;
+                                    let anchor_pos = this.chart_state.viewport_offset
+                                        + (visible_count as f64 - 1.0) * anchor_frac as f64;
+                                    this.axis_drag = Some(LegacyAxisDrag::Time {
+                                        start_x: pos.x.as_f32(),
+                                        start_visible: visible_count as f64,
+                                        anchor_pos,
+                                        anchor_frac,
+                                        moved: false,
+                                    });
+                                }
+                            }
+                        }
+                        this.hover_axis = Some(axis);
+                        this.chart_state.crosshair_pos = None;
+                        this.drawing_cursor_point = None;
                         cx.notify();
                         return;
                     }
@@ -2631,6 +2864,11 @@ impl Render for ChartPanel {
                     this.settings_panel_dragging = false;
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
+                    if let Some(drag) = this.axis_drag.take() {
+                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
+                            this.mark_dirty();
+                        }
+                    }
                     let pos: Point<Pixels> = ev.position;
                     if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
                         cx.notify();
@@ -2645,6 +2883,11 @@ impl Render for ChartPanel {
                     this.settings_panel_dragging = false;
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
+                    if let Some(drag) = this.axis_drag.take() {
+                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
+                            this.mark_dirty();
+                        }
+                    }
                     cx.notify();
                 }),
             )
@@ -2692,6 +2935,7 @@ impl Render for ChartPanel {
             .bg(cx.theme().colors.background)
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !*hovered {
+                    this.hover_axis = None;
                     if this.chart_state.crosshair_pos.is_some()
                         || this.drawing_cursor_point.is_some()
                     {
@@ -2846,5 +3090,86 @@ mod tests {
         indicators.retain(|instance| instance.id != "ema-1");
         let next = unique_indicator_id(&indicators, &IndicatorKind::Ema);
         assert_eq!(next, "ema-3");
+    }
+
+    #[test]
+    fn axis_at_point_detects_price_and_time_rails() {
+        let origin = (0.0, 0.0);
+        let size = (800.0, 400.0);
+        let bounds_bottom = 500.0;
+
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 798.0, 200.0),
+            Some(AxisHandle::Price)
+        );
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 300.0, 490.0),
+            Some(AxisHandle::Time)
+        );
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 300.0, 200.0),
+            None
+        );
+    }
+
+    #[test]
+    fn axis_at_point_respects_the_rail_edges() {
+        let origin = (10.0, 20.0);
+        let size = (800.0, 400.0);
+        let bounds_bottom = 500.0;
+
+        // Price rail starts 4 px left of the plot's right edge.
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 806.0, 20.0),
+            Some(AxisHandle::Price)
+        );
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 805.9, 20.0),
+            None
+        );
+        // Time rail starts 4 px above the bottom axis strip.
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 300.0, 478.0),
+            Some(AxisHandle::Time)
+        );
+        assert_eq!(
+            axis_at_point(origin, size, bounds_bottom, 300.0, 477.9),
+            None
+        );
+    }
+
+    #[test]
+    fn axis_at_point_rejects_non_finite_input() {
+        let origin = (0.0, 0.0);
+        let size = (800.0, 400.0);
+        assert_eq!(axis_at_point(origin, size, 500.0, f32::NAN, 200.0), None);
+        assert_eq!(
+            axis_at_point(origin, (f32::NAN, 400.0), 500.0, 300.0, 200.0),
+            None
+        );
+    }
+
+    #[test]
+    fn price_axis_anchor_uses_the_rendered_scale_inset() {
+        // Reproduce the state captured during paint: a 10 px top inset maps
+        // the top pixel slightly above the price range's max.
+        let mut state = ChartState::new();
+        state.candle_plot_origin.set(Some((10.0, 20.0)));
+        state.candle_plot_size.set(Some((800.0, 400.0)));
+        state.candle_price_range.set(Some((100.0, 200.0)));
+
+        let top = state.y_to_price(20.0).expect("anchored price");
+        // The naive (y - origin) / candle_h fraction would return exactly the
+        // range max here; the real scale reaches above it because of the inset.
+        assert!(top > 200.0);
+
+        let bottom = state.y_to_price(20.0 + 400.0).expect("anchored price");
+        assert!((bottom - 100.0).abs() < 1e-9);
+
+        let mid = state.y_to_price(20.0 + 200.0).expect("anchored price");
+        let expected = 100.0 + ((200.0 - 400.0) / (10.0 - 400.0)) * 100.0;
+        assert!((mid - expected).abs() < 1e-4);
+        // The inset means the midpoint is not the naive 150.0.
+        assert!((mid - 150.0).abs() > 1.0);
     }
 }

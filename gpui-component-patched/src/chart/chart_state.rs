@@ -48,7 +48,9 @@ pub struct ChartState {
 
     pub drag_start_y: f32,
     pub drag_start_vol_ratio: f32,
-    pub chart_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    /// Total chart bounds captured during paint. Shared so `ChartPanel` can
+    /// hit-test the price/time axis rails against the rendered geometry.
+    pub chart_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// Saved during paint: Absolute window Y pixel of the separator
     pub separator_y: std::rc::Rc<std::cell::Cell<Option<f32>>>,
     pub separator_ys: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<usize, f32>>>,
@@ -110,7 +112,7 @@ impl ChartState {
             is_dragging_volume: false,
             drag_start_y: 0.0,
             drag_start_vol_ratio: 0.18,
-            chart_bounds: None,
+            chart_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             separator_y: std::rc::Rc::new(std::cell::Cell::new(None)),
             chart_height: std::rc::Rc::new(std::cell::Cell::new(None)),
             candle_plot_origin: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -198,6 +200,39 @@ impl ChartState {
 
         self.viewport_offset = new_offset.max(0.0);
         self.clamp_offset(total);
+    }
+
+    /// Resize the viewport to an absolute span, anchoring on `cursor_frac`.
+    ///
+    /// The candle at `cursor_frac` (0.0 = left edge, 1.0 = right edge) stays
+    /// stationary, mirroring [`Self::zoom`] but targeting a concrete visible
+    /// count instead of a multiplicative factor. Used by time-axis drags.
+    ///
+    /// `new_visible` is rounded and clamped to `[MIN_VISIBLE, MAX_VISIBLE]`
+    /// (and never above the buffer size). Non-finite input is ignored.
+    pub fn resize_span(&mut self, new_visible: f64, total: usize, cursor_frac: f32) {
+        if !new_visible.is_finite() {
+            return;
+        }
+        let cursor_frac = if cursor_frac.is_finite() {
+            cursor_frac.clamp(0.0, 1.0) as f64
+        } else {
+            0.5
+        };
+
+        let visible_f = (self.visible_count as f64 - 1.0).max(0.0);
+        let anchor = self.viewport_offset + visible_f * cursor_frac;
+
+        let new_visible = new_visible
+            .round()
+            .clamp(MIN_VISIBLE as f64, MAX_VISIBLE as f64)
+            .min(total.max(1) as f64);
+        self.visible_count = (new_visible as usize).max(1);
+
+        let new_visible_f = (self.visible_count as f64 - 1.0).max(0.0);
+        self.viewport_offset = anchor - new_visible_f * cursor_frac;
+        self.clamp_offset(total);
+        self.pinned_to_latest = false;
     }
 
     /// Pin the viewport to the most recent candles (right edge).
@@ -324,6 +359,61 @@ mod tests {
         // After zoom: visible_count = 50; offset = 75 - 50*0.25 = 75 - 12.5 = 62 → 62
         assert_eq!(s.visible_count, 50);
         assert_eq!(s.viewport_offset, 62.5);
+    }
+
+    #[test]
+    fn resize_span_keeps_anchor_candle_stationary() {
+        let mut s = ChartState::new();
+        s.viewport_offset = 50.0;
+        s.visible_count = 100;
+        s.pinned_to_latest = true;
+
+        let frac = 0.25_f32;
+        let anchor_before = s.viewport_offset + (s.visible_count as f64 - 1.0) * frac as f64;
+
+        s.resize_span(60.0, 500, frac);
+
+        let anchor_after = s.viewport_offset + (s.visible_count as f64 - 1.0) * frac as f64;
+        assert_eq!(s.visible_count, 60);
+        assert!((anchor_before - anchor_after).abs() < 1e-9);
+        assert_eq!(s.viewport_offset, 60.0);
+        assert!(!s.pinned_to_latest);
+    }
+
+    #[test]
+    fn resize_span_clamps_to_min_and_max() {
+        let mut s = ChartState::new();
+        s.visible_count = 100;
+
+        s.resize_span(1.0, 500, 0.5);
+        assert_eq!(s.visible_count, MIN_VISIBLE);
+
+        s.resize_span(10_000.0, 500, 0.5);
+        assert_eq!(s.visible_count, MAX_VISIBLE);
+    }
+
+    #[test]
+    fn resize_span_handles_short_buffers() {
+        let mut s = ChartState::new();
+        s.visible_count = 100;
+        s.viewport_offset = 0.0;
+
+        s.resize_span(200.0, 8, 0.5);
+        assert_eq!(s.visible_count, 8);
+        assert!(s.viewport_offset <= 6.0);
+        assert!(!s.pinned_to_latest);
+    }
+
+    #[test]
+    fn resize_span_ignores_non_finite_spans() {
+        let mut s = ChartState::new();
+        s.visible_count = 100;
+        s.viewport_offset = 20.0;
+
+        s.resize_span(f64::NAN, 500, 0.5);
+        s.resize_span(f64::INFINITY, 500, 0.5);
+        assert_eq!(s.visible_count, 100);
+        assert_eq!(s.viewport_offset, 20.0);
     }
 
     #[test]

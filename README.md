@@ -40,7 +40,7 @@ Most market tools ask you to choose between a browser tab that eats your RAM and
 
 | **Charting** | **Market data** |
 | --- | --- |
-| Candlesticks and Heikin Ashi, pan, zoom, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. | Live OHLCV over WebSocket with history and reconnect handling, a Depth of Market order book pane, a Time & Sales trade tape pane, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
+| Candlesticks and Heikin Ashi, pan, zoom, price/time axis drag, crosshair, volume, exchange-aware price formatting, timezone-aware axes, resizable indicator sub-panes, and a built-in study library. | Live OHLCV over WebSocket with history and reconnect handling, a Depth of Market order book pane, a Time & Sales trade tape pane, tickers, watchlists, market cap, Fear & Greed, and a news feed. |
 
 | **Workspace** | **Account & updates** |
 | --- | --- |

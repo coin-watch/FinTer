@@ -28,6 +28,12 @@ The legacy chart now keeps drawing time-axis labels across the blank past/future
 
 The crosshair also travels across the whole plot into candle slots that have not been formed or loaded yet. In blank space it keeps drawing the hairlines and price badge and shows the slot's extrapolated timestamp in the existing X-axis timestamp pill. The OHLC legend continues to fall back to the newest candle, and the candle series itself is unchanged: panning still stops with two candles visible at the oldest/newest edge. The v2 engine already behaved this way.
 
+## Chart axis drag (legacy renderer)
+
+The default legacy `CandlestickChart` now supports the same axis-rail interaction as the opt-in v2 engine. Hovering the price rail shows a row-resize cursor and dragging it scales the Y range around the price under the pointer (up shrinks, down expands); hovering the time rail shows a column-resize cursor and dragging it widens or narrows the visible span around the time under the pointer (right widens, left narrows). Both drags use a 2 px dead-zone.
+
+The price range is stored in the existing `ChartLayout.manual_price_range` field and restored on load, so a manual scale survives restarts. Double-clicking the price rail returns the chart to auto-fit and persists that reset; double-clicking the time rail restores the default zoom and pins the view to the newest candles. Wheel zoom and trackpad pan are unchanged.
+
 ## Chart core (experimental, opt-in)
 
 A scene-based chart engine now lives in `gpui-component-patched/src/chart/{core,scene,charts,elements,theme}.rs` and is selected with `FINTER_CHART_V2` (unset by default). The legacy `CandlestickChart` path remains the default and keeps drawings, alerts, positions/orders, indicators, volume, and history paging. The v2 path currently renders candles, volume, axes, grid, price scale and crosshair only. Layouts persist both the v1 and v2 price-scale fields, and the patch rationale is recorded in `gpui-component-patched/FINTER-PATCHES.md`.

@@ -38,6 +38,17 @@ removed the left blank margin. That alters the legacy (non-v2) viewport, so the
 change was reverted in the merge commit; `clamp_offset` keeps its original
 `total - 2` / `2 - visible_count` bounds. Re-landing it is a separate UX change.
 
+Axis-drag additions:
+
+- `chart_bounds` is now a shared `Rc<Cell<Option<Bounds<Pixels>>>>` captured
+  during paint, so `ChartPanel` can hit-test the price and time rails against
+  the rendered geometry (the chart receives a clone of `ChartState`).
+- `resize_span(new_visible, total, cursor_frac)` sets an absolute visible span
+  using the same cursor-anchor math as `zoom`, then clamps the offset and clears
+  `pinned_to_latest`. The legacy time-axis drag uses it.
+- `MIN_VISIBLE` / `MAX_VISIBLE` are re-exported from `src/chart/mod.rs` so
+  `ChartPanel` can pass the same limits to `drag_time_span`.
+
 ## `src/chart/core/time.rs`
 
 Pure additions: `timeframe_interval_ms()` maps a selected timeframe to an exact
@@ -64,6 +75,11 @@ are drawn.
 - **Subpane zero line.** `draw_lines` paints a faint zero baseline for any pane
   whose auto-scaled domain includes zero (for example histogram indicator
   panes). This is otherwise unchanged chart behaviour.
+- **Optional manual price range.** A valid finite `manual_price_range` with
+  `max > min` replaces the auto 5%-padded Y domain for ticks, the price scale,
+  and `candle_price_range`; `None` or an invalid range keeps auto-fit. Paint
+  also writes the shared `chart_bounds` cell so `ChartPanel` can hit-test the
+  axis rails.
 
 Manual checks on desktop where possible:
 

@@ -139,6 +139,9 @@ where
     timeframe: Option<String>,
     /// Interactive viewport / crosshair state.
     state: Option<ChartState>,
+    /// When set to a valid finite range with `max > min`, overrides the
+    /// auto-fitted Y domain (used by price-axis drags). `None` keeps auto-fit.
+    manual_price_range: Option<(f64, f64)>,
     /// Optional price formatter (for labels and tooltip).
     format_price: Option<Rc<dyn Fn(f64) -> SharedString>>,
     /// Optional timezone-aware timestamp formatters.
@@ -182,6 +185,7 @@ where
             body_width_ratio: 0.8,
             timeframe: None,
             state: None,
+            manual_price_range: None,
             format_price: None,
             format_timestamp_short: None,
             format_timestamp_long: None,
@@ -261,6 +265,15 @@ where
     /// Attach chart interaction state (viewport offset, zoom, crosshair).
     pub fn chart_state(mut self, state: ChartState) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Override the auto-fitted Y domain with an exact price range.
+    ///
+    /// The range is only applied when both bounds are finite and `max > min`;
+    /// otherwise the chart keeps its automatic 5%-padded fit.
+    pub fn manual_price_range(mut self, range: Option<(f64, f64)>) -> Self {
+        self.manual_price_range = range;
         self
     }
 
@@ -460,7 +473,12 @@ where
         // Use the widest of price/countdown labels for dynamic Y-axis width.
         // Include both exact-interval and interval-1s countdown variants because
         // boundary values like "1h" become longer strings like "59m:59s".
-        let sample_label = self.price_str(y_domain_max);
+        let sample_label = self.price_str(match self.manual_price_range {
+            Some((min, max)) if min.is_finite() && max.is_finite() && max > min => {
+                y_domain_max.max(max)
+            }
+            _ => y_domain_max,
+        });
         let interval_secs = (interval_ms / 1_000).max(0);
         let countdown_sample_exact: SharedString = format_countdown_duration(interval_secs).into();
         let countdown_sample_worst: SharedString =
@@ -635,11 +653,12 @@ where
             y_domain_max *= 1.1;
         }
 
-        // Add 5% padding to Y range so candles don't touch the edges.
+        // Add 5% padding to Y range so candles don't touch the edges, unless a
+        // manual price-axis range overrides the auto-fit.
         let y_range = (y_domain_max - y_domain_min).max(f64::EPSILON);
         let y_pad = y_range * 0.05;
-        let y_min_padded = y_domain_min - y_pad;
-        let y_max_padded = y_domain_max + y_pad;
+        let (y_min_padded, y_max_padded) =
+            resolve_price_range(y_domain_min, y_domain_max, y_pad, self.manual_price_range);
 
         // Generate nice Y-axis ticks
         let mut y_ticks = Vec::new();
@@ -698,6 +717,7 @@ where
                 *timestamps.last().unwrap_or(&0) as f64,
             )));
             st.candle_price_range.set(Some((y_min_padded, y_max_padded)));
+            st.chart_bounds.set(Some(bounds));
         }
         let bullish_color = cx.theme().bullish;
         let bearish_color = cx.theme().bearish;
@@ -2406,6 +2426,24 @@ fn format_price_inline(v: f64) -> String {
     }
 }
 
+/// Resolve the Y domain used for ticks and the price scale.
+///
+/// A manual range wins when it is finite and increasing; otherwise the
+/// auto-fitted domain is padded by `pad` on each side.
+fn resolve_price_range(
+    auto_min: f64,
+    auto_max: f64,
+    pad: f64,
+    manual: Option<(f64, f64)>,
+) -> (f64, f64) {
+    if let Some((min, max)) = manual {
+        if min.is_finite() && max.is_finite() && max > min {
+            return (min, max);
+        }
+    }
+    (auto_min - pad, auto_max + pad)
+}
+
 /// Candle-slot cell under a pixel X, including blank past/future slots.
 fn slot_at(cursor_x: f32, slot_w: f32, offset: f64) -> i64 {
     if !cursor_x.is_finite() || !slot_w.is_finite() || slot_w <= 0.0 || !offset.is_finite() {
@@ -2851,5 +2889,34 @@ mod tests {
     fn x_ticks_are_empty_for_degenerate_inputs() {
         assert!(build_x_time_ticks(&[], 0, 0.0, 12, 800.0, 10.0, "1m", MINUTE, 80.0).is_empty());
         assert!(build_x_time_ticks(&[0], 0, 0.0, 12, 0.0, 10.0, "1m", MINUTE, 80.0).is_empty());
+    }
+
+    #[test]
+    fn resolve_price_range_prefers_a_valid_manual_range() {
+        assert_eq!(
+            resolve_price_range(100.0, 200.0, 5.0, Some((120.0, 180.0))),
+            (120.0, 180.0)
+        );
+    }
+
+    #[test]
+    fn resolve_price_range_falls_back_for_invalid_manual_ranges() {
+        assert_eq!(
+            resolve_price_range(100.0, 200.0, 5.0, Some((180.0, 120.0))),
+            (95.0, 205.0)
+        );
+        assert_eq!(
+            resolve_price_range(100.0, 200.0, 5.0, Some((f64::NAN, 200.0))),
+            (95.0, 205.0)
+        );
+        assert_eq!(
+            resolve_price_range(100.0, 200.0, 5.0, Some((100.0, f64::INFINITY))),
+            (95.0, 205.0)
+        );
+    }
+
+    #[test]
+    fn resolve_price_range_uses_auto_when_manual_is_none() {
+        assert_eq!(resolve_price_range(100.0, 200.0, 5.0, None), (95.0, 205.0));
     }
 }
