@@ -39,7 +39,7 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::button::Button;
 use gpui_component::chart::core::{
-    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span,
+    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span, pan_price_range,
     timeframe_interval_ms, timestamp_at_buffer_index,
 };
 use gpui_component::chart::elements::{
@@ -153,9 +153,16 @@ struct IndicatorLineSpec {
 enum LegacyAxisDrag {
     Price {
         start_y: f32,
+        start_x: f32,
+        start_offset: f64,
         start_range: (f64, f64),
         anchor_price: f64,
+        /// Vertical movement past the drag threshold was seen.
         moved: bool,
+        /// Horizontal movement past the drag threshold was seen.
+        time_moved: bool,
+        /// The price range actually changed (vertical pan or modifier zoom).
+        range_changed: bool,
     },
     Time {
         start_x: f32,
@@ -255,6 +262,17 @@ fn plot_point_to_screen(
     (x as f64, y as f64)
 }
 
+/// Whether the first-paint price lock should capture the chart's auto-fitted
+/// range. Only when nothing is pinned yet and no saved/manual range exists.
+fn should_lock_price_range(manual: Option<(f64, f64)>, applied: bool) -> bool {
+    !applied && manual.is_none()
+}
+
+/// Validate a painted price range for use as the initial price lock.
+fn lockable_price_range(range: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    range.filter(|range| range.0.is_finite() && range.1.is_finite() && range.1 > range.0)
+}
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -281,6 +299,12 @@ pub struct ChartPanel {
     /// Persisted v2 price scale mode and range.
     v2_price_scale_mode: String,
     manual_price_range: Option<(f64, f64)>,
+    /// Whether the price scale has been pinned since load. The first paint
+    /// captures the auto-fitted range and stops re-fitting on every tick.
+    price_lock_applied: bool,
+    /// Set on an explicit Price-axis reset: one render must paint the
+    /// auto-fitted scale before the lock re-captures it.
+    price_lock_deferred: bool,
     v2_percent_anchor: Option<f64>,
     pub on_load_more:
         Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
@@ -610,6 +634,8 @@ impl ChartPanel {
             last_v2_key,
             v2_price_scale_mode,
             manual_price_range,
+            price_lock_applied: false,
+            price_lock_deferred: false,
             v2_percent_anchor,
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
@@ -1093,6 +1119,7 @@ impl ChartPanel {
         self.show_horizontal_grid = layout.show_grid;
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.manual_price_range = layout.manual_price_range;
+        self.price_lock_applied = self.manual_price_range.is_some();
         self.v2_percent_anchor = layout.percent_anchor;
         self.footprint_settings = layout.footprint;
     }
@@ -1820,6 +1847,20 @@ impl Render for ChartPanel {
                     feed.request_visible(since, until, range.len().saturating_add(8), row_size);
                 }
             }
+        }
+
+        // Pin the price scale on the first paint: capture the auto-fitted
+        // range the legacy chart published last frame so ticks stop re-fitting
+        // it. This deliberately does not mark the layout dirty; the captured
+        // range is a view snapshot, not user intent. An explicit Price-axis
+        // reset defers one render so the auto-fit is painted first.
+        if self.price_lock_deferred {
+            self.price_lock_deferred = false;
+        } else if should_lock_price_range(self.manual_price_range, self.price_lock_applied)
+            && let Some(range) = lockable_price_range(self.chart_state.candle_price_range.get())
+        {
+            self.manual_price_range = Some(range);
+            self.price_lock_applied = true;
         }
 
         let chart_st = self.chart_state.clone();
@@ -2979,8 +3020,12 @@ impl Render for ChartPanel {
             .min_h_0()
             .relative();
 
-        if active_axis == Some(AxisHandle::Price) {
-            chart_area = chart_area.cursor_row_resize();
+        // The Price rail is a 2D pan handle now: grab while hovering, grabbing
+        // while dragging. The Time rail keeps its column-resize cursor.
+        if matches!(self.axis_drag, Some(LegacyAxisDrag::Price { .. })) {
+            chart_area = chart_area.cursor_grabbing();
+        } else if active_axis == Some(AxisHandle::Price) {
+            chart_area = chart_area.cursor_grab();
         } else if active_axis == Some(AxisHandle::Time) {
             chart_area = chart_area.cursor_col_resize();
         } else if is_near_separator {
@@ -3084,22 +3129,62 @@ impl Render for ChartPanel {
                     match &mut drag {
                         LegacyAxisDrag::Price {
                             start_y,
+                            start_x,
+                            start_offset,
                             start_range,
                             anchor_price,
                             moved,
+                            time_moved,
+                            range_changed,
                         } => {
                             let dy = y - *start_y;
+                            let dx = x - *start_x;
+
+                            // Price: vertical movement pans the range (the rail
+                            // is a 2D handle, not a zoom). Secondary/Ctrl is
+                            // kept as the explicit zoom gesture.
                             if *moved || dy.abs() >= 2.0 {
                                 *moved = true;
-                                let range = drag_price_range(
-                                    PriceScaleMode::Linear,
-                                    *start_range,
-                                    *anchor_price,
-                                    dy,
-                                );
+                                let zoom = ev.modifiers.secondary();
+                                let range = if zoom {
+                                    drag_price_range(
+                                        PriceScaleMode::Linear,
+                                        *start_range,
+                                        *anchor_price,
+                                        dy,
+                                    )
+                                } else if let Some(plot_h) =
+                                    this.chart_state.candle_plot_size.get().map(|(_, h)| h)
+                                {
+                                    pan_price_range(*start_range, dy, plot_h)
+                                } else {
+                                    *start_range
+                                };
                                 if range.0.is_finite() && range.1.is_finite() && range.1 > range.0 {
+                                    if range != *start_range {
+                                        *range_changed = true;
+                                    }
                                     this.manual_price_range = Some(range);
                                 }
+                            }
+
+                            // Time: horizontal movement pans the viewport the
+                            // same way a plot drag does, so the whole chart
+                            // follows the rail.
+                            if *time_moved || dx.abs() >= 2.0 {
+                                *time_moved = true;
+                                let candle_width = if this.chart_state.visible_count > 0
+                                    && this.last_chart_width > 0.0
+                                {
+                                    this.last_chart_width as f64
+                                        / this.chart_state.visible_count as f64
+                                } else {
+                                    8.0
+                                };
+                                this.chart_state.viewport_offset =
+                                    *start_offset - dx as f64 / candle_width;
+                                this.chart_state.clamp_offset(total);
+                                this.chart_state.pinned_to_latest = false;
                             }
                         }
                         LegacyAxisDrag::Time {
@@ -3259,6 +3344,8 @@ impl Render for ChartPanel {
                             match axis {
                                 AxisHandle::Price => {
                                     this.manual_price_range = None;
+                                    this.price_lock_applied = false;
+                                    this.price_lock_deferred = true;
                                     this.mark_dirty();
                                 }
                                 AxisHandle::Time => {
@@ -3283,9 +3370,13 @@ impl Render for ChartPanel {
                                     {
                                         this.axis_drag = Some(LegacyAxisDrag::Price {
                                             start_y: pos.y.as_f32(),
+                                            start_x: pos.x.as_f32(),
+                                            start_offset: this.chart_state.viewport_offset,
                                             start_range: range,
                                             anchor_price,
                                             moved: false,
+                                            time_moved: false,
+                                            range_changed: false,
                                         });
                                     }
                                 }
@@ -3460,7 +3551,13 @@ impl Render for ChartPanel {
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
                     if let Some(drag) = this.axis_drag.take() {
-                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
+                        if matches!(
+                            drag,
+                            LegacyAxisDrag::Price {
+                                range_changed: true,
+                                ..
+                            }
+                        ) {
                             this.mark_dirty();
                         }
                     }
@@ -3480,7 +3577,13 @@ impl Render for ChartPanel {
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
                     if let Some(drag) = this.axis_drag.take() {
-                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
+                        if matches!(
+                            drag,
+                            LegacyAxisDrag::Price {
+                                range_changed: true,
+                                ..
+                            }
+                        ) {
                             this.mark_dirty();
                         }
                     }
@@ -3877,6 +3980,30 @@ mod tests {
             axis_at_point(origin, (f32::NAN, 400.0), 500.0, 300.0, 200.0),
             None
         );
+    }
+
+    #[test]
+    fn price_lock_decision_requires_an_unpinned_empty_state() {
+        // Fresh pane, nothing painted yet: not lockable until a range exists.
+        assert!(should_lock_price_range(None, false));
+        // Saved or user-selected manual range: already pinned.
+        assert!(!should_lock_price_range(Some((100.0, 200.0)), false));
+        // Already locked: never re-capture, so ticks do not reset the scale.
+        assert!(!should_lock_price_range(None, true));
+        assert!(!should_lock_price_range(Some((100.0, 200.0)), true));
+    }
+
+    #[test]
+    fn price_lock_rejects_unusable_painted_ranges() {
+        assert_eq!(
+            lockable_price_range(Some((100.0, 200.0))),
+            Some((100.0, 200.0))
+        );
+        assert_eq!(lockable_price_range(None), None);
+        assert_eq!(lockable_price_range(Some((200.0, 100.0))), None);
+        assert_eq!(lockable_price_range(Some((100.0, 100.0))), None);
+        assert_eq!(lockable_price_range(Some((f64::NAN, 200.0))), None);
+        assert_eq!(lockable_price_range(Some((100.0, f64::INFINITY))), None);
     }
 
     #[test]

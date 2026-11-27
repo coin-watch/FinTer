@@ -4,6 +4,10 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Pinned price scale and panning price rail
+
+The legacy chart's price scale now pins on first paint: the initial auto-fit is captured and held instead of re-fitting on every tick, so the scale only moves when the right price rail is dragged (vertical) or the axis is double-clicked to re-fit. The price rail is now a 2D pan handle: dragging it vertically shifts the price range (Ctrl/⌘ + drag keeps the old range zoom) and dragging it horizontally pans time, with grab/grabbing cursors replacing the row-resize cursor.
+
 ## Drawing move and endpoint drag
 
 Drawings on the legacy chart can now be dragged as whole objects on both axes: hover a drawing to get a grab cursor, then drag it along time and price together. Horizontal lines follow the price axis, vertical lines follow the time axis, and trendlines, rays, segments, Fibonacci levels, channels, text notes, and long/short position tools translate both points together. While dragging, the chart viewport does not pan, and the moved geometry is persisted to the layout on release (including when the pointer leaves the window mid-drag).

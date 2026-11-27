@@ -17,6 +17,7 @@ pub mod viewport;
 pub use geometry::{Point, Rect, snap, snap_point};
 pub use gesture::{
     DragClassifier, DragRelease, DragUpdate, VelocityTracker, drag_price_range, drag_time_span,
+    pan_price_range,
 };
 pub use hit::{AxisHandle, axis_handle, nearest_candle, pane_separator};
 pub use layout::{
