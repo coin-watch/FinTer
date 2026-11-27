@@ -219,22 +219,29 @@ fn plot_point_to_screen(
     (x as f64, y as f64)
 }
 
-/// Whether the first-paint price lock should capture the chart's auto-fitted
-/// range. Only when nothing is pinned yet and no saved/manual range exists.
-fn should_lock_price_range(manual: Option<(f64, f64)>, applied: bool) -> bool {
-    !applied && manual.is_none()
-}
-
-/// Validate a painted price range for use as the initial price lock.
-fn lockable_price_range(range: Option<(f64, f64)>) -> Option<(f64, f64)> {
-    range.filter(|range| range.0.is_finite() && range.1.is_finite() && range.1 > range.0)
-}
-
 /// Whether a mouse-down on a drawing should start its move drag instead of
 /// falling through to a chart pan. Only an already-selected drawing claims the
 /// drag; an unselected hit is selected first and the same drag pans the chart.
 fn drawing_drag_claims_hit(is_already_selected: bool) -> bool {
     is_already_selected
+}
+
+/// A saved manual range means the axis was explicitly unlocked when the layout
+/// was written; no range means locked/auto-fit.
+fn y_axis_unlocked_for_saved_range(saved: Option<(f64, f64)>) -> bool {
+    saved.is_some()
+}
+
+/// The range handed to the chart. Locked mode always clears the manual range so
+/// the renderer auto-fits the current visible candles; unlocked mode keeps it.
+fn manual_price_range_for_render(unlocked: bool, manual: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    if unlocked { manual } else { None }
+}
+
+/// The Y-axis state after a double-click on the price rail: re-lock and drop
+/// the saved manual range.
+fn y_axis_after_reset() -> (Option<(f64, f64)>, bool) {
+    (None, false)
 }
 
 /// Whether a chart-body drag may pan price vertically. Time panning is always
@@ -243,8 +250,8 @@ fn body_pan_allows_price(y_axis_unlocked: bool) -> bool {
     y_axis_unlocked
 }
 
-/// Whether a price-rail drag unlocks vertical body panning. The rail scales on
-/// every frame, but only a drag past the threshold unlocks the Y axis; an
+/// Whether a price-rail drag unlocks manual Y-axis scaling. The rail scales on
+/// every frame, but only a drag past the threshold leaves locked/auto mode; an
 /// already-unlocked axis stays unlocked.
 fn y_axis_unlock_after_rail_drag(unlocked: bool, moved: bool) -> bool {
     unlocked || moved
@@ -276,14 +283,9 @@ pub struct ChartPanel {
     /// Persisted v2 price scale mode and range.
     v2_price_scale_mode: String,
     manual_price_range: Option<(f64, f64)>,
-    /// Whether the price scale has been pinned since load. The first paint
-    /// captures the auto-fitted range and stops re-fitting on every tick.
-    price_lock_applied: bool,
-    /// Set on an explicit Price-axis reset: one render must paint the
-    /// auto-fitted scale before the lock re-captures it.
-    price_lock_deferred: bool,
-    /// Whether a price-rail drag has unlocked vertical body panning. The Y
-    /// axis starts locked and re-locks on a price-axis double-click.
+    /// Single Y-axis mode flag. `false` is locked/auto-fit: the chart clears any
+    /// manual range each render and fits the visible candles. `true` is manual:
+    /// a rail or body drag owns the range until a price-axis double-click.
     y_axis_unlocked: bool,
     v2_percent_anchor: Option<f64>,
     pub on_load_more:
@@ -612,8 +614,6 @@ impl ChartPanel {
             last_v2_key,
             v2_price_scale_mode,
             manual_price_range,
-            price_lock_applied: false,
-            price_lock_deferred: false,
             y_axis_unlocked: false,
             v2_percent_anchor,
             last_chart_width: 800.0,
@@ -1044,8 +1044,7 @@ impl ChartPanel {
         self.show_horizontal_grid = layout.show_grid;
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.manual_price_range = layout.manual_price_range;
-        self.price_lock_applied = self.manual_price_range.is_some();
-        self.y_axis_unlocked = false;
+        self.y_axis_unlocked = y_axis_unlocked_for_saved_range(self.manual_price_range);
         self.pan_start_price_range = None;
         self.v2_percent_anchor = layout.percent_anchor;
     }
@@ -1548,19 +1547,11 @@ impl Render for ChartPanel {
             self.chart_state.clamp_offset(total);
         }
 
-        // Pin the price scale on the first paint: capture the auto-fitted
-        // range the legacy chart published last frame so ticks stop re-fitting
-        // it. This deliberately does not mark the layout dirty; the captured
-        // range is a view snapshot, not user intent. An explicit Price-axis
-        // reset defers one render so the auto-fit is painted first.
-        if self.price_lock_deferred {
-            self.price_lock_deferred = false;
-        } else if should_lock_price_range(self.manual_price_range, self.price_lock_applied)
-            && let Some(range) = lockable_price_range(self.chart_state.candle_price_range.get())
-        {
-            self.manual_price_range = Some(range);
-            self.price_lock_applied = true;
-        }
+        // Locked mode always auto-fits the visible viewport. Clearing the
+        // manual range here is a view-state decision, not user intent, so it
+        // must not mark the layout dirty.
+        self.manual_price_range =
+            manual_price_range_for_render(self.y_axis_unlocked, self.manual_price_range);
 
         let chart_st = self.chart_state.clone();
         let candle_type = self.candle_type;
@@ -2946,10 +2937,9 @@ impl Render for ChartPanel {
                         if ev.click_count >= 2 {
                             match axis {
                                 AxisHandle::Price => {
-                                    this.manual_price_range = None;
-                                    this.price_lock_applied = false;
-                                    this.price_lock_deferred = true;
-                                    this.y_axis_unlocked = false;
+                                    let (manual, unlocked) = y_axis_after_reset();
+                                    this.manual_price_range = manual;
+                                    this.y_axis_unlocked = unlocked;
                                     this.pan_start_price_range = None;
                                     this.mark_dirty();
                                 }
@@ -3456,27 +3446,44 @@ mod tests {
     }
 
     #[test]
-    fn price_lock_decision_requires_an_unpinned_empty_state() {
-        // Fresh pane, nothing painted yet: not lockable until a range exists.
-        assert!(should_lock_price_range(None, false));
-        // Saved or user-selected manual range: already pinned.
-        assert!(!should_lock_price_range(Some((100.0, 200.0)), false));
-        // Already locked: never re-capture, so ticks do not reset the scale.
-        assert!(!should_lock_price_range(None, true));
-        assert!(!should_lock_price_range(Some((100.0, 200.0)), true));
+    fn locked_y_axis_selects_auto_fit() {
+        // Locked mode has no manual range even if render was handed one, so the
+        // chart auto-fits the visible candles on every viewport change.
+        assert_eq!(
+            manual_price_range_for_render(false, Some((100.0, 200.0))),
+            None
+        );
+        assert_eq!(manual_price_range_for_render(false, None), None);
+        assert!(!body_pan_allows_price(false));
     }
 
     #[test]
-    fn price_lock_rejects_unusable_painted_ranges() {
+    fn saved_manual_range_starts_unlocked() {
+        assert!(!y_axis_unlocked_for_saved_range(None));
+        assert!(y_axis_unlocked_for_saved_range(Some((100.0, 200.0))));
+        // Unlocked mode preserves the saved manual range for the chart.
         assert_eq!(
-            lockable_price_range(Some((100.0, 200.0))),
+            manual_price_range_for_render(true, Some((100.0, 200.0))),
             Some((100.0, 200.0))
         );
-        assert_eq!(lockable_price_range(None), None);
-        assert_eq!(lockable_price_range(Some((200.0, 100.0))), None);
-        assert_eq!(lockable_price_range(Some((100.0, 100.0))), None);
-        assert_eq!(lockable_price_range(Some((f64::NAN, 200.0))), None);
-        assert_eq!(lockable_price_range(Some((100.0, f64::INFINITY))), None);
+    }
+
+    #[test]
+    fn rail_drag_transitions_locked_to_unlocked() {
+        let unlocked = y_axis_unlock_after_rail_drag(false, false);
+        assert!(!unlocked, "a click without movement stays locked/auto");
+        let unlocked = y_axis_unlock_after_rail_drag(unlocked, true);
+        assert!(unlocked, "a rail drag switches to manual");
+        assert!(body_pan_allows_price(unlocked));
+        assert!(y_axis_unlock_after_rail_drag(true, false));
+    }
+
+    #[test]
+    fn price_axis_double_click_transitions_back_to_locked_auto() {
+        let (manual, unlocked) = y_axis_after_reset();
+        assert_eq!(manual, None);
+        assert!(!unlocked);
+        assert_eq!(manual_price_range_for_render(unlocked, manual), None);
     }
 
     #[test]

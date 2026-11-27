@@ -12,7 +12,7 @@ Existing layouts still load: `show_footprint` and `footprint` are ignored as unk
 
 ## Locked price scale and chart panning
 
-The legacy chart's Y/price axis pins on first paint: the initial auto-fit is captured and held instead of re-fitting on every tick, so the price range only changes when the right price rail is dragged (which scales it and unlocks the Y axis) or the axis is double-clicked to re-fit and re-lock. The chart body always pans time; after the first price-rail drag it also pans price vertically.
+The legacy chart's Y/price axis is **locked to auto-fit by default**: with no manual range saved, the scale re-fits the visible candles on every pan, zoom, and new candle. Dragging the right price rail scales the Y axis and switches it to manual, and that manual range is what gets saved. The chart body always pans time; only after a price-rail drag does it also pan price vertically. Double-clicking the price rail clears the manual range, re-locks the axis, and returns to auto-fit. A layout saved with `manual_price_range: Some(...)` loads as unlocked/manual; `None` loads locked/auto.
 
 ## Drawing move and endpoint drag
 
