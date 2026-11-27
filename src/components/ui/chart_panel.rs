@@ -39,7 +39,7 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::button::Button;
 use gpui_component::chart::core::{
-    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span, pan_price_range,
+    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span,
     timeframe_interval_ms, timestamp_at_buffer_index,
 };
 use gpui_component::chart::elements::{
@@ -153,16 +153,9 @@ struct IndicatorLineSpec {
 enum LegacyAxisDrag {
     Price {
         start_y: f32,
-        start_x: f32,
-        start_offset: f64,
         start_range: (f64, f64),
         anchor_price: f64,
-        /// Vertical movement past the drag threshold was seen.
         moved: bool,
-        /// Horizontal movement past the drag threshold was seen.
-        time_moved: bool,
-        /// The price range actually changed (vertical pan or modifier zoom).
-        range_changed: bool,
     },
     Time {
         start_x: f32,
@@ -271,6 +264,13 @@ fn should_lock_price_range(manual: Option<(f64, f64)>, applied: bool) -> bool {
 /// Validate a painted price range for use as the initial price lock.
 fn lockable_price_range(range: Option<(f64, f64)>) -> Option<(f64, f64)> {
     range.filter(|range| range.0.is_finite() && range.1.is_finite() && range.1 > range.0)
+}
+
+/// Whether a mouse-down on a drawing should start its move drag instead of
+/// falling through to a chart pan. Only an already-selected drawing claims the
+/// drag; an unselected hit is selected first and the same drag pans the chart.
+fn drawing_drag_claims_hit(is_already_selected: bool) -> bool {
+    is_already_selected
 }
 
 pub struct ChartPanel {
@@ -3001,17 +3001,18 @@ impl Render for ChartPanel {
         };
 
         // Drawings advertise that they can be grabbed, while axis rails and
-        // separators keep their resize cursors.
+        // separators keep their resize cursors. Only the selected drawing is
+        // draggable; hovering any other drawing keeps the crosshair.
         let drawing_drag_active = matches!(
             self.drawing_state,
             DrawingInteractionState::MovingDrawing { .. }
                 | DrawingInteractionState::DraggingPoint { .. }
         );
-        let hovered_drawing = self
+        let hovered_selected_drawing = self
             .chart_state
             .crosshair_pos
             .and_then(|pos| self.drawing_hit_at(pos.x.as_f32(), pos.y.as_f32()))
-            .is_some();
+            .is_some_and(|id| self.selected_drawing_id.as_deref() == Some(id.as_str()));
 
         let mut chart_area = div()
             .id("chart_interactive_area")
@@ -3020,19 +3021,15 @@ impl Render for ChartPanel {
             .min_h_0()
             .relative();
 
-        // The Price rail is a 2D pan handle now: grab while hovering, grabbing
-        // while dragging. The Time rail keeps its column-resize cursor.
-        if matches!(self.axis_drag, Some(LegacyAxisDrag::Price { .. })) {
-            chart_area = chart_area.cursor_grabbing();
-        } else if active_axis == Some(AxisHandle::Price) {
-            chart_area = chart_area.cursor_grab();
+        if active_axis == Some(AxisHandle::Price) {
+            chart_area = chart_area.cursor_row_resize();
         } else if active_axis == Some(AxisHandle::Time) {
             chart_area = chart_area.cursor_col_resize();
         } else if is_near_separator {
             chart_area = chart_area.cursor_row_resize();
         } else if drawing_drag_active {
             chart_area = chart_area.cursor_grabbing();
-        } else if hovered_drawing {
+        } else if hovered_selected_drawing {
             chart_area = chart_area.cursor_grab();
         } else {
             chart_area = chart_area.cursor_crosshair();
@@ -3129,62 +3126,22 @@ impl Render for ChartPanel {
                     match &mut drag {
                         LegacyAxisDrag::Price {
                             start_y,
-                            start_x,
-                            start_offset,
                             start_range,
                             anchor_price,
                             moved,
-                            time_moved,
-                            range_changed,
                         } => {
                             let dy = y - *start_y;
-                            let dx = x - *start_x;
-
-                            // Price: vertical movement pans the range (the rail
-                            // is a 2D handle, not a zoom). Secondary/Ctrl is
-                            // kept as the explicit zoom gesture.
                             if *moved || dy.abs() >= 2.0 {
                                 *moved = true;
-                                let zoom = ev.modifiers.secondary();
-                                let range = if zoom {
-                                    drag_price_range(
-                                        PriceScaleMode::Linear,
-                                        *start_range,
-                                        *anchor_price,
-                                        dy,
-                                    )
-                                } else if let Some(plot_h) =
-                                    this.chart_state.candle_plot_size.get().map(|(_, h)| h)
-                                {
-                                    pan_price_range(*start_range, dy, plot_h)
-                                } else {
-                                    *start_range
-                                };
+                                let range = drag_price_range(
+                                    PriceScaleMode::Linear,
+                                    *start_range,
+                                    *anchor_price,
+                                    dy,
+                                );
                                 if range.0.is_finite() && range.1.is_finite() && range.1 > range.0 {
-                                    if range != *start_range {
-                                        *range_changed = true;
-                                    }
                                     this.manual_price_range = Some(range);
                                 }
-                            }
-
-                            // Time: horizontal movement pans the viewport the
-                            // same way a plot drag does, so the whole chart
-                            // follows the rail.
-                            if *time_moved || dx.abs() >= 2.0 {
-                                *time_moved = true;
-                                let candle_width = if this.chart_state.visible_count > 0
-                                    && this.last_chart_width > 0.0
-                                {
-                                    this.last_chart_width as f64
-                                        / this.chart_state.visible_count as f64
-                                } else {
-                                    8.0
-                                };
-                                this.chart_state.viewport_offset =
-                                    *start_offset - dx as f64 / candle_width;
-                                this.chart_state.clamp_offset(total);
-                                this.chart_state.pinned_to_latest = false;
                             }
                         }
                         LegacyAxisDrag::Time {
@@ -3370,13 +3327,9 @@ impl Render for ChartPanel {
                                     {
                                         this.axis_drag = Some(LegacyAxisDrag::Price {
                                             start_y: pos.y.as_f32(),
-                                            start_x: pos.x.as_f32(),
-                                            start_offset: this.chart_state.viewport_offset,
                                             start_range: range,
                                             anchor_price,
                                             moved: false,
-                                            time_moved: false,
-                                            range_changed: false,
                                         });
                                     }
                                 }
@@ -3511,31 +3464,42 @@ impl Render for ChartPanel {
                         return;
                     }
 
-                    // 5. Otherwise hit-test existing drawings for whole-object moves
-                    if let Some(hit_id) = this.drawing_hit_at(pos.x.as_f32(), pos.y.as_f32()) {
-                        let anchor = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32());
-                        this.selected_drawing_id = Some(hit_id.clone());
-                        this.drawing_state = match anchor.and_then(|anchor_point| {
-                            this.drawings
-                                .iter()
-                                .find(|d| d.id == hit_id)
-                                .map(|d| (anchor_point, d.points.clone()))
-                        }) {
-                            Some((anchor_point, original_points)) => {
-                                DrawingInteractionState::MovingDrawing {
-                                    drawing_id: hit_id,
-                                    anchor_point,
-                                    original_points,
+                    // 5. Existing drawings: the selected drawing claims the
+                    // drag so it can be moved. An unselected hit is selected
+                    // first, then falls through to a normal time pan below.
+                    let hit_drawing = this.drawing_hit_at(pos.x.as_f32(), pos.y.as_f32());
+                    if let Some(hit_id) = hit_drawing {
+                        let already_selected =
+                            this.selected_drawing_id.as_deref() == Some(hit_id.as_str());
+                        if drawing_drag_claims_hit(already_selected) {
+                            let anchor = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32());
+                            this.selected_drawing_id = Some(hit_id.clone());
+                            this.drawing_state = match anchor.and_then(|anchor_point| {
+                                this.drawings
+                                    .iter()
+                                    .find(|d| d.id == hit_id)
+                                    .map(|d| (anchor_point, d.points.clone()))
+                            }) {
+                                Some((anchor_point, original_points)) => {
+                                    DrawingInteractionState::MovingDrawing {
+                                        drawing_id: hit_id,
+                                        anchor_point,
+                                        original_points,
+                                    }
                                 }
-                            }
-                            None => DrawingInteractionState::Selected { drawing_id: hit_id },
-                        };
-                        cx.notify();
-                        return;
-                    }
+                                None => DrawingInteractionState::Selected { drawing_id: hit_id },
+                            };
+                            cx.notify();
+                            return;
+                        }
 
-                    this.selected_drawing_id = None;
-                    this.drawing_state = DrawingInteractionState::Idle;
+                        this.selected_drawing_id = Some(hit_id.clone());
+                        this.drawing_state =
+                            DrawingInteractionState::Selected { drawing_id: hit_id };
+                    } else {
+                        this.selected_drawing_id = None;
+                        this.drawing_state = DrawingInteractionState::Idle;
+                    }
 
                     // 6. Normal chart pan drag
                     this.chart_state.is_dragging = true;
@@ -3551,13 +3515,7 @@ impl Render for ChartPanel {
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
                     if let Some(drag) = this.axis_drag.take() {
-                        if matches!(
-                            drag,
-                            LegacyAxisDrag::Price {
-                                range_changed: true,
-                                ..
-                            }
-                        ) {
+                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
                             this.mark_dirty();
                         }
                     }
@@ -3577,13 +3535,7 @@ impl Render for ChartPanel {
                     this.chart_state.is_dragging = false;
                     this.chart_state.is_dragging_separator = None;
                     if let Some(drag) = this.axis_drag.take() {
-                        if matches!(
-                            drag,
-                            LegacyAxisDrag::Price {
-                                range_changed: true,
-                                ..
-                            }
-                        ) {
+                        if matches!(drag, LegacyAxisDrag::Price { moved: true, .. }) {
                             this.mark_dirty();
                         }
                     }
@@ -4004,6 +3956,12 @@ mod tests {
         assert_eq!(lockable_price_range(Some((100.0, 100.0))), None);
         assert_eq!(lockable_price_range(Some((f64::NAN, 200.0))), None);
         assert_eq!(lockable_price_range(Some((100.0, f64::INFINITY))), None);
+    }
+
+    #[test]
+    fn only_a_selected_drawing_claims_the_drag() {
+        assert!(drawing_drag_claims_hit(true));
+        assert!(!drawing_drag_claims_hit(false));
     }
 
     #[test]
