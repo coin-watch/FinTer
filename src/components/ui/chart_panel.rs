@@ -273,6 +273,12 @@ fn drawing_drag_claims_hit(is_already_selected: bool) -> bool {
     is_already_selected
 }
 
+/// Whether a chart-body drag may pan time. Panning starts locked on load and
+/// stays locked until a price-rail drag unlocks the pane.
+fn pan_allowed(unlocked: bool) -> bool {
+    unlocked
+}
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -305,6 +311,9 @@ pub struct ChartPanel {
     /// Set on an explicit Price-axis reset: one render must paint the
     /// auto-fitted scale before the lock re-captures it.
     price_lock_deferred: bool,
+    /// Whether a price-rail drag has unlocked chart-body panning for this
+    /// loaded pane. Starts locked; the first rail drag is the explicit unlock.
+    chart_unlocked: bool,
     v2_percent_anchor: Option<f64>,
     pub on_load_more:
         Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
@@ -636,6 +645,7 @@ impl ChartPanel {
             manual_price_range,
             price_lock_applied: false,
             price_lock_deferred: false,
+            chart_unlocked: false,
             v2_percent_anchor,
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
@@ -1120,6 +1130,7 @@ impl ChartPanel {
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.manual_price_range = layout.manual_price_range;
         self.price_lock_applied = self.manual_price_range.is_some();
+        self.chart_unlocked = false;
         self.v2_percent_anchor = layout.percent_anchor;
         self.footprint_settings = layout.footprint;
     }
@@ -3133,6 +3144,9 @@ impl Render for ChartPanel {
                             let dy = y - *start_y;
                             if *moved || dy.abs() >= 2.0 {
                                 *moved = true;
+                                // The first price-rail drag is the explicit
+                                // unlock for chart-body panning.
+                                this.chart_unlocked = true;
                                 let range = drag_price_range(
                                     PriceScaleMode::Linear,
                                     *start_range,
@@ -3303,6 +3317,7 @@ impl Render for ChartPanel {
                                     this.manual_price_range = None;
                                     this.price_lock_applied = false;
                                     this.price_lock_deferred = true;
+                                    this.chart_unlocked = false;
                                     this.mark_dirty();
                                 }
                                 AxisHandle::Time => {
@@ -3501,10 +3516,14 @@ impl Render for ChartPanel {
                         this.drawing_state = DrawingInteractionState::Idle;
                     }
 
-                    // 6. Normal chart pan drag
-                    this.chart_state.is_dragging = true;
-                    this.chart_state.drag_start_x = pos.x.as_f32();
-                    this.chart_state.drag_start_offset = this.chart_state.viewport_offset;
+                    // 6. Normal chart pan drag. Panning stays locked until the
+                    // price rail has been dragged once; drawing selection still
+                    // happened above while locked.
+                    if pan_allowed(this.chart_unlocked) {
+                        this.chart_state.is_dragging = true;
+                        this.chart_state.drag_start_x = pos.x.as_f32();
+                        this.chart_state.drag_start_offset = this.chart_state.viewport_offset;
+                    }
                     cx.notify();
                 }),
             )
@@ -3962,6 +3981,12 @@ mod tests {
     fn only_a_selected_drawing_claims_the_drag() {
         assert!(drawing_drag_claims_hit(true));
         assert!(!drawing_drag_claims_hit(false));
+    }
+
+    #[test]
+    fn body_pan_requires_the_price_rail_unlock() {
+        assert!(!pan_allowed(false));
+        assert!(pan_allowed(true));
     }
 
     #[test]
