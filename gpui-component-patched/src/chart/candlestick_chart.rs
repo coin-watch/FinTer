@@ -74,6 +74,86 @@ const CHAR_WIDTH_EST: f32 = 6.0;
 const Y_AXIS_MIN_W: f32 = 50.0;
 /// Padding inside the Y-axis label area.
 const Y_AXIS_PAD: f32 = 6.0;
+/// Height of the compact price pills painted in the Y-axis column.
+const AXIS_PILL_H: f32 = 14.0;
+/// Maximum alert badges stacked at each edge of the plot; the remainder is
+/// summarised by a single `+N` badge.
+const MAX_OFFSCREEN_ALERT_BADGES: usize = 3;
+
+// ---------------------------------------------------------------------------
+// Y-axis tag collision layout
+// ---------------------------------------------------------------------------
+
+/// Tracks the vertical extents already claimed by Y-axis tags.
+///
+/// The right rail is a single column shared by the crosshair, the live price
+/// and countdown, position/order/liquidation pills, and alert pills. Tags are
+/// reserved in priority order, so the first tag to claim an interval wins and
+/// lower-priority tags (and price labels) are skipped instead of painted over.
+///
+/// Every reservation includes a 1px guard above and below the tag, which keeps
+/// neighbouring pills from touching.
+#[derive(Clone, Debug, Default)]
+struct YAxisTagLayout {
+    reserved: Vec<(f32, f32)>,
+}
+
+impl YAxisTagLayout {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn interval(centre_y: f32, height: f32) -> (f32, f32) {
+        (centre_y - height / 2.0 - 1.0, centre_y + height / 2.0 + 1.0)
+    }
+
+    /// Whether a tag at `centre_y` would collide with an existing reservation.
+    fn overlaps(&self, centre_y: f32, height: f32) -> bool {
+        if !centre_y.is_finite() || !height.is_finite() {
+            return true;
+        }
+        let (start, end) = Self::interval(centre_y, height);
+        self.reserved.iter().any(|&(s, e)| start < e && end > s)
+    }
+
+    /// Reserve a tag interval. Returns `false` when it overlaps an existing
+    /// reservation, in which case nothing is recorded.
+    fn reserve(&mut self, centre_y: f32, height: f32) -> bool {
+        if self.overlaps(centre_y, height) {
+            return false;
+        }
+        self.reserved.push(Self::interval(centre_y, height));
+        true
+    }
+
+    /// Reserve a pill deliberately stacked flush beneath `above` (the live
+    /// price pill). The shared edge is intentional, so the reservation above
+    /// is ignored during the collision check; every other tag still applies.
+    fn reserve_stacked_below(&mut self, centre_y: f32, height: f32, above: usize) -> bool {
+        if !centre_y.is_finite() || !height.is_finite() {
+            return false;
+        }
+        let (start, end) = Self::interval(centre_y, height);
+        let collides = self
+            .reserved
+            .iter()
+            .enumerate()
+            .any(|(i, &(s, e))| i != above && start < e && end > s);
+        if collides {
+            return false;
+        }
+        self.reserved.push((start, end));
+        true
+    }
+
+    /// Reserve a priority-ordered list of `(id, centre_y, height)` tags and
+    /// return the accepted flag for each entry in input order.
+    fn layout_tags<T: Copy>(&mut self, tags: &[(T, f32, f32)]) -> Vec<bool> {
+        tags.iter()
+            .map(|&(_, centre_y, height)| self.reserve(centre_y, height))
+            .collect()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CandleType enum
@@ -510,19 +590,14 @@ where
             return;
         }
 
-        // Use the widest of price/countdown labels for dynamic Y-axis width.
-        // Include both exact-interval and interval-1s countdown variants because
-        // boundary values like "1h" become longer strings like "59m:59s".
+        // Size the Y-axis from price labels only. Countdown badges must fit
+        // inside this width; they never widen the axis.
         let sample_label = self.price_str(match self.manual_price_range {
             Some((min, max)) if min.is_finite() && max.is_finite() && max > min => {
                 y_domain_max.max(max)
             }
             _ => y_domain_max,
         });
-        let interval_secs = (interval_ms / 1_000).max(0);
-        let countdown_sample_exact: SharedString = format_countdown_duration(interval_secs).into();
-        let countdown_sample_worst: SharedString =
-            format_countdown_duration(interval_secs.saturating_sub(1)).into();
         let font_size = px(TIP_FONT);
         let measure_text_width = |text: &SharedString| -> f32 {
             let text_run = gpui::TextRun {
@@ -542,9 +617,7 @@ where
                 .map(|line| line.size(font_size).width.as_f32())
                 .unwrap_or(text.len() as f32 * CHAR_WIDTH_EST)
         };
-        let widest_label_w = measure_text_width(&sample_label)
-            .max(measure_text_width(&countdown_sample_exact))
-            .max(measure_text_width(&countdown_sample_worst));
+        let widest_label_w = measure_text_width(&sample_label);
         let y_axis_w = (widest_label_w + Y_AXIS_PAD * 2.0 + 2.0).max(Y_AXIS_MIN_W);
 
         // Candle drawing area: full width minus Y-axis on the right.
@@ -1370,6 +1443,133 @@ where
             .max(self.pill_width_for_text(&countdown_label_for_width, y_axis_w, window));
 
         // ------------------------------------------------------------------ //
+        // 10.5 Reserve Y-axis tag slots (paint pre-pass)
+        // ------------------------------------------------------------------ //
+        // The right rail is a single column shared by the crosshair, live price
+        // + countdown, liquidation/position/order pills, and alerts. Reserve
+        // their vertical extents in priority order so lower-priority pills and
+        // price labels are skipped instead of overpainted.
+        let mut y_tag_layout = YAxisTagLayout::new();
+
+        // 1. Crosshair price tag (highest priority).
+        let crosshair_tag_y = self
+            .state
+            .as_ref()
+            .and_then(|st| st.crosshair_pos)
+            .and_then(|cursor| {
+                let rel = cursor - origin;
+                let x = rel.x.as_f32();
+                let y = rel.y.as_f32();
+                (x >= 0.0 && x <= chart_w && y >= 0.0 && y <= full_h - AXIS_GAP)
+                    .then_some(origin.y.as_f32() + y)
+            });
+        let mut crosshair_tag_accepted = false;
+        if let Some(y) = crosshair_tag_y {
+            crosshair_tag_accepted = y_tag_layout.reserve(y, AXIS_PILL_H);
+        }
+
+        // 2. Last-price pill, then its countdown pill stacked directly below.
+        let last_close_px_y = y_scale.scale(last_close_f);
+        let live_pill_y = origin.y.as_f32() + last_close_px_y;
+        let show_live_badge = self.show_last_price && self.show_candles && last_close_f > 0.0;
+        let mut last_price_tag_accepted = false;
+        let mut countdown_tag_accepted = false;
+        if show_live_badge {
+            last_price_tag_accepted = y_tag_layout.reserve(live_pill_y, AXIS_PILL_H);
+            if last_price_tag_accepted {
+                let countdown_w = self.measured_pill_width(&countdown_label_for_width, window);
+                if countdown_w <= y_axis_w + 0.5 {
+                    let above = y_tag_layout.reserved.len() - 1;
+                    countdown_tag_accepted = y_tag_layout.reserve_stacked_below(
+                        live_pill_y + AXIS_PILL_H,
+                        AXIS_PILL_H,
+                        above,
+                    );
+                }
+            }
+        }
+
+        // 3. Liquidation price, then position entry, then open orders.
+        let mut liquidation_tag_accepted = vec![false; self.position_overlays.len()];
+        for (i, pos) in self.position_overlays.iter().enumerate() {
+            let Some(liq_price) = pos.liquidation_price else {
+                continue;
+            };
+            if !liq_price.is_finite() || liq_price <= 0.0 || pos.leverage <= 1 {
+                continue;
+            }
+            let liq_px_y = y_scale.scale(liq_price);
+            if self.show_candles && liq_px_y >= 0.0 && liq_px_y <= candle_h {
+                liquidation_tag_accepted[i] =
+                    y_tag_layout.reserve(origin.y.as_f32() + liq_px_y, AXIS_PILL_H);
+            }
+        }
+        let mut position_tag_accepted = vec![false; self.position_overlays.len()];
+        for (i, pos) in self.position_overlays.iter().enumerate() {
+            let entry_px_y = y_scale.scale(pos.entry_price);
+            if self.show_candles && entry_px_y >= 0.0 && entry_px_y <= candle_h {
+                position_tag_accepted[i] =
+                    y_tag_layout.reserve(origin.y.as_f32() + entry_px_y, AXIS_PILL_H);
+            }
+        }
+        let mut order_tag_accepted = vec![false; self.order_overlays.len()];
+        for (i, ord) in self.order_overlays.iter().enumerate() {
+            let ord_px_y = y_scale.scale(ord.price);
+            if self.show_candles && ord_px_y >= 0.0 && ord_px_y <= candle_h {
+                order_tag_accepted[i] =
+                    y_tag_layout.reserve(origin.y.as_f32() + ord_px_y, AXIS_PILL_H);
+            }
+        }
+
+        // 4. Alerts: active before paused, then closest to the last price,
+        //    then paint order. Off-screen alerts never own an axis pill.
+        let last_price_px =
+            (last_close_f.is_finite() && last_close_f > 0.0).then_some(last_close_px_y);
+        let mut alert_candidates: Vec<(usize, f32)> = Vec::new();
+        if self.show_candles {
+            for (i, alert) in self.alert_overlays.iter().enumerate() {
+                if !alert.price.is_finite() || alert.price <= 0.0 {
+                    continue;
+                }
+                let alert_px_y = y_scale.scale(alert.price);
+                if alert_px_y >= 0.0 && alert_px_y <= candle_h {
+                    alert_candidates.push((i, alert_px_y));
+                }
+            }
+        }
+        alert_candidates.sort_by(|&(ia, ya), &(ib, yb)| {
+            let a = &self.alert_overlays[ia];
+            let b = &self.alert_overlays[ib];
+            b.is_active
+                .cmp(&a.is_active)
+                .then_with(|| {
+                    let da = last_price_px.map_or(0.0, |ly| (ya - ly).abs());
+                    let db = last_price_px.map_or(0.0, |ly| (yb - ly).abs());
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| ia.cmp(&ib))
+        });
+        let mut alert_tag_accepted = vec![false; self.alert_overlays.len()];
+        {
+            // Reserve at the pill's clamped paint position so edge-hugging
+            // alerts do not block labels they never actually cover.
+            let pill_min_y = origin.y.as_f32() + 1.0;
+            let pill_max_y = (origin.y.as_f32() + candle_h - AXIS_PILL_H - 1.0).max(pill_min_y);
+            let alert_tags: Vec<(usize, f32, f32)> = alert_candidates
+                .iter()
+                .map(|&(idx, alert_px_y)| {
+                    let abs_y = origin.y.as_f32() + alert_px_y;
+                    let pill_y = (abs_y - AXIS_PILL_H / 2.0).clamp(pill_min_y, pill_max_y);
+                    (idx, pill_y + AXIS_PILL_H / 2.0, AXIS_PILL_H)
+                })
+                .collect();
+            let accepted = y_tag_layout.layout_tags(&alert_tags);
+            for (&(idx, _, _), ok) in alert_tags.iter().zip(accepted) {
+                alert_tag_accepted[idx] = ok;
+            }
+        }
+
+        // ------------------------------------------------------------------ //
         // 11. Volume sub-pane
         // ------------------------------------------------------------------ //
         if self.show_volume_pane {
@@ -1538,6 +1738,11 @@ where
             let origin = bounds.origin;
             for &price in &y_ticks {
                 let py = y_scale.scale(price);
+                // Mirror the X-axis label skipping: never paint a price label
+                // through a pill that already owns this part of the rail.
+                if y_tag_layout.overlaps(origin.y.as_f32() + py, AXIS_PILL_H) {
+                    continue;
+                }
                 let label = self.price_str(price);
                 let lx = origin.x.as_f32() + chart_w + Y_AXIS_PAD;
                 let ly = origin.y.as_f32() + py - TIP_FONT / 2.0;
@@ -1607,9 +1812,8 @@ where
         // The crosshair price badge is deferred even further so it beats the live
         // price badge when the cursor hovers on the current price row.
         let mut crosshair_price_badge: Option<(SharedString, Hsla, f32)> = None;
-        let last_close_px_y = y_scale.scale(last_close_f);
-        if self.show_last_price && self.show_candles && last_close_f > 0.0 {
-            let lcp_abs_y = origin.y.as_f32() + last_close_px_y;
+        if show_live_badge {
+            let lcp_abs_y = live_pill_y;
             let label_color = if last_candle_is_bullish {
                 bullish_color
             } else {
@@ -1638,9 +1842,15 @@ where
             // Countdown timer: time until next candle opens.
             let countdown_str = countdown_label_for_width.clone();
 
-            live_price_badges.push((label_txt, label_color, lcp_abs_y));
-            // Countdown pill stacked directly below the price pill (no gap).
-            live_price_badges.push((countdown_str, label_color, lcp_abs_y + 14.0));
+            // The line is always drawn; the pills only when the layout
+            // accepted their slots (the live price wins over the countdown).
+            if last_price_tag_accepted {
+                live_price_badges.push((label_txt, label_color, lcp_abs_y));
+            }
+            if countdown_tag_accepted {
+                // Countdown pill stacked directly below the price pill.
+                live_price_badges.push((countdown_str, label_color, lcp_abs_y + AXIS_PILL_H));
+            }
         }
 
         // ------------------------------------------------------------------ //
@@ -1679,8 +1889,10 @@ where
         if self.show_candles {
             let mut offscreen_up = 0usize;
             let mut offscreen_down = 0usize;
+            let mut offscreen_overflow_up = 0usize;
+            let mut offscreen_overflow_down = 0usize;
 
-            for alert in &self.alert_overlays {
+            for (alert_idx, alert) in self.alert_overlays.iter().enumerate() {
                 if !alert.price.is_finite() || alert.price <= 0.0 {
                     continue;
                 }
@@ -1724,77 +1936,110 @@ where
                         window.paint_path(path, accent_color);
                     }
 
-                    // Y-axis pill with a coloured accent strip.
-                    let pill_h = 14.0_f32;
-                    let pill_x = origin.x.as_f32() + chart_w;
-                    let pill_min_y = origin.y.as_f32() + 1.0;
-                    let pill_max_y =
-                        (origin.y.as_f32() + candle_h - pill_h - 1.0).max(pill_min_y);
-                    let pill_y = (alert_abs_y - pill_h / 2.0).clamp(pill_min_y, pill_max_y);
-                    let pill_bounds = Bounds::from_corners(
-                        gpui::point(px(pill_x), px(pill_y)),
-                        gpui::point(px(pill_x + y_axis_w), px(pill_y + pill_h)),
-                    );
-                    let pill_bg = if alert.is_active {
-                        rgba(0x131722f0)
-                    } else {
-                        rgba(0x131722a0)
-                    };
-                    window.paint_quad(fill(pill_bounds, pill_bg));
-                    let strip_bounds = Bounds::from_corners(
-                        gpui::point(px(pill_x), px(pill_y)),
-                        gpui::point(px(pill_x + 2.0), px(pill_y + pill_h)),
-                    );
-                    window.paint_quad(fill(strip_bounds, accent_color));
-                    let text_color = if alert.is_active {
-                        alert.color
-                    } else {
-                        alert.color.opacity(0.6)
-                    };
-                    paint_text_line_centered(
-                        alert.label.clone(),
-                        text_color,
-                        pill_bounds,
-                        window,
-                        cx,
-                    );
+                    // Y-axis pill with a coloured accent strip. The line and
+                    // marker above always paint; the pill only when the
+                    // layout accepted its slot.
+                    if alert_tag_accepted[alert_idx] {
+                        let pill_h = AXIS_PILL_H;
+                        let pill_x = origin.x.as_f32() + chart_w;
+                        let pill_min_y = origin.y.as_f32() + 1.0;
+                        let pill_max_y =
+                            (origin.y.as_f32() + candle_h - pill_h - 1.0).max(pill_min_y);
+                        let pill_y = (alert_abs_y - pill_h / 2.0).clamp(pill_min_y, pill_max_y);
+                        let pill_bounds = Bounds::from_corners(
+                            gpui::point(px(pill_x), px(pill_y)),
+                            gpui::point(px(pill_x + y_axis_w), px(pill_y + pill_h)),
+                        );
+                        let pill_bg = if alert.is_active {
+                            rgba(0x131722f0)
+                        } else {
+                            rgba(0x131722a0)
+                        };
+                        window.paint_quad(fill(pill_bounds, pill_bg));
+                        let strip_bounds = Bounds::from_corners(
+                            gpui::point(px(pill_x), px(pill_y)),
+                            gpui::point(px(pill_x + 2.0), px(pill_y + pill_h)),
+                        );
+                        window.paint_quad(fill(strip_bounds, accent_color));
+                        let text_color = if alert.is_active {
+                            alert.color
+                        } else {
+                            alert.color.opacity(0.6)
+                        };
+                        paint_text_line_centered(
+                            alert.label.clone(),
+                            text_color,
+                            pill_bounds,
+                            window,
+                            cx,
+                        );
+                    }
                 } else {
-                    // Off-screen level: pin a compact badge to the top/bottom edge.
-                    let (off_y, arrow) = if alert_px_y < 0.0 {
-                        let y = origin.y.as_f32() + 4.0 + offscreen_up as f32 * 18.0;
-                        offscreen_up += 1;
-                        (y, "▲")
+                    // Off-screen level: pin a compact badge to the top/bottom
+                    // edge, but cap the stack so a wall of alerts cannot fill
+                    // the chart. The remainder becomes a single `+N` badge.
+                    let (up, arrow) = if alert_px_y < 0.0 {
+                        (true, "▲")
                     } else {
-                        let y = origin.y.as_f32() + candle_h - 18.0 - offscreen_down as f32 * 18.0;
-                        offscreen_down += 1;
-                        (y, "▼")
+                        (false, "▼")
                     };
-                    let off_min_y = origin.y.as_f32() + 2.0;
-                    let off_max_y =
-                        (origin.y.as_f32() + candle_h - 18.0).max(off_min_y);
-                    let off_y = off_y.clamp(off_min_y, off_max_y);
-                    let off_text: SharedString = format!("{} ALERT {}", arrow, alert.label).into();
-                    let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(90.0, 160.0);
-                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0)
-                        .max(origin.x.as_f32() + 4.0);
-                    let off_bounds = Bounds::from_corners(
-                        gpui::point(px(off_x), px(off_y)),
-                        gpui::point(px(off_x + off_w), px(off_y + 18.0)),
-                    );
-                    window.paint_quad(fill(off_bounds, rgba(0x131722e0)));
-                    let text_b = Bounds::from_corners(
-                        gpui::point(px(off_x + 4.0), px(off_y)),
-                        gpui::point(px(off_x + off_w - 4.0), px(off_y + 18.0)),
-                    );
-                    paint_text_line(
-                        off_text,
-                        gpui::point(px(off_x + 4.0), px(off_y + 3.0)),
-                        accent_color,
-                        text_b,
-                        window,
-                        cx,
-                    );
+                    let slot = if up { offscreen_up } else { offscreen_down };
+                    if slot < MAX_OFFSCREEN_ALERT_BADGES {
+                        let off_y = if up {
+                            origin.y.as_f32() + 4.0 + slot as f32 * 18.0
+                        } else {
+                            origin.y.as_f32() + candle_h - 18.0 - slot as f32 * 18.0
+                        };
+                        paint_alert_edge_badge(
+                            format!("{} ALERT {}", arrow, alert.label),
+                            accent_color,
+                            origin.x.as_f32(),
+                            origin.y.as_f32(),
+                            chart_w,
+                            candle_h,
+                            off_y,
+                            window,
+                            cx,
+                        );
+                        if up {
+                            offscreen_up += 1;
+                        } else {
+                            offscreen_down += 1;
+                        }
+                    } else if up {
+                        offscreen_overflow_up += 1;
+                    } else {
+                        offscreen_overflow_down += 1;
+                    }
                 }
+            }
+
+            // Compact overflow badge in the slot below the capped stack.
+            for (up, overflow) in [
+                (true, offscreen_overflow_up),
+                (false, offscreen_overflow_down),
+            ] {
+                if overflow == 0 {
+                    continue;
+                }
+                let arrow = if up { "▲" } else { "▼" };
+                let slot = MAX_OFFSCREEN_ALERT_BADGES;
+                let off_y = if up {
+                    origin.y.as_f32() + 4.0 + slot as f32 * 18.0
+                } else {
+                    origin.y.as_f32() + candle_h - 18.0 - slot as f32 * 18.0
+                };
+                paint_alert_edge_badge(
+                    format!("{} +{}", arrow, overflow),
+                    cx.theme().muted_foreground,
+                    origin.x.as_f32(),
+                    origin.y.as_f32(),
+                    chart_w,
+                    candle_h,
+                    off_y,
+                    window,
+                    cx,
+                );
             }
         }
 
@@ -1803,7 +2048,7 @@ where
         // ------------------------------------------------------------------ //
         if self.show_candles {
             // A. Active Positions
-            for pos in &self.position_overlays {
+            for (pos_idx, pos) in self.position_overlays.iter().enumerate() {
                 let side_color = if pos.is_long { bullish_color } else { bearish_color };
                 // Guard against a missing/zero mark so a fresh position never
                 // renders an absurd P&L while waiting for its first tick.
@@ -1940,18 +2185,20 @@ where
                         });
                     }
 
-                    // 3. Price pill on Y-axis
-                    self.paint_price_pill_with_width(
-                        self.price_str(pos.entry_price),
-                        side_color,
-                        gpui::white(),
-                        origin.x.as_f32() + chart_w,
-                        entry_abs_y,
-                        shared_live_badge_w,
-                        y_axis_w,
-                        window,
-                        cx,
-                    );
+                    // 3. Price pill on Y-axis (skipped when its slot was claimed)
+                    if position_tag_accepted[pos_idx] {
+                        self.paint_price_pill_with_width(
+                            self.price_str(pos.entry_price),
+                            side_color,
+                            gpui::white(),
+                            origin.x.as_f32() + chart_w,
+                            entry_abs_y,
+                            shared_live_badge_w,
+                            y_axis_w,
+                            window,
+                            cx,
+                        );
+                    }
                 } else {
                     // Off-screen indicator
                     let mode_tag = if pos.is_live { "LIVE" } else { "PAPER" };
@@ -2013,26 +2260,30 @@ where
                                 x_cur += seg + gap;
                             }
 
-                            // Liquidation pill on Y-axis
-                            let liq_str: SharedString = format!("LIQ {}", self.price_str(liq_price)).into();
-                            self.paint_price_pill_with_width(
-                                liq_str,
-                                warning_color,
-                                gpui::white(),
-                                origin.x.as_f32() + chart_w,
-                                liq_abs_y,
-                                shared_live_badge_w,
-                                y_axis_w,
-                                window,
-                                cx,
-                            );
+                            // Liquidation pill on Y-axis (skipped when its slot
+                            // was claimed by a higher-priority tag).
+                            if liquidation_tag_accepted[pos_idx] {
+                                let liq_str: SharedString =
+                                    format!("LIQ {}", self.price_str(liq_price)).into();
+                                self.paint_price_pill_with_width(
+                                    liq_str,
+                                    warning_color,
+                                    gpui::white(),
+                                    origin.x.as_f32() + chart_w,
+                                    liq_abs_y,
+                                    shared_live_badge_w,
+                                    y_axis_w,
+                                    window,
+                                    cx,
+                                );
+                            }
                         }
                     }
                 }
             }
 
             // B. Open Orders
-            for ord in &self.order_overlays {
+            for (ord_idx, ord) in self.order_overlays.iter().enumerate() {
                 let side_color = if ord.is_long { bullish_color } else { bearish_color };
                 let ord_px_y = y_scale.scale(ord.price);
                 let ord_abs_y = origin.y.as_f32() + ord_px_y;
@@ -2147,18 +2398,20 @@ where
                         });
                     }
 
-                    // 3. Price pill on Y-axis
-                    self.paint_price_pill_with_width(
-                        self.price_str(ord.price),
-                        side_color,
-                        gpui::white(),
-                        origin.x.as_f32() + chart_w,
-                        ord_abs_y,
-                        shared_live_badge_w,
-                        y_axis_w,
-                        window,
-                        cx,
-                    );
+                    // 3. Price pill on Y-axis (skipped when its slot was claimed)
+                    if order_tag_accepted[ord_idx] {
+                        self.paint_price_pill_with_width(
+                            self.price_str(ord.price),
+                            side_color,
+                            gpui::white(),
+                            origin.x.as_f32() + chart_w,
+                            ord_abs_y,
+                            shared_live_badge_w,
+                            y_axis_w,
+                            window,
+                            cx,
+                        );
+                    }
                 } else {
                     // Off-screen indicator
                     let mode_tag = if ord.is_live { "LIVE" } else { "PAPER" };
@@ -2303,7 +2556,7 @@ where
                             }
                         }
 
-                        if !pl_txt.is_empty() {
+                        if !pl_txt.is_empty() && crosshair_tag_accepted {
                             crosshair_price_badge = Some((pl_txt, crosshair_bg, hy));
                         }
                     }
@@ -2397,7 +2650,9 @@ where
         }
     }
 
-    fn pill_width_for_text(&self, text: &SharedString, y_axis_w: f32, window: &mut Window) -> f32 {
+    /// Bold pill text width including horizontal padding, before the axis
+    /// clamp. Used to decide whether a tag (e.g. the countdown) fits.
+    fn measured_pill_width(&self, text: &SharedString, window: &mut Window) -> f32 {
         let font_size = px(TIP_FONT);
         let mut font = window.text_style().font();
         font.weight = gpui::FontWeight::BOLD;
@@ -2418,9 +2673,11 @@ where
             .map(|line| line.size(font_size).width.as_f32())
             .unwrap_or(text.len() as f32 * CHAR_WIDTH_EST);
 
-        (measured_w + Y_AXIS_PAD * 2.0)
-            .max(40.0)
-            .min(y_axis_w - 2.0)
+        (measured_w + Y_AXIS_PAD * 2.0).max(40.0)
+    }
+
+    fn pill_width_for_text(&self, text: &SharedString, y_axis_w: f32, window: &mut Window) -> f32 {
+        self.measured_pill_width(text, window).min(y_axis_w - 2.0)
     }
 
     fn paint_price_pill_with_width(
@@ -2630,6 +2887,46 @@ fn paint_text_line(
             let _ = line.paint(origin, font_size, TextAlign::Left, None, window, cx);
         }
     }
+}
+
+/// Paint a compact alert badge pinned to the top or bottom edge of the candle
+/// plot. `text` is pre-formatted (arrow + label, or arrow + overflow count).
+#[allow(clippy::too_many_arguments)]
+fn paint_alert_edge_badge(
+    text: String,
+    color: Hsla,
+    origin_x: f32,
+    origin_y: f32,
+    chart_w: f32,
+    candle_h: f32,
+    y: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text: SharedString = text.into();
+    let badge_h = 18.0_f32;
+    let badge_w = ((text.len() as f32) * 6.5 + 16.0).clamp(90.0, 160.0);
+    let min_y = origin_y + 2.0;
+    let max_y = (origin_y + candle_h - badge_h).max(min_y);
+    let y = y.clamp(min_y, max_y);
+    let x = (origin_x + chart_w - badge_w - 8.0).max(origin_x + 4.0);
+    let bounds = Bounds::from_corners(
+        gpui::point(px(x), px(y)),
+        gpui::point(px(x + badge_w), px(y + badge_h)),
+    );
+    window.paint_quad(fill(bounds, rgba(0x131722e0)));
+    let text_bounds = Bounds::from_corners(
+        gpui::point(px(x + 4.0), px(y)),
+        gpui::point(px(x + badge_w - 4.0), px(y + badge_h)),
+    );
+    paint_text_line(
+        text,
+        gpui::point(px(x + 4.0), px(y + 3.0)),
+        color,
+        text_bounds,
+        window,
+        cx,
+    );
 }
 
 pub fn paint_text_line_centered(
@@ -3235,5 +3532,88 @@ mod tests {
         // -1 = bid/sell imbalance → left edge of the bid lane.
         assert_eq!(imbalance_stripe_left(&lanes, -1), lanes.bid_left);
         assert!(imbalance_stripe_left(&lanes, 1) > imbalance_stripe_left(&lanes, -1));
+    }
+
+    #[test]
+    fn y_axis_tags_accept_disjoint_pills() {
+        let mut layout = YAxisTagLayout::new();
+        assert!(layout.reserve(20.0, 14.0));
+        assert!(layout.reserve(60.0, 14.0));
+        assert!(layout.reserve(100.0, 14.0));
+    }
+
+    #[test]
+    fn y_axis_tags_reject_overlapping_lower_priority_pills() {
+        let mut layout = YAxisTagLayout::new();
+        assert!(layout.reserve(100.0, 14.0));
+        // Same centre and a pill inside the 1px guard are both rejected.
+        assert!(!layout.reserve(100.0, 14.0));
+        assert!(!layout.reserve(106.0, 14.0));
+        // Far enough away to clear the guard.
+        assert!(layout.reserve(120.0, 14.0));
+    }
+
+    #[test]
+    fn y_axis_tags_allow_adjacent_pills_with_a_one_pixel_gap() {
+        // [92, 108] and [108, 124] touch at the guard edge, which counts as
+        // fitting; moving 1px closer overlaps.
+        let mut layout = YAxisTagLayout::new();
+        assert!(layout.reserve(100.0, 14.0));
+        assert!(layout.reserve(116.0, 14.0));
+        let mut closer = YAxisTagLayout::new();
+        assert!(closer.reserve(100.0, 14.0));
+        assert!(!closer.reserve(115.0, 14.0));
+    }
+
+    #[test]
+    fn y_axis_tag_overlaps_matches_price_label_bounds() {
+        let mut layout = YAxisTagLayout::new();
+        assert!(layout.reserve(100.0, 14.0));
+        // Reserved interval is [92, 108]. A 14px label centred at 84 spans
+        // [76, 92] and only touches; at 85 it overlaps the guard.
+        assert!(!layout.overlaps(84.0, 14.0));
+        assert!(layout.overlaps(85.0, 14.0));
+        assert!(layout.overlaps(100.0, 14.0));
+        assert!(!layout.overlaps(120.0, 14.0));
+    }
+
+    #[test]
+    fn y_axis_layout_rejects_alert_cluster_on_the_live_price() {
+        let mut layout = YAxisTagLayout::new();
+        // Crosshair/live price claimed the row first.
+        assert!(layout.reserve(100.0, 14.0));
+        // Six alerts all map onto the same price; none may take the slot.
+        let tags: Vec<(usize, f32, f32)> = (0..6).map(|i| (i, 100.0, 14.0)).collect();
+        let accepted = layout.layout_tags(&tags);
+        assert!(accepted.iter().all(|&ok| !ok), "{accepted:?}");
+    }
+
+    #[test]
+    fn y_axis_layout_accepts_one_alert_per_price_cluster() {
+        let mut layout = YAxisTagLayout::new();
+        assert!(layout.reserve(100.0, 14.0)); // last price
+        let tags: Vec<(usize, f32, f32)> = vec![
+            (0, 140.0, 14.0),
+            (1, 140.0, 14.0),
+            (2, 140.0, 14.0),
+            (3, 141.0, 14.0),
+            (4, 160.0, 14.0),
+        ];
+        let accepted = layout.layout_tags(&tags);
+        assert_eq!(accepted, vec![true, false, false, false, true]);
+    }
+
+    #[test]
+    fn y_axis_layout_keeps_the_live_price_and_drops_the_countdown_on_collision() {
+        let mut layout = YAxisTagLayout::new();
+        // Live price at 200 and its countdown stacked flush beneath.
+        assert!(layout.reserve(200.0, 14.0));
+        let live_idx = layout.reserved.len() - 1;
+        assert!(layout.reserve_stacked_below(214.0, 14.0, live_idx));
+        // A new tag that only touches the live pill is still rejected by the
+        // countdown, but the live reservation itself is untouched.
+        assert!(!layout.reserve(207.0, 14.0));
+        assert!(layout.overlaps(200.0, 14.0));
+        assert!(layout.overlaps(214.0, 14.0));
     }
 }

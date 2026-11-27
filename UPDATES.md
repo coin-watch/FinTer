@@ -4,6 +4,10 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Adaptive Y-axis tags
+
+The legacy chart now reserves the right-axis column in priority order (crosshair, live price + countdown, liquidation/position/order pills, then active-before-paused alerts), paints only the pills that win a slot, skips price labels that would collide, caps off-screen alert badges at three per edge with a single `+N` summary, and sizes the axis from price labels only so the countdown never widens it.
+
 ## Footprint candle style (historical + live)
 
 The chart Type menu now includes **Footprint**. It renders the restored bid × ask grid (bid volume left in red, ask volume right in green), per-row imbalance stripes, a POC border, VAH/VAL row lines, and a per-bar delta/volume/POC footer. Delta and total-volume-only modes are available, and the Type menu exposes ticks-per-row plus POC, value-area, imbalance, and summary toggles. Each bar lays out as bid lane | narrow candle | ask lane: the bid and ask lanes carry a volume-scaled tint and the candle keeps its wick and body, while POC/VAH/VAL and imbalance markings span the whole cluster; footprint density is now width-based so the three lanes stay readable.

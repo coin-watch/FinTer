@@ -80,6 +80,12 @@ are drawn.
   and `candle_price_range`; `None` or an invalid range keeps auto-fit. Paint
   also writes the shared `chart_bounds` cell so `ChartPanel` can hit-test the
   axis rails.
+- **Adaptive Y-axis tags.** The right rail reserves tag slots in priority order
+  (crosshair, live price + countdown, liquidation/position/order, then
+  active-before-paused alerts) through `YAxisTagLayout`, so overlapping pills
+  and price labels are skipped instead of overpainted. Off-screen alert badges
+  cap at three per edge with a `+N` summary, and the axis width is measured from
+  price labels only so the countdown never widens it.
 - **Footprint candle style.** `CandleType::Footprint` and `FootprintCellSpec`
   carry pre-computed cells from FinTer's `chart::footprint` module. Each bar is
   split into bid lane | narrow candle lane | ask lane by `footprint_lanes`; the
