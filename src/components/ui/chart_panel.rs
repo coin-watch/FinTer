@@ -203,6 +203,58 @@ fn axis_at_point(
     None
 }
 
+/// Map a plot-space Y pixel to a price using the same linear mapping the
+/// drawing overlay uses to paint drawings.
+fn plot_y_to_price(origin_y: f32, plot_height: f32, price_range: (f64, f64), y: f32) -> f64 {
+    let (p_min, p_max) = price_range;
+    let frac = ((y - origin_y) / plot_height.max(1.0)).clamp(0.0, 1.0) as f64;
+    p_max - frac * (p_max - p_min)
+}
+
+/// Slot index under a plot-space X pixel. Mirrors the candle slot layout used
+/// by the renderer (slot width = plot width / visible count).
+fn plot_x_to_slot(
+    origin_x: f32,
+    plot_width: f32,
+    visible_count: usize,
+    viewport_offset: f64,
+    x: f32,
+) -> i64 {
+    let slot_w = (plot_width / visible_count.max(1) as f32).max(1.0);
+    (((x - origin_x) as f64 / slot_w as f64) + viewport_offset).floor() as i64
+}
+
+/// Linear X-to-timestamp fallback used before any candles are available.
+fn plot_x_to_timestamp_linear(origin_x: f32, plot_width: f32, ts_range: (f64, f64), x: f32) -> i64 {
+    let frac = ((x - origin_x) / plot_width.max(1.0)).clamp(0.0, 1.0) as f64;
+    (ts_range.0 + frac * (ts_range.1 - ts_range.0)).round() as i64
+}
+
+/// Translate a drawing point to plot-space pixels. Matches the drawing
+/// overlay renderer so hit-testing and dragging agree with what is painted.
+fn plot_point_to_screen(
+    origin: (f32, f32),
+    plot_size: (f32, f32),
+    ts_range: (f64, f64),
+    price_range: (f64, f64),
+    timestamp: i64,
+    price: f64,
+) -> (f64, f64) {
+    let (ts_min, ts_max) = ts_range;
+    let (p_min, p_max) = price_range;
+    let x = if ts_max > ts_min {
+        origin.0 + ((timestamp as f64 - ts_min) / (ts_max - ts_min)) as f32 * plot_size.0
+    } else {
+        origin.0
+    };
+    let y = if p_max > p_min {
+        origin.1 + ((p_max - price) / (p_max - p_min)) as f32 * plot_size.1
+    } else {
+        origin.1
+    };
+    (x as f64, y as f64)
+}
+
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -630,6 +682,121 @@ impl ChartPanel {
         let size = self.chart_state.candle_plot_size.get()?;
         let bounds = self.chart_state.chart_bounds.get()?;
         axis_at_point(origin, size, bounds.bottom().as_f32(), x, y)
+    }
+
+    /// Convert a window-space cursor position into a drawing anchor point
+    /// using the same plot geometry as the drawing overlay. Shared by
+    /// placement and dragging so both map the cursor identically.
+    fn cursor_drawing_point(&self, x: f32, y: f32) -> Option<DrawingPoint> {
+        let origin = self.chart_state.candle_plot_origin.get()?;
+        let size = self.chart_state.candle_plot_size.get()?;
+        let ts_range = self.chart_state.candle_ts_range.get()?;
+        let price_range = self.chart_state.candle_price_range.get()?;
+
+        let price = plot_y_to_price(origin.1, size.1, price_range, y);
+
+        // Slot-accurate timestamp: the chart lays candles out on discrete
+        // slots, so snap to the slot under the cursor. Blank past/future
+        // slots use the same timeframe extrapolation as the crosshair pill.
+        let visible = self.feed.visible_slice(&self.chart_state);
+        let interval = timeframe_interval_ms(&self.timeframe).unwrap_or(60_000);
+        let timestamp = if !visible.is_empty() && size.0 > 0.0 {
+            let slot = plot_x_to_slot(
+                origin.0,
+                size.0,
+                self.chart_state.visible_count,
+                self.chart_state.viewport_offset,
+                x,
+            );
+            let vis_start = self.chart_state.visible_range(self.feed.len()).start as i64;
+            let rel = slot - vis_start;
+            if rel >= 0 && (rel as usize) < visible.len() {
+                visible[rel as usize].timestamp
+            } else if rel < 0 {
+                let first = visible.first().map(|c| c.timestamp).unwrap_or(0);
+                timestamp_at_buffer_index(&[first], rel as f64, &self.timeframe, interval)
+                    .unwrap_or(first)
+            } else {
+                let last = visible.last().map(|c| c.timestamp).unwrap_or(0);
+                let future = rel - (visible.len() as i64 - 1);
+                timestamp_at_buffer_index(&[last], future as f64, &self.timeframe, interval)
+                    .unwrap_or(last)
+            }
+        } else {
+            plot_x_to_timestamp_linear(origin.0, size.0, ts_range, x)
+        };
+
+        Some(DrawingPoint { timestamp, price })
+    }
+
+    /// Hit-test drawings at a window-space point. Uses the same transform as
+    /// the renderer so selection and dragging match the painted geometry.
+    fn drawing_hit_at(&self, x: f32, y: f32) -> Option<String> {
+        let origin = self.chart_state.candle_plot_origin.get()?;
+        let size = self.chart_state.candle_plot_size.get()?;
+        let ts_range = self.chart_state.candle_ts_range.get()?;
+        let price_range = self.chart_state.candle_price_range.get()?;
+
+        hit_test_drawings(x as f64, y as f64, &self.drawings, 8.0, |ts, price| {
+            Some(plot_point_to_screen(
+                origin,
+                size,
+                ts_range,
+                price_range,
+                ts,
+                price,
+            ))
+        })
+    }
+
+    /// Index of the selected drawing's endpoint handle under the cursor.
+    /// Handles are painted as 8×8 squares around each point.
+    fn drawing_handle_at(&self, x: f32, y: f32) -> Option<(String, usize)> {
+        let selected_id = self.selected_drawing_id.as_deref()?;
+        let drawing = self.drawings.iter().find(|d| d.id == selected_id)?;
+        let origin = self.chart_state.candle_plot_origin.get()?;
+        let size = self.chart_state.candle_plot_size.get()?;
+        let ts_range = self.chart_state.candle_ts_range.get()?;
+        let price_range = self.chart_state.candle_price_range.get()?;
+
+        drawing.points.iter().enumerate().find_map(|(index, pt)| {
+            let (hx, hy) =
+                plot_point_to_screen(origin, size, ts_range, price_range, pt.timestamp, pt.price);
+            let dx = hx - x as f64;
+            let dy = hy - y as f64;
+            ((dx * dx + dy * dy).sqrt() <= 8.0).then(|| (drawing.id.clone(), index))
+        })
+    }
+
+    /// Finish a whole-object or endpoint drag: persist changed geometry and
+    /// return to `Selected`. No-op for every other interaction state.
+    fn finish_drawing_interaction(&mut self) {
+        let (drawing_id, changed) = match &self.drawing_state {
+            DrawingInteractionState::MovingDrawing {
+                drawing_id,
+                original_points,
+                ..
+            } => {
+                let changed = self
+                    .drawings
+                    .iter()
+                    .find(|d| d.id == *drawing_id)
+                    .is_some_and(|d| d.points != *original_points);
+                (Some(drawing_id.clone()), changed)
+            }
+            DrawingInteractionState::DraggingPoint { drawing_id, .. } => {
+                // Endpoint drags mutate in place, so persist on release.
+                (Some(drawing_id.clone()), true)
+            }
+            _ => (None, false),
+        };
+
+        if let Some(drawing_id) = drawing_id {
+            if changed {
+                self.mark_dirty();
+            }
+            self.drawing_state = DrawingInteractionState::Selected { drawing_id };
+        }
     }
 
     fn settings_panel_width(&self) -> f32 {
@@ -2792,6 +2959,19 @@ impl Render for ChartPanel {
             None => self.hover_axis,
         };
 
+        // Drawings advertise that they can be grabbed, while axis rails and
+        // separators keep their resize cursors.
+        let drawing_drag_active = matches!(
+            self.drawing_state,
+            DrawingInteractionState::MovingDrawing { .. }
+                | DrawingInteractionState::DraggingPoint { .. }
+        );
+        let hovered_drawing = self
+            .chart_state
+            .crosshair_pos
+            .and_then(|pos| self.drawing_hit_at(pos.x.as_f32(), pos.y.as_f32()))
+            .is_some();
+
         let mut chart_area = div()
             .id("chart_interactive_area")
             .flex_1()
@@ -2805,6 +2985,10 @@ impl Render for ChartPanel {
             chart_area = chart_area.cursor_col_resize();
         } else if is_near_separator {
             chart_area = chart_area.cursor_row_resize();
+        } else if drawing_drag_active {
+            chart_area = chart_area.cursor_grabbing();
+        } else if hovered_drawing {
+            chart_area = chart_area.cursor_grab();
         } else {
             chart_area = chart_area.cursor_crosshair();
         }
@@ -2841,6 +3025,54 @@ impl Render for ChartPanel {
                         this.chart_state.crosshair_pos = None;
                         cx.notify();
                     }
+                    return;
+                }
+
+                // Drawing drags take priority over axis rails, panning, and
+                // separators. Whole-object moves restore the original points
+                // each frame and re-apply the total delta, so repeated moves
+                // cannot accumulate rounding drift.
+                let moving_drawing = match &this.drawing_state {
+                    DrawingInteractionState::MovingDrawing {
+                        drawing_id,
+                        anchor_point,
+                        original_points,
+                    } => Some((drawing_id.clone(), *anchor_point, original_points.clone())),
+                    _ => None,
+                };
+                if let Some((drawing_id, anchor_point, original_points)) = moving_drawing {
+                    if let Some(cur) = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32()) {
+                        let dt = cur.timestamp - anchor_point.timestamp;
+                        let dp = cur.price - anchor_point.price;
+                        if let Some(drawing) = this.drawings.iter_mut().find(|d| d.id == drawing_id)
+                        {
+                            drawing.points = original_points;
+                            drawing.move_by(dt, dp);
+                        }
+                    }
+                    this.chart_state.crosshair_pos = None;
+                    this.drawing_cursor_point = None;
+                    cx.notify();
+                    return;
+                }
+
+                let dragging_point = match &this.drawing_state {
+                    DrawingInteractionState::DraggingPoint {
+                        drawing_id,
+                        point_index,
+                    } => Some((drawing_id.clone(), *point_index)),
+                    _ => None,
+                };
+                if let Some((drawing_id, point_index)) = dragging_point {
+                    if let Some(cur) = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32()) {
+                        if let Some(drawing) = this.drawings.iter_mut().find(|d| d.id == drawing_id)
+                        {
+                            drawing.set_point(point_index, cur);
+                        }
+                    }
+                    this.chart_state.crosshair_pos = None;
+                    this.drawing_cursor_point = None;
+                    cx.notify();
                     return;
                 }
 
@@ -2969,66 +3201,8 @@ impl Render for ChartPanel {
                 }
 
                 // Compute cursor data point (timestamp, price)
-                let origin = this.chart_state.candle_plot_origin.get();
-                let size = this.chart_state.candle_plot_size.get();
-                let ts_range = this.chart_state.candle_ts_range.get();
-                let price_range = this.chart_state.candle_price_range.get();
-
-                if let (Some(orig), Some(sz), Some((ts_min, ts_max)), Some((p_min, p_max))) =
-                    (origin, size, ts_range, price_range)
-                {
-                    let mouse_x = pos.x.as_f32();
-                    let mouse_y = pos.y.as_f32();
-                    let frac_y = ((mouse_y - orig.1) / sz.1.max(1.0)).clamp(0.0, 1.0) as f64;
-                    let p = p_max - frac_y * (p_max - p_min);
-
-                    // Slot-accurate timestamp: the chart lays candles out on
-                    // discrete slots (see `candlestick_chart.rs`), so snap to
-                    // the slot under the cursor. Blank past/future slots use
-                    // the same timeframe extrapolation as the crosshair pill.
-                    let visible = this.feed.visible_slice(&this.chart_state);
-                    let chart_w = sz.0;
-                    let ts = if !visible.is_empty() && chart_w > 0.0 {
-                        let visible_count_f = this.chart_state.visible_count.max(1) as f32;
-                        let slot_w = (chart_w / visible_count_f).max(1.0);
-                        let offset = this.chart_state.viewport_offset;
-                        let vis_start =
-                            this.chart_state.visible_range(this.feed.len()).start as i64;
-                        let slot = ((((mouse_x - orig.0) as f64) / (slot_w as f64)) + offset)
-                            .floor() as i64;
-                        let rel = slot - vis_start;
-                        let interval = timeframe_interval_ms(&this.timeframe).unwrap_or(60_000);
-                        if rel >= 0 && (rel as usize) < visible.len() {
-                            visible[rel as usize].timestamp
-                        } else if rel < 0 {
-                            let first = visible.first().map(|c| c.timestamp).unwrap_or(0);
-                            timestamp_at_buffer_index(
-                                &[first],
-                                rel as f64,
-                                &this.timeframe,
-                                interval,
-                            )
-                            .unwrap_or(first)
-                        } else {
-                            let last = visible.last().map(|c| c.timestamp).unwrap_or(0);
-                            let future = rel - (visible.len() as i64 - 1);
-                            timestamp_at_buffer_index(
-                                &[last],
-                                future as f64,
-                                &this.timeframe,
-                                interval,
-                            )
-                            .unwrap_or(last)
-                        }
-                    } else {
-                        let frac_x = ((mouse_x - orig.0) / sz.0.max(1.0)).clamp(0.0, 1.0) as f64;
-                        (ts_min + frac_x * (ts_max - ts_min)).round() as i64
-                    };
-
-                    this.drawing_cursor_point = Some(DrawingPoint {
-                        timestamp: ts,
-                        price: p,
-                    });
+                if let Some(pt) = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32()) {
+                    this.drawing_cursor_point = Some(pt);
                 }
 
                 this.chart_state.crosshair_pos = Some(pos);
@@ -3163,7 +3337,10 @@ impl Render for ChartPanel {
 
                     // 2. If a drawing tool is active, place points
                     if let Some(tool) = this.active_drawing_tool {
-                        if let Some(mut cur_pt) = this.drawing_cursor_point {
+                        let cursor_pt = this
+                            .cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32())
+                            .or(this.drawing_cursor_point);
+                        if let Some(mut cur_pt) = cursor_pt {
                             // Snap to closest candle if enabled
                             if this.snap_to_candle {
                                 let snap_feed = this.feed.snapshot();
@@ -3229,48 +3406,47 @@ impl Render for ChartPanel {
                         }
                     }
 
-                    // 4. Otherwise hit-test existing drawings
-                    let origin = this.chart_state.candle_plot_origin.get();
-                    let size = this.chart_state.candle_plot_size.get();
-                    let ts_range = this.chart_state.candle_ts_range.get();
-                    let price_range = this.chart_state.candle_price_range.get();
-
-                    if let (Some(orig), Some(sz), Some((ts_min, ts_max)), Some((p_min, p_max))) =
-                        (origin, size, ts_range, price_range)
+                    // 4. Endpoint handles on the selected drawing take
+                    // precedence over whole-object moves.
+                    if let Some((drawing_id, point_index)) =
+                        this.drawing_handle_at(pos.x.as_f32(), pos.y.as_f32())
                     {
-                        let to_screen = |ts: i64, price: f64| -> Option<(f64, f64)> {
-                            let x = if ts_max > ts_min {
-                                orig.0 + ((ts as f64 - ts_min) / (ts_max - ts_min)) as f32 * sz.0
-                            } else {
-                                orig.0
-                            };
-                            let y = if p_max > p_min {
-                                orig.1 + ((p_max - price) / (p_max - p_min)) as f32 * sz.1
-                            } else {
-                                orig.1
-                            };
-                            Some((x as f64, y as f64))
+                        this.selected_drawing_id = Some(drawing_id.clone());
+                        this.drawing_state = DrawingInteractionState::DraggingPoint {
+                            drawing_id,
+                            point_index,
                         };
-
-                        if let Some(hit_id) = hit_test_drawings(
-                            pos.x.as_f32() as f64,
-                            pos.y.as_f32() as f64,
-                            &this.drawings,
-                            8.0,
-                            to_screen,
-                        ) {
-                            this.selected_drawing_id = Some(hit_id.clone());
-                            this.drawing_state =
-                                DrawingInteractionState::Selected { drawing_id: hit_id };
-                            cx.notify();
-                            return;
-                        } else {
-                            this.selected_drawing_id = None;
-                            this.drawing_state = DrawingInteractionState::Idle;
-                        }
+                        cx.notify();
+                        return;
                     }
 
-                    // 4. Normal chart pan drag
+                    // 5. Otherwise hit-test existing drawings for whole-object moves
+                    if let Some(hit_id) = this.drawing_hit_at(pos.x.as_f32(), pos.y.as_f32()) {
+                        let anchor = this.cursor_drawing_point(pos.x.as_f32(), pos.y.as_f32());
+                        this.selected_drawing_id = Some(hit_id.clone());
+                        this.drawing_state = match anchor.and_then(|anchor_point| {
+                            this.drawings
+                                .iter()
+                                .find(|d| d.id == hit_id)
+                                .map(|d| (anchor_point, d.points.clone()))
+                        }) {
+                            Some((anchor_point, original_points)) => {
+                                DrawingInteractionState::MovingDrawing {
+                                    drawing_id: hit_id,
+                                    anchor_point,
+                                    original_points,
+                                }
+                            }
+                            None => DrawingInteractionState::Selected { drawing_id: hit_id },
+                        };
+                        cx.notify();
+                        return;
+                    }
+
+                    this.selected_drawing_id = None;
+                    this.drawing_state = DrawingInteractionState::Idle;
+
+                    // 6. Normal chart pan drag
                     this.chart_state.is_dragging = true;
                     this.chart_state.drag_start_x = pos.x.as_f32();
                     this.chart_state.drag_start_offset = this.chart_state.viewport_offset;
@@ -3288,6 +3464,7 @@ impl Render for ChartPanel {
                             this.mark_dirty();
                         }
                     }
+                    this.finish_drawing_interaction();
                     let pos: Point<Pixels> = ev.position;
                     if this.is_over_modal(pos.x.as_f32(), pos.y.as_f32()) {
                         cx.notify();
@@ -3307,6 +3484,7 @@ impl Render for ChartPanel {
                             this.mark_dirty();
                         }
                     }
+                    this.finish_drawing_interaction();
                     cx.notify();
                 }),
             )
@@ -3723,5 +3901,72 @@ mod tests {
         assert!((mid - expected).abs() < 1e-4);
         // The inset means the midpoint is not the naive 150.0.
         assert!((mid - 150.0).abs() > 1.0);
+    }
+
+    #[test]
+    fn plot_y_maps_cursor_to_price() {
+        let (origin_y, height) = (20.0, 400.0);
+        let range = (100.0, 200.0);
+
+        assert!((plot_y_to_price(origin_y, height, range, 20.0) - 200.0).abs() < 1e-9);
+        assert!((plot_y_to_price(origin_y, height, range, 220.0) - 150.0).abs() < 1e-9);
+        assert!((plot_y_to_price(origin_y, height, range, 420.0) - 100.0).abs() < 1e-9);
+        // Clamp outside the plot so drags cannot escape the visible scale.
+        assert!((plot_y_to_price(origin_y, height, range, -100.0) - 200.0).abs() < 1e-9);
+        assert!((plot_y_to_price(origin_y, height, range, 900.0) - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plot_x_maps_cursor_to_candle_slot() {
+        // 10 slots over 800 px → 80 px per slot, with the viewport starting
+        // at slot 100.
+        let (origin_x, width) = (10.0, 800.0);
+        assert_eq!(plot_x_to_slot(origin_x, width, 10, 100.0, 10.0), 100);
+        assert_eq!(plot_x_to_slot(origin_x, width, 10, 100.0, 89.9), 100);
+        assert_eq!(plot_x_to_slot(origin_x, width, 10, 100.0, 90.0), 101);
+        assert_eq!(
+            plot_x_to_slot(origin_x, width, 10, 100.0, 10.0 + 80.0 * 3.5),
+            103
+        );
+    }
+
+    #[test]
+    fn plot_x_linear_fallback_maps_range() {
+        let (origin_x, width) = (0.0, 800.0);
+        let range = (1_000.0, 2_000.0);
+
+        assert_eq!(
+            plot_x_to_timestamp_linear(origin_x, width, range, 0.0),
+            1_000
+        );
+        assert_eq!(
+            plot_x_to_timestamp_linear(origin_x, width, range, 400.0),
+            1_500
+        );
+        assert_eq!(
+            plot_x_to_timestamp_linear(origin_x, width, range, 800.0),
+            2_000
+        );
+        // Clamp outside the plot.
+        assert_eq!(
+            plot_x_to_timestamp_linear(origin_x, width, range, -50.0),
+            1_000
+        );
+    }
+
+    #[test]
+    fn drawing_point_screen_transform_round_trips_plot_edges() {
+        let origin = (10.0, 20.0);
+        let size = (800.0, 400.0);
+        let ts_range = (1_000.0, 2_000.0);
+        let price_range = (100.0, 200.0);
+
+        let top_left = plot_point_to_screen(origin, size, ts_range, price_range, 1_000, 200.0);
+        assert!((top_left.0 - 10.0).abs() < 1e-6);
+        assert!((top_left.1 - 20.0).abs() < 1e-6);
+
+        let bottom_right = plot_point_to_screen(origin, size, ts_range, price_range, 2_000, 100.0);
+        assert!((bottom_right.0 - 810.0).abs() < 1e-6);
+        assert!((bottom_right.1 - 420.0).abs() < 1e-6);
     }
 }

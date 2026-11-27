@@ -4,6 +4,12 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Drawing move and endpoint drag
+
+Drawings on the legacy chart can now be dragged as whole objects on both axes: hover a drawing to get a grab cursor, then drag it along time and price together. Horizontal lines follow the price axis, vertical lines follow the time axis, and trendlines, rays, segments, Fibonacci levels, channels, text notes, and long/short position tools translate both points together. While dragging, the chart viewport does not pan, and the moved geometry is persisted to the layout on release (including when the pointer leaves the window mid-drag).
+
+Selecting a drawing reveals its endpoint handles; dragging a handle moves that single anchor point. Alerts, orders, and positions overlays remain read-only.
+
 ## Adaptive Y-axis tags
 
 The legacy chart now reserves the right-axis column in priority order (crosshair, live price + countdown, liquidation/position/order pills, then active-before-paused alerts), paints only the pills that win a slot, skips price labels that would collide, caps off-screen alert badges at three per edge with a single `+N` summary, and sizes the axis from price labels only so the countdown never widens it.

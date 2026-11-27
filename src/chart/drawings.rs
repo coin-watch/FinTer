@@ -198,14 +198,18 @@ where
 
         match drawing.tool {
             DrawingTool::HorizontalLine => {
-                if let Some((_, sy)) = to_screen(drawing.points[0].timestamp, drawing.points[0].price) {
+                if let Some((_, sy)) =
+                    to_screen(drawing.points[0].timestamp, drawing.points[0].price)
+                {
                     if (screen_y - sy).abs() <= tolerance_px {
                         return Some(drawing.id.clone());
                     }
                 }
             }
             DrawingTool::VerticalLine => {
-                if let Some((sx, _)) = to_screen(drawing.points[0].timestamp, drawing.points[0].price) {
+                if let Some((sx, _)) =
+                    to_screen(drawing.points[0].timestamp, drawing.points[0].price)
+                {
                     if (screen_x - sx).abs() <= tolerance_px {
                         return Some(drawing.id.clone());
                     }
@@ -280,8 +284,12 @@ where
                 }
             }
             DrawingTool::Text => {
-                if let Some((sx, sy)) = to_screen(drawing.points[0].timestamp, drawing.points[0].price) {
-                    if (screen_x - sx).abs() <= tolerance_px * 2.0 && (screen_y - sy).abs() <= tolerance_px * 2.0 {
+                if let Some((sx, sy)) =
+                    to_screen(drawing.points[0].timestamp, drawing.points[0].price)
+                {
+                    if (screen_x - sx).abs() <= tolerance_px * 2.0
+                        && (screen_y - sy).abs() <= tolerance_px * 2.0
+                    {
                         return Some(drawing.id.clone());
                     }
                 }
@@ -296,7 +304,11 @@ where
                         let max_x = x1.max(x2) + tolerance_px;
                         let min_y = y1.min(y2) - tolerance_px;
                         let max_y = y1.max(y2) + tolerance_px;
-                        if screen_x >= min_x && screen_x <= max_x && screen_y >= min_y && screen_y <= max_y {
+                        if screen_x >= min_x
+                            && screen_x <= max_x
+                            && screen_y >= min_y
+                            && screen_y <= max_y
+                        {
                             return Some(drawing.id.clone());
                         }
                     }
@@ -361,15 +373,38 @@ mod tests {
         let mut d = DrawingInstance {
             id: "t-1".into(),
             tool: DrawingTool::Trendline,
-            points: vec![
-                DrawingPoint::new(100, 50.0),
-                DrawingPoint::new(200, 60.0),
-            ],
+            points: vec![DrawingPoint::new(100, 50.0), DrawingPoint::new(200, 60.0)],
             style: Default::default(),
             text: None,
         };
         d.move_by(10, 5.0);
         assert_eq!(d.points[0], DrawingPoint::new(110, 55.0));
         assert_eq!(d.points[1], DrawingPoint::new(210, 65.0));
+    }
+
+    #[test]
+    fn move_by_reapplies_from_original_points_without_drift() {
+        let original = vec![DrawingPoint::new(100, 50.0), DrawingPoint::new(200, 60.0)];
+        let mut d = DrawingInstance {
+            id: "t-1".into(),
+            tool: DrawingTool::Trendline,
+            points: original.clone(),
+            style: Default::default(),
+            text: None,
+        };
+
+        // Simulate two drag frames: restore the original each frame, then
+        // apply the total delta. The result only depends on the latest delta.
+        d.move_by(30, 10.0);
+        d.points = original.clone();
+        d.move_by(30, 10.0);
+
+        assert_eq!(d.points[0], DrawingPoint::new(130, 60.0));
+        assert_eq!(d.points[1], DrawingPoint::new(230, 70.0));
+
+        // A later frame that moves back to the anchor restores geometry.
+        d.points = original.clone();
+        d.move_by(0, 0.0);
+        assert_eq!(d.points, original);
     }
 }
