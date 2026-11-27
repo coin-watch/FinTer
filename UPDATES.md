@@ -6,7 +6,7 @@ Updates require explicit user action to download and install. Downloads are boun
 
 ## Locked price scale and chart panning
 
-The legacy chart's price scale pins on first paint: the initial auto-fit is captured and held instead of re-fitting on every tick, so the scale only changes when the right price rail is dragged (the rail scales the range) or the axis is double-clicked to re-fit and re-lock. The chart starts locked so a body drag does not pan; the first price-rail drag unlocks body time panning with the existing viewport math, and the plot never pans price.
+The legacy chart's price scale pins on first paint: the initial auto-fit is captured and held instead of re-fitting on every tick, so the price range only moves when the right price rail is dragged or the axis is double-clicked to re-fit and re-lock. The chart body always pans time with the existing viewport math; the price rail pans the price range vertically (Ctrl/⌘ + drag scales it instead).
 
 ## Drawing move and endpoint drag
 

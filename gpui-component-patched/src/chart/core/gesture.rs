@@ -237,6 +237,30 @@ pub fn drag_price_range(
     (min, max)
 }
 
+/// Pan a price range by dragging a price axis.
+///
+/// `dy` is the pointer displacement in pixels and `plot_h` is the candle plot
+/// height in pixels. The range keeps its span and shifts by `dy` pixels
+/// converted through the current pixels-per-price-unit. Invalid ranges,
+/// non-finite input, and a non-positive plot height return `start_range`
+/// unchanged.
+pub fn pan_price_range(start_range: (f64, f64), dy: f32, plot_h: f32) -> (f64, f64) {
+    let (min, max) = start_range;
+    if !min.is_finite() || !max.is_finite() || max <= min {
+        return start_range;
+    }
+    if !dy.is_finite() || !plot_h.is_finite() || plot_h <= 0.0 {
+        return start_range;
+    }
+    let ppu = (max - min) / plot_h.max(1.0) as f64;
+    let delta = dy as f64 * ppu;
+    let (lo, hi) = (min + delta, max + delta);
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        return start_range;
+    }
+    (lo, hi)
+}
+
 /// Scale the visible time span by dragging a time axis.
 ///
 /// Dragging right (positive `dx`) widens the span; dragging left narrows it.
@@ -298,6 +322,28 @@ mod axis_tests {
             Rect::new(0.0, 0.0, 100.0, 100.0),
         );
         assert!((scale_before.to_y(anchor) - scale_after.to_y(anchor)).abs() < 0.01);
+    }
+
+    #[test]
+    fn price_pan_keeps_the_span_and_follows_the_drag() {
+        let start = (100.0, 200.0);
+        assert_eq!(pan_price_range(start, 10.0, 100.0), (110.0, 210.0));
+        assert_eq!(pan_price_range(start, -10.0, 100.0), (90.0, 190.0));
+        assert_eq!(pan_price_range(start, 10.0, 50.0), (120.0, 220.0));
+    }
+
+    #[test]
+    fn price_pan_rejects_invalid_input() {
+        let start = (100.0, 200.0);
+        assert_eq!(pan_price_range(start, 10.0, 0.0), start);
+        assert_eq!(pan_price_range(start, 10.0, -5.0), start);
+        assert_eq!(pan_price_range(start, 10.0, f32::NAN), start);
+        assert_eq!(pan_price_range(start, f32::NAN, 100.0), start);
+        assert_eq!(pan_price_range((200.0, 100.0), 10.0, 100.0), (200.0, 100.0));
+        assert_eq!(pan_price_range((100.0, 100.0), 10.0, 100.0), (100.0, 100.0));
+        let nan_min = pan_price_range((f64::NAN, 200.0), 10.0, 100.0);
+        assert!(nan_min.0.is_nan());
+        assert_eq!(nan_min.1, 200.0);
     }
 
     #[test]

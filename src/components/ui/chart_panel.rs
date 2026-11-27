@@ -39,7 +39,7 @@ use gpui::{
 use gpui_component::PixelsExt;
 use gpui_component::button::Button;
 use gpui_component::chart::core::{
-    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span,
+    AXIS_GAP, AxisHandle, Ohlcv, PriceScaleMode, drag_price_range, drag_time_span, pan_price_range,
     timeframe_interval_ms, timestamp_at_buffer_index,
 };
 use gpui_component::chart::elements::{
@@ -155,6 +155,8 @@ enum LegacyAxisDrag {
         start_y: f32,
         start_range: (f64, f64),
         anchor_price: f64,
+        /// Latches once the drag has changed the price range, so release only
+        /// persists a real edit.
         moved: bool,
     },
     Time {
@@ -273,12 +275,6 @@ fn drawing_drag_claims_hit(is_already_selected: bool) -> bool {
     is_already_selected
 }
 
-/// Whether a chart-body drag may pan time. Panning starts locked on load and
-/// stays locked until a price-rail drag unlocks the pane.
-fn pan_allowed(unlocked: bool) -> bool {
-    unlocked
-}
-
 pub struct ChartPanel {
     feed: CandleFeed,
     /// Display title (e.g. "BTC/USDT 1m").
@@ -311,9 +307,6 @@ pub struct ChartPanel {
     /// Set on an explicit Price-axis reset: one render must paint the
     /// auto-fitted scale before the lock re-captures it.
     price_lock_deferred: bool,
-    /// Whether a price-rail drag has unlocked chart-body panning for this
-    /// loaded pane. Starts locked; the first rail drag is the explicit unlock.
-    chart_unlocked: bool,
     v2_percent_anchor: Option<f64>,
     pub on_load_more:
         Option<std::sync::Arc<dyn Fn(i64, std::sync::mpsc::Sender<()>) + Send + Sync>>,
@@ -645,7 +638,6 @@ impl ChartPanel {
             manual_price_range,
             price_lock_applied: false,
             price_lock_deferred: false,
-            chart_unlocked: false,
             v2_percent_anchor,
             last_chart_width: 800.0,
             last_cursor_x: 400.0,
@@ -1130,7 +1122,6 @@ impl ChartPanel {
         self.v2_price_scale_mode = layout.price_scale_mode;
         self.manual_price_range = layout.manual_price_range;
         self.price_lock_applied = self.manual_price_range.is_some();
-        self.chart_unlocked = false;
         self.v2_percent_anchor = layout.percent_anchor;
         self.footprint_settings = layout.footprint;
     }
@@ -3032,8 +3023,12 @@ impl Render for ChartPanel {
             .min_h_0()
             .relative();
 
-        if active_axis == Some(AxisHandle::Price) {
-            chart_area = chart_area.cursor_row_resize();
+        // The Price rail pans the price range vertically: grab while hovering,
+        // grabbing while dragging. The Time rail keeps its column-resize cursor.
+        if matches!(self.axis_drag, Some(LegacyAxisDrag::Price { .. })) {
+            chart_area = chart_area.cursor_grabbing();
+        } else if active_axis == Some(AxisHandle::Price) {
+            chart_area = chart_area.cursor_grab();
         } else if active_axis == Some(AxisHandle::Time) {
             chart_area = chart_area.cursor_col_resize();
         } else if is_near_separator {
@@ -3143,18 +3138,35 @@ impl Render for ChartPanel {
                         } => {
                             let dy = y - *start_y;
                             if *moved || dy.abs() >= 2.0 {
-                                *moved = true;
-                                // The first price-rail drag is the explicit
-                                // unlock for chart-body panning.
-                                this.chart_unlocked = true;
-                                let range = drag_price_range(
-                                    PriceScaleMode::Linear,
-                                    *start_range,
-                                    *anchor_price,
-                                    dy,
-                                );
-                                if range.0.is_finite() && range.1.is_finite() && range.1 > range.0 {
-                                    this.manual_price_range = Some(range);
+                                // Vertical rail drag pans the price range; the
+                                // horizontal component is deliberately ignored
+                                // because the chart body owns time panning.
+                                // Ctrl/⌘ keeps range zoom reachable.
+                                if let Some(plot_h) =
+                                    this.chart_state.candle_plot_size.get().map(|(_, h)| h)
+                                {
+                                    let range = if ev.modifiers.secondary() {
+                                        drag_price_range(
+                                            PriceScaleMode::Linear,
+                                            *start_range,
+                                            *anchor_price,
+                                            dy,
+                                        )
+                                    } else {
+                                        pan_price_range(*start_range, dy, plot_h)
+                                    };
+                                    if range.0.is_finite()
+                                        && range.1.is_finite()
+                                        && range.1 > range.0
+                                    {
+                                        // `moved` latches once the range
+                                        // actually changes so release only
+                                        // persists a real edit.
+                                        if range != *start_range {
+                                            *moved = true;
+                                        }
+                                        this.manual_price_range = Some(range);
+                                    }
                                 }
                             }
                         }
@@ -3317,7 +3329,6 @@ impl Render for ChartPanel {
                                     this.manual_price_range = None;
                                     this.price_lock_applied = false;
                                     this.price_lock_deferred = true;
-                                    this.chart_unlocked = false;
                                     this.mark_dirty();
                                 }
                                 AxisHandle::Time => {
@@ -3516,14 +3527,10 @@ impl Render for ChartPanel {
                         this.drawing_state = DrawingInteractionState::Idle;
                     }
 
-                    // 6. Normal chart pan drag. Panning stays locked until the
-                    // price rail has been dragged once; drawing selection still
-                    // happened above while locked.
-                    if pan_allowed(this.chart_unlocked) {
-                        this.chart_state.is_dragging = true;
-                        this.chart_state.drag_start_x = pos.x.as_f32();
-                        this.chart_state.drag_start_offset = this.chart_state.viewport_offset;
-                    }
+                    // 6. Normal chart pan drag
+                    this.chart_state.is_dragging = true;
+                    this.chart_state.drag_start_x = pos.x.as_f32();
+                    this.chart_state.drag_start_offset = this.chart_state.viewport_offset;
                     cx.notify();
                 }),
             )
@@ -3981,12 +3988,6 @@ mod tests {
     fn only_a_selected_drawing_claims_the_drag() {
         assert!(drawing_drag_claims_hit(true));
         assert!(!drawing_drag_claims_hit(false));
-    }
-
-    #[test]
-    fn body_pan_requires_the_price_rail_unlock() {
-        assert!(!pan_allowed(false));
-        assert!(pan_allowed(true));
     }
 
     #[test]
