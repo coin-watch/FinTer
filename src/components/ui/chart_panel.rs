@@ -47,9 +47,8 @@ use gpui_component::chart::elements::{
 };
 use gpui_component::chart::theme::ChartPalette;
 use gpui_component::chart::{
-    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState,
-    FootprintCellSpec, IndicatorStyle, MAX_VISIBLE, MIN_VISIBLE, OrderOverlaySpec, PaneTarget,
-    PositionOverlaySpec,
+    AlertOverlaySpec, CandleType, CandlestickChart, ChartOverlayAction, ChartState, IndicatorStyle,
+    MAX_VISIBLE, MIN_VISIBLE, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 use gpui_component::theme::ActiveTheme;
@@ -58,22 +57,17 @@ use gpui_component::v_flex;
 use crate::chart::drawings::{
     DrawingInstance, DrawingInteractionState, DrawingPoint, DrawingTool, hit_test_drawings,
 };
-use crate::chart::footprint::{FootprintBuildInput, build_footprint_grid};
 use crate::chart::indicators::{IndicatorCache, validate_params};
 use crate::chart::layout::ChartMetrics;
-use crate::chart::model::{
-    ChartLayout, FootprintMode, FootprintSettings, IndicatorCategory, IndicatorInstance,
-    IndicatorKind,
-};
+use crate::chart::model::{ChartLayout, IndicatorCategory, IndicatorInstance, IndicatorKind};
 use crate::chart::persistence::{default_chart_dir, load_layout, save_layout};
 use crate::data::alerts::AlertStore;
 use crate::data::candle_feed::CandleFeed;
 use crate::data::models::{OhlcvCandle, PrecisionInfo};
-use crate::data::orderflow_feed::{FootprintFeed, FootprintSnapshot};
 use crate::data::price_format::format_price;
 use crate::klinechart;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -103,36 +97,6 @@ pub type TechnicalIndicatorCategory = IndicatorCategory;
 /// Callback used by title-bar and legend controls to open the floating
 /// indicator window without owning window creation.
 pub type ChartWindowCallback = std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
-
-/// Compact volume label used inside footprint cells.
-fn compact_flow(value: f64) -> String {
-    let value = value.abs();
-    if value >= 1_000_000_000.0 {
-        format!("{:.1}B", value / 1_000_000_000.0)
-    } else if value >= 1_000_000.0 {
-        format!("{:.1}M", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.1}K", value / 1_000.0)
-    } else if value >= 100.0 {
-        format!("{value:.0}")
-    } else if value >= 1.0 {
-        format!("{value:.1}")
-    } else if value > 0.0 {
-        format!("{value:.2}")
-    } else {
-        "0".to_string()
-    }
-}
-
-/// Compact signed delta label used inside footprint cells.
-fn compact_delta(value: f64) -> String {
-    if value.abs() < 1e-9 {
-        "0".to_string()
-    } else {
-        let sign = if value > 0.0 { "+" } else { "-" };
-        format!("{sign}{}", compact_flow(value.abs()))
-    }
-}
 
 struct IndicatorLineSpec {
     instance_id: String,
@@ -379,11 +343,6 @@ pub struct ChartPanel {
     pan_start_price_range: Option<(f64, f64)>,
     /// Current chart rendering style
     candle_type: CandleType,
-    /// Historical + live footprint feed, attached while the footprint style is
-    /// available. Kept alive by the pane even when another style is selected.
-    footprint_feed: Option<FootprintFeed>,
-    /// Footprint cell mode, analytics and per-row tick density.
-    footprint_settings: FootprintSettings,
     /// Show/hide horizontal dashed guide lines in plot area.
     show_horizontal_grid: bool,
     /// IANA timezone used for chart labels and crosshair timestamps.
@@ -661,8 +620,6 @@ impl ChartPanel {
             last_cursor_x: 400.0,
             pan_start_price_range: None,
             candle_type: CandleType::Solid,
-            footprint_feed: None,
-            footprint_settings: FootprintSettings::default(),
             show_horizontal_grid: false,
             timezone: "UTC".into(),
             pane_width: 800.0,
@@ -878,75 +835,11 @@ impl ChartPanel {
     }
 
     pub fn set_candle_type(&mut self, candle_type: CandleType) {
-        let previous = self.candle_type;
         self.candle_type = candle_type;
-        if candle_type == CandleType::Footprint && previous != CandleType::Footprint {
-            self.ensure_footprint_density();
-        }
     }
 
     pub fn candle_type_config(&self) -> &'static str {
         crate::components::ui::pane_grid::chart_config::candle_type_to_config(self.candle_type)
-    }
-
-    /// True when the footprint renderer is selected.
-    pub fn show_footprint(&self) -> bool {
-        self.candle_type == CandleType::Footprint
-    }
-
-    /// Footprint needs room for three lanes (bid | candle | ask), so target a
-    /// slot width wide enough for the numeric columns instead of a fixed count.
-    fn ensure_footprint_density(&mut self) {
-        self.chart_state.visible_count = footprint_visible_count(self.pane_width);
-    }
-
-    /// Attach the historical + live footprint feed for this pane.
-    pub fn set_footprint_feed(&mut self, feed: FootprintFeed, cx: &mut Context<Self>) {
-        let version = feed.version_handle();
-        self.footprint_feed = Some(feed);
-        cx.spawn(async move |this, cx| {
-            let mut last = u64::MAX;
-            loop {
-                let failed = this
-                    .update(cx, |panel, cx| {
-                        let current = version.load(std::sync::atomic::Ordering::Relaxed);
-                        if current != last {
-                            last = current;
-                            if panel.show_footprint() {
-                                cx.notify();
-                            }
-                        }
-                    })
-                    .is_err();
-                if failed {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    pub fn footprint_settings(&self) -> &FootprintSettings {
-        &self.footprint_settings
-    }
-
-    pub fn set_footprint_settings(&mut self, settings: FootprintSettings) {
-        self.footprint_settings = settings;
-        self.ensure_footprint_density();
-        self.mark_dirty();
-    }
-
-    pub fn set_footprint_mode(&mut self, mode: FootprintMode) {
-        self.footprint_settings.mode = mode;
-        self.mark_dirty();
-    }
-
-    pub fn set_footprint_ticks_per_row(&mut self, ticks_per_row: u32) {
-        self.footprint_settings.ticks_per_row = ticks_per_row.max(1);
-        self.mark_dirty();
     }
 
     /// Exchange, symbol and timeframe for title-bar/floating-window context.
@@ -1155,7 +1048,6 @@ impl ChartPanel {
         self.y_axis_unlocked = false;
         self.pan_start_price_range = None;
         self.v2_percent_anchor = layout.percent_anchor;
-        self.footprint_settings = layout.footprint;
     }
 
     pub fn save_layout(&self) {
@@ -1169,10 +1061,7 @@ impl ChartPanel {
             CandleType::Ohlc => "ohlc".into(),
             CandleType::Area => "area".into(),
             CandleType::HeikinAshi => "heikin_ashi".into(),
-            CandleType::Footprint => "footprint".into(),
         };
-        layout.show_footprint = self.show_footprint();
-        layout.footprint = self.footprint_settings.clone();
         layout.show_grid = self.show_horizontal_grid;
         layout.timezone = self.timezone.clone();
         layout.indicators = self.indicators.clone();
@@ -1358,194 +1247,6 @@ impl ChartPanel {
         (lines, subpane_idx)
     }
 
-    /// Price span of one footprint row. When the exchange tick is known this
-    /// is `tick_size * ticks_per_row`; otherwise derive a readable fallback
-    /// from the whole candle buffer instead of the live visible range.
-    fn footprint_row_size(&self, candles: &[OhlcvCandle]) -> f64 {
-        footprint_row_size_for(
-            self.precision.as_ref(),
-            self.footprint_settings.ticks_per_row,
-            candles,
-        )
-    }
-
-    fn compute_footprint_cells(
-        &self,
-        candles: &[OhlcvCandle],
-        snapshot: Option<&FootprintSnapshot>,
-        bullish: gpui::Hsla,
-        bearish: gpui::Hsla,
-    ) -> Vec<FootprintCellSpec> {
-        if !self.show_footprint() {
-            return Vec::new();
-        }
-        if matches!(self.timeframe.as_str(), "1w" | "1M") {
-            return Vec::new();
-        }
-        let Some(snapshot) = snapshot else {
-            return Vec::new();
-        };
-        if snapshot.bars.is_empty() || candles.is_empty() {
-            return Vec::new();
-        }
-
-        let range = self.chart_state.visible_range(candles.len());
-        let visible = &candles[range];
-        if visible.is_empty() {
-            return Vec::new();
-        }
-        let timestamps: HashSet<i64> = visible.iter().map(|candle| candle.timestamp).collect();
-
-        let (price_min, price_max) = match self.chart_state.candle_price_range.get() {
-            Some((min, max)) if min.is_finite() && max.is_finite() && max > min => (min, max),
-            _ => {
-                let mut min = f64::INFINITY;
-                let mut max = f64::NEG_INFINITY;
-                for candle in visible {
-                    if candle.low.is_finite() && candle.high.is_finite() {
-                        min = min.min(candle.low);
-                        max = max.max(candle.high);
-                    }
-                }
-                if !min.is_finite() || !max.is_finite() || max <= min {
-                    return Vec::new();
-                }
-                (min, max)
-            }
-        };
-
-        let plot_h = self
-            .chart_state
-            .candle_plot_size
-            .get()
-            .map(|(_, height)| height)
-            .unwrap_or(self.pane_height * 0.7)
-            .max(120.0);
-        let min_row_h = self.footprint_settings.min_row_height.max(6.0);
-        let max_rows = (plot_h / min_row_h).floor().clamp(12.0, 96.0) as usize;
-        let tick_size = self
-            .precision
-            .as_ref()
-            .and_then(|precision| precision.tick_size)
-            .filter(|tick| tick.is_finite() && *tick > 0.0);
-
-        let grid = build_footprint_grid(&FootprintBuildInput {
-            bars: &snapshot.bars,
-            timestamps: &timestamps,
-            price_min,
-            price_max,
-            max_rows,
-            tick_size,
-            ticks_per_row: self.footprint_settings.ticks_per_row,
-            show_value_area: self.footprint_settings.show_value_area,
-            show_imbalance: self.footprint_settings.show_imbalance,
-            imbalance_ratio: self.footprint_settings.imbalance_ratio,
-        });
-
-        let mut cells = Vec::new();
-        for bar in &grid.bars {
-            let max_abs_delta = bar
-                .rows
-                .iter()
-                .map(|row| row.delta().abs())
-                .fold(0.0, f64::max)
-                .max(1e-9);
-            let max_sell = bar
-                .rows
-                .iter()
-                .map(|row| row.sell.max(0.0))
-                .fold(0.0, f64::max)
-                .max(1e-9);
-            let max_buy = bar
-                .rows
-                .iter()
-                .map(|row| row.buy.max(0.0))
-                .fold(0.0, f64::max)
-                .max(1e-9);
-            for row in &bar.rows {
-                let delta = row.delta();
-                let intensity = (delta.abs() / max_abs_delta).clamp(0.0, 1.0) as f32;
-                let base = if delta >= 0.0 { bullish } else { bearish };
-                let alpha = 0.08 + 0.20 * intensity + if bar.is_closed { 0.0 } else { 0.05 };
-                let background = base.opacity(alpha.min(0.45));
-                let bid_intensity = (row.sell / max_sell).clamp(0.0, 1.0) as f32;
-                let ask_intensity = (row.buy / max_buy).clamp(0.0, 1.0) as f32;
-                let bid_background = bearish.opacity(0.10 + 0.55 * bid_intensity);
-                let ask_background = bullish.opacity(0.10 + 0.55 * ask_intensity);
-                let (left_text, right_text, single_text) = match self.footprint_settings.mode {
-                    FootprintMode::BidAsk => (
-                        compact_flow(row.sell).into(),
-                        compact_flow(row.buy).into(),
-                        compact_delta(delta).into(),
-                    ),
-                    FootprintMode::Delta => ("".into(), "".into(), compact_delta(delta).into()),
-                    FootprintMode::Volume => {
-                        ("".into(), "".into(), compact_flow(row.volume()).into())
-                    }
-                };
-                let single_color = if delta >= 0.0 { bullish } else { bearish };
-                let lane_text = gpui::white().opacity(0.92);
-                cells.push(FootprintCellSpec {
-                    timestamp_ms: bar.timestamp,
-                    price_low: row.price_low,
-                    price_high: row.price_high,
-                    left_text,
-                    right_text,
-                    single_text,
-                    left_color: lane_text,
-                    right_color: lane_text,
-                    single_color,
-                    background,
-                    bid_background,
-                    ask_background,
-                    is_poc: self.footprint_settings.show_poc && row.is_poc,
-                    is_vah: self.footprint_settings.show_value_area && row.is_vah,
-                    is_val: self.footprint_settings.show_value_area && row.is_val,
-                    imbalance: if self.footprint_settings.show_imbalance {
-                        row.imbalance
-                    } else {
-                        0
-                    },
-                    is_live: !bar.is_closed,
-                });
-            }
-        }
-        cells
-    }
-
-    /// One-line note for guest/unauthenticated/credit states and unsupported
-    /// timeframes. Kept out of the empty/error paths so the candles stay usable.
-    fn footprint_note(&self, snapshot: Option<&FootprintSnapshot>) -> Option<String> {
-        if !self.show_footprint() {
-            return None;
-        }
-        if chart_v2_enabled() {
-            return Some(
-                "Footprint is unavailable in the experimental chart renderer. Showing candles."
-                    .to_string(),
-            );
-        }
-        if matches!(self.timeframe.as_str(), "1w" | "1M") {
-            return Some("Footprint does not support weekly or monthly timeframes.".to_string());
-        }
-        let snapshot = snapshot?;
-        if let Some(note) = snapshot.status.note() {
-            return Some(note.to_string());
-        }
-        if snapshot.queued {
-            // Cached/live bars stay visible while the server backfills the
-            // rest of the window from CryptoHFTData.
-            return Some("Fetching footprint history from CryptoHFTData…".to_string());
-        }
-        if snapshot.partial {
-            return Some(
-                "Footprint history is partial: only the persisted 14-day trade window is available."
-                    .to_string(),
-            );
-        }
-        None
-    }
-
     // -----------------------------------------------------------------------
     // Helper Methods
     // -----------------------------------------------------------------------
@@ -1665,30 +1366,6 @@ impl Render for ChartPanel {
             let palette = ChartPalette::from_theme(&cx.theme().colors);
             self.chart_v2
                 .update(cx, |view, cx| view.set_palette_if_changed(palette, cx));
-            let v2_note = self.footprint_note(None);
-            let chart_container = div()
-                .flex_1()
-                .w_full()
-                .min_h_0()
-                .relative()
-                .child(self.chart_v2.clone());
-            let chart_container = if let Some(note) = v2_note {
-                chart_container.child(
-                    div()
-                        .absolute()
-                        .bottom(px(10.0))
-                        .left(px(12.0))
-                        .px(px(8.0))
-                        .py(px(4.0))
-                        .rounded(px(4.0))
-                        .bg(cx.theme().colors.background.opacity(0.85))
-                        .text_xs()
-                        .text_color(cx.theme().colors.muted_foreground)
-                        .child(note),
-                )
-            } else {
-                chart_container
-            };
             let root = v_flex()
                 .size_full()
                 .bg(cx.theme().colors.background)
@@ -1696,7 +1373,14 @@ impl Render for ChartPanel {
                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                     this.handle_chart_key(ev, window, cx);
                 }))
-                .child(chart_container);
+                .child(
+                    div()
+                        .flex_1()
+                        .w_full()
+                        .min_h_0()
+                        .relative()
+                        .child(self.chart_v2.clone()),
+                );
             return root.into_any_element();
         }
 
@@ -1714,7 +1398,6 @@ impl Render for ChartPanel {
         self.check_debounced_save();
 
         let (candles_snap, feed_version) = self.feed.snapshot_with_version();
-        let footprint_snapshot = self.footprint_feed.as_ref().map(|feed| feed.snapshot());
         let metrics = self.chart_metrics();
         let current_oldest = candles_snap.first().map(|c| c.timestamp).unwrap_or(0);
         if current_oldest > 0 && current_oldest != self.oldest_loaded_ts {
@@ -1865,24 +1548,6 @@ impl Render for ChartPanel {
             self.chart_state.clamp_offset(total);
         }
 
-        if self.show_footprint() {
-            if let Some(feed) = &self.footprint_feed {
-                let range = self.chart_state.visible_range(total);
-                if !range.is_empty() {
-                    let visible = &candles[range.clone()];
-                    let since = visible.first().map(|candle| candle.timestamp).unwrap_or(0);
-                    let last_end = visible.last().map(|candle| candle.timestamp).unwrap_or(0);
-                    let interval = timeframe_interval_ms(&self.timeframe).unwrap_or(60_000);
-                    let until = last_end.saturating_add(interval);
-                    // Use the full buffer so the fallback row size does not
-                    // change with every live ticker update to the visible
-                    // window's min/max.
-                    let row_size = self.footprint_row_size(&candles);
-                    feed.request_visible(since, until, range.len().saturating_add(8), row_size);
-                }
-            }
-        }
-
         // Pin the price scale on the first paint: capture the auto-fitted
         // range the legacy chart published last frame so ticks stop re-fitting
         // it. This deliberately does not mark the layout dirty; the captured
@@ -1910,13 +1575,6 @@ impl Render for ChartPanel {
         // Compute parameterized indicators with the versioned cache.
         let (indicator_lines, subpane_count) =
             self.compute_indicators_for_chart(&candles, feed_version);
-        let footprint_cells = self.compute_footprint_cells(
-            &candles,
-            footprint_snapshot.as_ref(),
-            cx.theme().bullish,
-            cx.theme().bearish,
-        );
-        let footprint_note = self.footprint_note(footprint_snapshot.as_ref());
 
         let full_h = self.chart_state.chart_height.get().unwrap_or(0.0);
         let has_subpanes = subpane_count > 0;
@@ -2106,68 +1764,6 @@ impl Render for ChartPanel {
                                 .child(div().text_color(c_color).child(change_str)),
                         )
                 );
-
-            if self.show_footprint() && self.footprint_settings.show_summary {
-                if let Some(bar) = footprint_snapshot.as_ref().and_then(|snapshot| {
-                    snapshot
-                        .bars
-                        .iter()
-                        .find(|bar| bar.timestamp == c.timestamp)
-                }) {
-                    let delta = bar.delta();
-                    let delta_color = if delta >= 0.0 {
-                        cx.theme().bullish
-                    } else {
-                        cx.theme().bearish
-                    };
-                    let volume = if bar.total_volume > 0.0 {
-                        bar.total_volume
-                    } else {
-                        bar.volume()
-                    };
-                    let poc = bar
-                        .poc
-                        .map(|price| format_price(price, precision.as_ref()))
-                        .unwrap_or_else(|| "—".to_string());
-                    let status_color = if bar.is_closed {
-                        cx.theme().colors.muted_foreground
-                    } else {
-                        cx.theme().primary
-                    };
-                    legend = legend.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .text_xs()
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child("FP"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(delta_color)
-                                    .child(format!("Δ {}", compact_delta(delta))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(format!("Vol {}", compact_flow(volume))),
-                            )
-                            .child(
-                                div()
-                                    .text_color(cx.theme().colors.muted_foreground)
-                                    .child(format!("POC {poc}")),
-                            )
-                            .child(div().text_color(status_color).child(if bar.is_closed {
-                                "CLOSED"
-                            } else {
-                                "LIVE"
-                            })),
-                    );
-                }
-            }
 
             let active_timestamp = c.timestamp;
             let mut subpane_legends_map: std::collections::BTreeMap<usize, (f32, Vec<AnyElement>)> =
@@ -2592,12 +2188,10 @@ impl Render for ChartPanel {
         // Candlestick chart construction
         let current_mark = candles.last().map(|c| c.close).unwrap_or(0.0);
         let show_candles = self.show_main_series;
-        let footprint_active = self.show_footprint() && !footprint_cells.is_empty();
         let mut chart = CandlestickChart::new(candles)
-            .show_candles(show_candles && !footprint_active)
+            .show_candles(show_candles)
             .subpane_count(subpane_count)
             .show_volume_pane(has_vol)
-            .footprint_cells(footprint_cells)
             .timestamp_ms(|c: &OhlcvCandle| c.timestamp)
             .open(|c: &OhlcvCandle| c.open)
             .high(|c: &OhlcvCandle| c.high)
@@ -3639,19 +3233,6 @@ impl Render for ChartPanel {
             .child(legend_ui)
             .child(legend_vol_ui)
             .children(subpane_legends)
-            .children(footprint_note.map(|note| {
-                div()
-                    .absolute()
-                    .bottom(px(26.0))
-                    .left(px(12.0))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(4.0))
-                    .bg(cx.theme().colors.background.opacity(0.85))
-                    .text_xs()
-                    .text_color(cx.theme().colors.muted_foreground)
-                    .child(note)
-            }))
             .child(gpui::deferred(settings_panel));
 
         let root = v_flex()
@@ -3713,58 +3294,6 @@ impl Focusable for ChartPanel {
 
 impl EventEmitter<PanelEvent> for ChartPanel {}
 
-/// How many bars fit at a footprint-friendly density. Each bar needs roughly
-/// 140px for the bid lane, candle lane, and ask lane to stay readable.
-fn footprint_visible_count(pane_width: f32) -> usize {
-    ((pane_width / 140.0).floor() as usize).clamp(4, 20)
-}
-
-/// Price span of one footprint row.
-///
-/// The tick path is exact, so it stays constant across price updates. The
-/// fallback derives its step from the whole candle buffer (not the live
-/// visible min/max) and quantizes it to three significant digits so small
-/// range changes keep the same history request key.
-fn footprint_row_size_for(
-    precision: Option<&PrecisionInfo>,
-    ticks_per_row: u32,
-    candles: &[OhlcvCandle],
-) -> f64 {
-    let ticks_per_row = ticks_per_row.max(1) as f64;
-    if let Some(tick) = precision
-        .and_then(|precision| precision.tick_size)
-        .filter(|tick| tick.is_finite() && *tick > 0.0)
-    {
-        return tick * ticks_per_row;
-    }
-
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    for candle in candles {
-        if candle.low.is_finite() && candle.high.is_finite() {
-            min = min.min(candle.low);
-            max = max.max(candle.high);
-        }
-    }
-    if !min.is_finite() || !max.is_finite() || max <= min {
-        return 0.0;
-    }
-    // Aim for roughly 60 rows over the loaded range, scaled by the density
-    // preference (more ticks per row -> fewer, wider rows).
-    let step = ((max - min) / (60.0 / ticks_per_row).max(1.0)).max(f64::MIN_POSITIVE);
-    quantize_significant(step, 3)
-}
-
-/// Round `value` to `digits` significant digits.
-fn quantize_significant(value: f64, digits: u32) -> f64 {
-    if !value.is_finite() || value <= 0.0 || digits == 0 {
-        return 0.0;
-    }
-    let magnitude = 10f64.powf(value.log10().floor());
-    let unit = magnitude / 10f64.powi(digits.saturating_sub(1) as i32);
-    (value / unit).round() * unit
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -3772,72 +3301,6 @@ fn quantize_significant(value: f64, digits: u32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::orderflow_feed::row_size_key;
-
-    fn candles_with_range(low: f64, high: f64, count: usize) -> Vec<OhlcvCandle> {
-        (0..count)
-            .map(|index| OhlcvCandle {
-                timestamp: index as i64 * 60_000,
-                open: low,
-                high,
-                low,
-                close: high,
-                volume: 1.0,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn footprint_row_size_uses_tick_and_is_stable_across_prices() {
-        let precision = PrecisionInfo {
-            price: None,
-            amount: None,
-            tick_size: Some(0.5),
-        };
-        let quiet = candles_with_range(100.0, 101.0, 40);
-        let volatile = candles_with_range(100.0, 120.0, 40);
-
-        assert_eq!(footprint_row_size_for(Some(&precision), 2, &quiet), 1.0);
-        assert_eq!(footprint_row_size_for(Some(&precision), 2, &volatile), 1.0);
-    }
-
-    #[test]
-    fn adaptive_footprint_row_size_is_stable_across_small_range_changes() {
-        let base = candles_with_range(100.0, 101.0, 40);
-        let mut nudged = base.clone();
-        for candle in &mut nudged {
-            candle.low *= 1.004;
-            candle.high *= 1.004;
-            candle.open *= 1.004;
-            candle.close *= 1.004;
-        }
-
-        let step = footprint_row_size_for(None, 1, &base);
-        let nudged_step = footprint_row_size_for(None, 1, &nudged);
-
-        assert!(step > 0.0);
-        assert_eq!(nudged_step, step, "a <0.5% price change keeps the step");
-        assert_eq!(
-            row_size_key(nudged_step),
-            row_size_key(step),
-            "the history key stays stable for the same step"
-        );
-    }
-
-    #[test]
-    fn adaptive_footprint_row_size_stays_positive_for_a_small_range() {
-        let candles = candles_with_range(0.000_000_1, 0.000_000_2, 10);
-        let step = footprint_row_size_for(None, 1, &candles);
-        assert!(step.is_finite() && step > 0.0, "step was {step}");
-    }
-
-    #[test]
-    fn footprint_visible_count_targets_readable_lane_widths() {
-        assert_eq!(footprint_visible_count(900.0), 6);
-        assert_eq!(footprint_visible_count(1400.0), 10);
-        assert_eq!(footprint_visible_count(300.0), 4);
-        assert_eq!(footprint_visible_count(3000.0), 20);
-    }
 
     #[test]
     fn format_time_works() {
@@ -3890,7 +3353,6 @@ mod tests {
             CandleType::DownStroke,
             CandleType::Ohlc,
             CandleType::Area,
-            CandleType::Footprint,
         ] {
             let label = match candle_type {
                 CandleType::Solid => "Candles",
@@ -3900,7 +3362,6 @@ mod tests {
                 CandleType::DownStroke => "Down stroke",
                 CandleType::Ohlc => "OHLC",
                 CandleType::Area => "Area",
-                CandleType::Footprint => "Footprint",
             };
             assert!(!label.is_empty());
         }

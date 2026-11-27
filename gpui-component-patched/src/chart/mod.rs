@@ -15,8 +15,8 @@ mod pie_chart;
 pub use area_chart::AreaChart;
 pub use bar_chart::BarChart;
 pub use candlestick_chart::{
-    paint_text_line_centered, AlertOverlaySpec, CandleType, CandlestickChart, FootprintCellSpec,
-    IndicatorStyle, OrderOverlaySpec, PaneTarget, PositionOverlaySpec,
+    AlertOverlaySpec, CandleType, CandlestickChart, IndicatorStyle, OrderOverlaySpec, PaneTarget,
+    PositionOverlaySpec, paint_text_line_centered,
 };
 pub use chart_state::{
     ChartOverlayAction, ChartOverlayHitbox, ChartState, MAX_VISIBLE, MIN_VISIBLE,

@@ -20,7 +20,6 @@ pub mod models;
 pub mod modules;
 pub mod orderbook;
 pub mod orderbook_feed;
-pub mod orderflow_feed;
 pub mod pane_control;
 pub mod pane_layout;
 pub mod pane_tree;

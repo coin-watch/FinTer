@@ -1,14 +1,15 @@
 use std::rc::Rc;
 
 use gpui::{
-    fill, px, rgb, rgba, App, Bounds, Corner, Hsla, PathBuilder, Pixels, SharedString, TextAlign, Window,
+    App, Bounds, Corner, Hsla, PathBuilder, Pixels, SharedString, TextAlign, Window, fill, px, rgb,
+    rgba,
 };
 use gpui_component_macros::IntoPlot;
 use num_traits::{Num, ToPrimitive};
 
 use crate::{
-    plot::{origin_point, scale::Sealed, Grid, Plot, AXIS_GAP},
     ActiveTheme, PixelsExt,
+    plot::{AXIS_GAP, Grid, Plot, origin_point, scale::Sealed},
 };
 
 use super::chart_state::{ChartOverlayAction, ChartOverlayHitbox, ChartState};
@@ -191,37 +192,6 @@ pub enum CandleType {
     Area,
     /// Heikin Ashi uses modified OHLC formulas for smoother trends.
     HeikinAshi,
-    /// Bid × ask / delta / volume footprint cells instead of candle bodies.
-    Footprint,
-}
-
-/// One bid × ask footprint cell (a price row inside one candle).
-#[derive(Clone, Debug, PartialEq)]
-pub struct FootprintCellSpec {
-    pub timestamp_ms: i64,
-    pub price_low: f64,
-    pub price_high: f64,
-    /// Bid/sell-side volume text.
-    pub left_text: SharedString,
-    /// Ask/buy-side volume text.
-    pub right_text: SharedString,
-    /// Delta or volume text shown when the cell is too narrow for two columns.
-    pub single_text: SharedString,
-    pub left_color: Hsla,
-    pub right_color: Hsla,
-    pub single_color: Hsla,
-    /// Delta-tinted background for the single-cell Delta/Volume path.
-    pub background: Hsla,
-    /// Volume-tinted background for the bid lane (BidAsk mode).
-    pub bid_background: Hsla,
-    /// Volume-tinted background for the ask lane (BidAsk mode).
-    pub ask_background: Hsla,
-    pub is_poc: bool,
-    pub is_vah: bool,
-    pub is_val: bool,
-    /// `1` = ask/buy imbalance, `-1` = bid/sell imbalance, `0` = none.
-    pub imbalance: i8,
-    pub is_live: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +245,6 @@ where
     order_overlays: Vec<OrderOverlaySpec>,
     /// Saved price-alert levels (dashed line + Y-axis pill).
     alert_overlays: Vec<AlertOverlaySpec>,
-    /// Pre-computed footprint cells for the `Footprint` candle style.
-    footprint_cells: Vec<FootprintCellSpec>,
 }
 
 impl<T, Y> CandlestickChart<T, Y>
@@ -312,7 +280,6 @@ where
             position_overlays: Vec::new(),
             order_overlays: Vec::new(),
             alert_overlays: Vec::new(),
-            footprint_cells: Vec::new(),
         }
     }
 
@@ -425,7 +392,13 @@ where
     }
 
     /// Add an indicator line (a series of timestamp -> value points) to be drawn over the price chart.
-    pub fn indicator_line(mut self, series: Vec<(i64, f64)>, color: Hsla, style: IndicatorStyle, pane: PaneTarget) -> Self {
+    pub fn indicator_line(
+        mut self,
+        series: Vec<(i64, f64)>,
+        color: Hsla,
+        style: IndicatorStyle,
+        pane: PaneTarget,
+    ) -> Self {
         self.indicator_lines.push((series, color, style, pane));
         self
     }
@@ -448,12 +421,6 @@ where
     /// Toggle the last-price line, badge, and countdown.
     pub fn show_last_price(mut self, show: bool) -> Self {
         self.show_last_price = show;
-        self
-    }
-
-    /// Attach pre-computed footprint cells (bid × ask / delta / volume).
-    pub fn footprint_cells(mut self, cells: Vec<FootprintCellSpec>) -> Self {
-        self.footprint_cells = cells;
         self
     }
 
@@ -524,7 +491,11 @@ where
         if !full_w.is_finite() || !full_h.is_finite() || full_w <= 1.0 || full_h <= 1.0 {
             return;
         }
-        let _has_volume = self.volume.is_some() || self.indicator_lines.iter().any(|l| matches!(l.3, PaneTarget::Subpane(_)));
+        let _has_volume = self.volume.is_some()
+            || self
+                .indicator_lines
+                .iter()
+                .any(|l| matches!(l.3, PaneTarget::Subpane(_)));
 
         // Collect visible timestamps early; we use interval for countdown sizing on Y-axis.
         let timestamps: Vec<i64> = visible.iter().map(|d| ts_fn(d)).collect();
@@ -537,10 +508,19 @@ where
         let time_span_est = ts_max_val.saturating_sub(ts_min_val) as f64;
         let target_interval_est = time_span_est / x_tick_count_est.max(1) as f64;
         let nice_intervals: [i64; 13] = [
-            60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000,
-            3600_000, 4 * 3600_000, 12 * 3600_000,
-            86400_000, 2 * 86400_000, 7 * 86400_000,
-            30 * 86400_000, 90 * 86400_000, 365 * 86400_000
+            60_000,
+            5 * 60_000,
+            15 * 60_000,
+            30 * 60_000,
+            3600_000,
+            4 * 3600_000,
+            12 * 3600_000,
+            86400_000,
+            2 * 86400_000,
+            7 * 86400_000,
+            30 * 86400_000,
+            90 * 86400_000,
+            365 * 86400_000,
         ];
         let mut best_interval: f64 = nice_intervals[0] as f64;
         let mut min_diff = f64::MAX;
@@ -636,7 +616,7 @@ where
                 total_subpane_ratio += subpane_ratios[i];
             }
         }
-        
+
         if total_subpane_ratio > 0.8 {
             let scale = 0.8 / total_subpane_ratio;
             for i in 0..self.subpane_count {
@@ -645,15 +625,19 @@ where
             total_subpane_ratio = 0.8;
         }
 
-        let subpane_total_gap = if has_subpanes { VOLUME_GAP * self.subpane_count as f32 } else { 0.0 };
-        
+        let subpane_total_gap = if has_subpanes {
+            VOLUME_GAP * self.subpane_count as f32
+        } else {
+            0.0
+        };
+
         let avail = full_h - AXIS_GAP;
         let candle_h = if has_subpanes {
             (avail * (1.0 - total_subpane_ratio) - subpane_total_gap).max(10.0)
         } else {
             avail.max(10.0)
         };
-        
+
         if !candle_h.is_finite() || candle_h <= 1.0 {
             return;
         }
@@ -823,18 +807,20 @@ where
         // ------------------------------------------------------------------ //
         let origin = bounds.origin;
         if let Some(ref st) = self.state {
-            st.candle_plot_origin.set(Some((origin.x.as_f32(), origin.y.as_f32())));
+            st.candle_plot_origin
+                .set(Some((origin.x.as_f32(), origin.y.as_f32())));
             st.candle_plot_size.set(Some((chart_w, candle_h)));
             st.candle_ts_range.set(Some((
                 *timestamps.first().unwrap_or(&0) as f64,
                 *timestamps.last().unwrap_or(&0) as f64,
             )));
-            st.candle_price_range.set(Some((y_min_padded, y_max_padded)));
+            st.candle_price_range
+                .set(Some((y_min_padded, y_max_padded)));
             st.chart_bounds.set(Some(bounds));
         }
         let bullish_color = cx.theme().bullish;
         let bearish_color = cx.theme().bearish;
-        
+
         let is_light = cx.theme().background.l > 0.5;
         let crosshair_line: gpui::Hsla = if is_light {
             gpui::rgb(0x76808F).into()
@@ -935,161 +921,34 @@ where
                 period_low_px = (center_x, low_y);
             }
 
-
-
             // Collect for Area chart.
             area_points.push((center_x, close_y));
 
             let body_left = center_x - body_w / 2.;
             let body_right = center_x + body_w / 2.;
 
-
-
             if self.show_candles {
                 match candle_type {
-                CandleType::Area => {
-                    // Area chart draws a line + fill after the loop; skip per-candle rendering.
-                }
-                CandleType::Footprint => {
-                    // Footprint layout is bid lane | candle lane | ask lane.
-                    // The wick stays centered on the slot; the body is inset
-                    // into the narrow middle lane.
-                    let lanes = footprint_lanes(center_x, slot_w);
-
-                    let mut wick = PathBuilder::stroke(px(1.));
-                    wick.move_to(origin_point(px(center_x), px(high_y), origin));
-                    wick.line_to(origin_point(px(center_x), px(low_y), origin));
-                    if let Ok(path) = wick.build() {
-                        window.paint_path(path, color);
+                    CandleType::Area => {
+                        // Area chart draws a line + fill after the loop; skip per-candle rendering.
                     }
-
-                    let (top, bottom) = if is_bullish {
-                        (close_y, open_y)
-                    } else {
-                        (open_y, close_y)
-                    };
-                    let bottom = bottom.max(top + 1.0); // ensure doji is visible
-                    let lane_left = lanes.candle_left + 1.0;
-                    let lane_right = (lanes.candle_right - 1.0).max(lane_left + 1.0);
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            origin_point(px(lane_left), px(top), origin),
-                            origin_point(px(lane_right), px(bottom), origin),
-                        ),
-                        color,
-                    ));
-                }
-                CandleType::HeikinAshi => {
-                    // Same as Solid, but data is transformed externally.
-                    // Wick (always drawn as a line).
-                    let mut wick = PathBuilder::stroke(px(1.));
-                    wick.move_to(origin_point(px(center_x), px(high_y), origin));
-                    wick.line_to(origin_point(px(center_x), px(low_y), origin));
-                    if let Ok(path) = wick.build() {
-                        window.paint_path(path, color);
-                    }
-
-                    // Body.
-                    let (top, bottom) = if is_bullish {
-                        (close_y, open_y)
-                    } else {
-                        (open_y, close_y)
-                    };
-                    let bottom = bottom.max(top + 1.0); // ensure doji is visible
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            origin_point(px(body_left), px(top), origin),
-                            origin_point(px(body_right), px(bottom), origin),
-                        ),
-                        color,
-                    ));
-                }
-                CandleType::Ohlc => {
-                    // OHLC bar: vertical high-low line + left tick at open + right tick at close.
-                    let tick_len = body_w / 2.0;
-
-                    // Vertical high-low line.
-                    let mut hl = PathBuilder::stroke(px(1.));
-                    hl.move_to(origin_point(px(center_x), px(high_y), origin));
-                    hl.line_to(origin_point(px(center_x), px(low_y), origin));
-                    if let Ok(p) = hl.build() {
-                        window.paint_path(p, color);
-                    }
-
-                    // Left tick at open.
-                    let mut ot = PathBuilder::stroke(px(1.));
-                    ot.move_to(origin_point(px(center_x - tick_len), px(open_y), origin));
-                    ot.line_to(origin_point(px(center_x), px(open_y), origin));
-                    if let Ok(p) = ot.build() {
-                        window.paint_path(p, color);
-                    }
-
-                    // Right tick at close.
-                    let mut ct = PathBuilder::stroke(px(1.));
-                    ct.move_to(origin_point(px(center_x), px(close_y), origin));
-                    ct.line_to(origin_point(px(center_x + tick_len), px(close_y), origin));
-                    if let Ok(p) = ct.build() {
-                        window.paint_path(p, color);
-                    }
-                }
-                CandleType::Solid
-                | CandleType::Stroke
-                | CandleType::UpStroke
-                | CandleType::DownStroke => {
-                    // Determine whether body should be filled or stroked.
-                    let use_stroke = match candle_type {
-                        CandleType::Stroke => true,
-                        CandleType::UpStroke => is_bullish,
-                        CandleType::DownStroke => !is_bullish,
-                        _ => false, // Solid
-                    };
-
-                    // Body.
-                    let (top, bottom) = if is_bullish {
-                        (close_y, open_y)
-                    } else {
-                        (open_y, close_y)
-                    };
-                    let bottom = bottom.max(top + 1.0); // ensure doji is visible
-
-                    // Wick (always drawn as a line).
-                    // If hollow, don't draw the wick *through* the body.
-                    if use_stroke {
-                        let mut top_wick = PathBuilder::stroke(px(1.));
-                        top_wick.move_to(origin_point(px(center_x), px(high_y), origin));
-                        top_wick.line_to(origin_point(px(center_x), px(top), origin));
-                        if let Ok(path) = top_wick.build() {
-                            window.paint_path(path, color);
-                        }
-                        
-                        let mut bot_wick = PathBuilder::stroke(px(1.));
-                        bot_wick.move_to(origin_point(px(center_x), px(bottom), origin));
-                        bot_wick.line_to(origin_point(px(center_x), px(low_y), origin));
-                        if let Ok(path) = bot_wick.build() {
-                            window.paint_path(path, color);
-                        }
-                    } else {
+                    CandleType::HeikinAshi => {
+                        // Same as Solid, but data is transformed externally.
+                        // Wick (always drawn as a line).
                         let mut wick = PathBuilder::stroke(px(1.));
                         wick.move_to(origin_point(px(center_x), px(high_y), origin));
                         wick.line_to(origin_point(px(center_x), px(low_y), origin));
                         if let Ok(path) = wick.build() {
                             window.paint_path(path, color);
                         }
-                    }
 
-                    if use_stroke {
-                        // Stroked (hollow) body.
-                        let mut body = PathBuilder::stroke(px(1.));
-                        body.move_to(origin_point(px(body_left), px(top), origin));
-                        body.line_to(origin_point(px(body_right), px(top), origin));
-                        body.line_to(origin_point(px(body_right), px(bottom), origin));
-                        body.line_to(origin_point(px(body_left), px(bottom), origin));
-                        body.line_to(origin_point(px(body_left), px(top), origin));
-                        if let Ok(p) = body.build() {
-                            window.paint_path(p, color);
-                        }
-                    } else {
-                        // Filled body.
+                        // Body.
+                        let (top, bottom) = if is_bullish {
+                            (close_y, open_y)
+                        } else {
+                            (open_y, close_y)
+                        };
+                        let bottom = bottom.max(top + 1.0); // ensure doji is visible
                         window.paint_quad(fill(
                             Bounds::from_corners(
                                 origin_point(px(body_left), px(top), origin),
@@ -1098,7 +957,101 @@ where
                             color,
                         ));
                     }
-                }
+                    CandleType::Ohlc => {
+                        // OHLC bar: vertical high-low line + left tick at open + right tick at close.
+                        let tick_len = body_w / 2.0;
+
+                        // Vertical high-low line.
+                        let mut hl = PathBuilder::stroke(px(1.));
+                        hl.move_to(origin_point(px(center_x), px(high_y), origin));
+                        hl.line_to(origin_point(px(center_x), px(low_y), origin));
+                        if let Ok(p) = hl.build() {
+                            window.paint_path(p, color);
+                        }
+
+                        // Left tick at open.
+                        let mut ot = PathBuilder::stroke(px(1.));
+                        ot.move_to(origin_point(px(center_x - tick_len), px(open_y), origin));
+                        ot.line_to(origin_point(px(center_x), px(open_y), origin));
+                        if let Ok(p) = ot.build() {
+                            window.paint_path(p, color);
+                        }
+
+                        // Right tick at close.
+                        let mut ct = PathBuilder::stroke(px(1.));
+                        ct.move_to(origin_point(px(center_x), px(close_y), origin));
+                        ct.line_to(origin_point(px(center_x + tick_len), px(close_y), origin));
+                        if let Ok(p) = ct.build() {
+                            window.paint_path(p, color);
+                        }
+                    }
+                    CandleType::Solid
+                    | CandleType::Stroke
+                    | CandleType::UpStroke
+                    | CandleType::DownStroke => {
+                        // Determine whether body should be filled or stroked.
+                        let use_stroke = match candle_type {
+                            CandleType::Stroke => true,
+                            CandleType::UpStroke => is_bullish,
+                            CandleType::DownStroke => !is_bullish,
+                            _ => false, // Solid
+                        };
+
+                        // Body.
+                        let (top, bottom) = if is_bullish {
+                            (close_y, open_y)
+                        } else {
+                            (open_y, close_y)
+                        };
+                        let bottom = bottom.max(top + 1.0); // ensure doji is visible
+
+                        // Wick (always drawn as a line).
+                        // If hollow, don't draw the wick *through* the body.
+                        if use_stroke {
+                            let mut top_wick = PathBuilder::stroke(px(1.));
+                            top_wick.move_to(origin_point(px(center_x), px(high_y), origin));
+                            top_wick.line_to(origin_point(px(center_x), px(top), origin));
+                            if let Ok(path) = top_wick.build() {
+                                window.paint_path(path, color);
+                            }
+
+                            let mut bot_wick = PathBuilder::stroke(px(1.));
+                            bot_wick.move_to(origin_point(px(center_x), px(bottom), origin));
+                            bot_wick.line_to(origin_point(px(center_x), px(low_y), origin));
+                            if let Ok(path) = bot_wick.build() {
+                                window.paint_path(path, color);
+                            }
+                        } else {
+                            let mut wick = PathBuilder::stroke(px(1.));
+                            wick.move_to(origin_point(px(center_x), px(high_y), origin));
+                            wick.line_to(origin_point(px(center_x), px(low_y), origin));
+                            if let Ok(path) = wick.build() {
+                                window.paint_path(path, color);
+                            }
+                        }
+
+                        if use_stroke {
+                            // Stroked (hollow) body.
+                            let mut body = PathBuilder::stroke(px(1.));
+                            body.move_to(origin_point(px(body_left), px(top), origin));
+                            body.line_to(origin_point(px(body_right), px(top), origin));
+                            body.line_to(origin_point(px(body_right), px(bottom), origin));
+                            body.line_to(origin_point(px(body_left), px(bottom), origin));
+                            body.line_to(origin_point(px(body_left), px(top), origin));
+                            if let Ok(p) = body.build() {
+                                window.paint_path(p, color);
+                            }
+                        } else {
+                            // Filled body.
+                            window.paint_quad(fill(
+                                Bounds::from_corners(
+                                    origin_point(px(body_left), px(top), origin),
+                                    origin_point(px(body_right), px(bottom), origin),
+                                ),
+                                color,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1141,149 +1094,32 @@ where
             }
         }
 
-        // Bid × ask footprint cells. BidAsk mode paints one volume-tinted lane
-        // on each side of the narrow candle lane; Delta/Volume modes fall back
-        // to a single centered cell across the whole cluster.
-        if !self.footprint_cells.is_empty() {
-            let poc_color: Hsla = gpui::rgb(0xf0b90b).into();
-            for cell in &self.footprint_cells {
-                if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
-                    continue;
-                }
-                let Some(&center_x) = ts_to_x.get(&cell.timestamp_ms) else {
-                    continue;
-                };
-                if center_x < -slot_w || center_x > chart_w + slot_w {
-                    continue;
-                }
-                let y_top = origin.y + px(y_scale.scale(cell.price_high));
-                let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
-                let top = y_top.min(y_bottom);
-                let bottom = y_top.max(y_bottom);
-
-                let lanes = footprint_lanes(center_x, slot_w);
-                let cluster_left = origin.x + px(lanes.cluster_left);
-                let cluster_right = origin.x + px(lanes.cluster_right);
-                let cluster_bounds = Bounds::from_corners(
-                    gpui::point(cluster_left, top),
-                    gpui::point(cluster_right, bottom),
-                );
-
-                if !cell.left_text.is_empty() || !cell.right_text.is_empty() {
-                    // Two tinted volume lanes around the candle lane.
-                    let bid_bounds = Bounds::from_corners(
-                        gpui::point(origin.x + px(lanes.bid_left), top),
-                        gpui::point(origin.x + px(lanes.bid_right), bottom),
-                    );
-                    let ask_bounds = Bounds::from_corners(
-                        gpui::point(origin.x + px(lanes.ask_left), top),
-                        gpui::point(origin.x + px(lanes.ask_right), bottom),
-                    );
-                    window.paint_quad(fill(bid_bounds, cell.bid_background));
-                    window.paint_quad(fill(ask_bounds, cell.ask_background));
-
-                    let left_w = cell.left_text.len() as f32 * CHAR_WIDTH_EST;
-                    let right_w = cell.right_text.len() as f32 * CHAR_WIDTH_EST;
-                    if !cell.left_text.is_empty() && left_w + 4.0 <= lanes.lane_w {
-                        paint_text_line_centered(
-                            cell.left_text.clone(),
-                            cell.left_color,
-                            bid_bounds,
-                            window,
-                            cx,
-                        );
-                    }
-                    if !cell.right_text.is_empty() && right_w + 4.0 <= lanes.lane_w {
-                        paint_text_line_centered(
-                            cell.right_text.clone(),
-                            cell.right_color,
-                            ask_bounds,
-                            window,
-                            cx,
-                        );
-                    }
-                } else {
-                    // Delta/Volume: one cell across the cluster.
-                    window.paint_quad(fill(cluster_bounds, cell.background));
-                    let single_w = cell.single_text.len() as f32 * CHAR_WIDTH_EST;
-                    if !cell.single_text.is_empty()
-                        && single_w + 4.0 <= (lanes.cluster_right - lanes.cluster_left)
-                    {
-                        paint_text_line_centered(
-                            cell.single_text.clone(),
-                            cell.single_color,
-                            cluster_bounds,
-                            window,
-                            cx,
-                        );
-                    }
-                }
-
-                if cell.is_poc {
-                    // One border around the whole cluster, not per lane.
-                    let mut border = PathBuilder::stroke(px(1.0));
-                    border.move_to(cluster_bounds.origin);
-                    border.line_to(gpui::point(cluster_right, cluster_bounds.origin.y));
-                    border.line_to(gpui::point(
-                        cluster_right,
-                        cluster_bounds.origin.y + cluster_bounds.size.height,
-                    ));
-                    border.line_to(gpui::point(
-                        cluster_left,
-                        cluster_bounds.origin.y + cluster_bounds.size.height,
-                    ));
-                    border.close();
-                    if let Ok(path) = border.build() {
-                        window.paint_path(path, poc_color);
-                    }
-                }
-
-                if cell.is_vah || cell.is_val {
-                    let y = if cell.is_vah {
-                        top
-                    } else {
-                        bottom - px(1.0)
-                    };
-                    let mut line = PathBuilder::stroke(px(1.0));
-                    line.move_to(gpui::point(cluster_left, y));
-                    line.line_to(gpui::point(cluster_right, y));
-                    if let Ok(path) = line.build() {
-                        window.paint_path(path, cx.theme().muted_foreground.opacity(0.8));
-                    }
-                }
-
-                if cell.imbalance != 0 {
-                    let stripe_w = px(2.0);
-                    let stripe_x = origin.x + px(imbalance_stripe_left(&lanes, cell.imbalance));
-                    let stripe = Bounds::from_corners(
-                        gpui::point(stripe_x, top),
-                        gpui::point(stripe_x + stripe_w, bottom),
-                    );
-                    let color = if cell.imbalance > 0 {
-                        bullish_color
-                    } else {
-                        bearish_color
-                    };
-                    window.paint_quad(fill(stripe, color.opacity(0.9)));
-                }
-            }
-        }
-
         // ------------------------------------------------------------------ //
-                // ------------------------------------------------------------------ //
+        // ------------------------------------------------------------------ //
         // Custom indicator lines
         // ------------------------------------------------------------------ //
-        
-        let mut grouped_lines: std::collections::HashMap<PaneTarget, Vec<&(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)>> = std::collections::HashMap::new();
+
+        let mut grouped_lines: std::collections::HashMap<
+            PaneTarget,
+            Vec<&(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)>,
+        > = std::collections::HashMap::new();
         for line in &self.indicator_lines {
             grouped_lines.entry(line.3).or_default().push(line);
         }
 
         let zero_line_color: Hsla = cx.theme().border.opacity(0.35);
-        let draw_lines = |window: &mut gpui::Window, pane_y0: f32, pane_h: f32, lines: &[&(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)], min_val: f64, max_val: f64| {
+        let draw_lines = |window: &mut gpui::Window,
+                          pane_y0: f32,
+                          pane_h: f32,
+                          lines: &[&(Vec<(i64, f64)>, Hsla, IndicatorStyle, PaneTarget)],
+                          min_val: f64,
+                          max_val: f64| {
             let scale_y = |val: f64| {
-                if (max_val - min_val).abs() < f64::EPSILON { pane_y0 + pane_h / 2.0 }
-                else { pane_y0 + pane_h * (1.0 - (val - min_val) / (max_val - min_val)) as f32 }
+                if (max_val - min_val).abs() < f64::EPSILON {
+                    pane_y0 + pane_h / 2.0
+                } else {
+                    pane_y0 + pane_h * (1.0 - (val - min_val) / (max_val - min_val)) as f32
+                }
             };
 
             // Faint zero line for histogram panes and any pane whose domain
@@ -1303,8 +1139,12 @@ where
                     let mut line_path = gpui::PathBuilder::stroke(gpui::px(1.5));
                     let mut started = false;
                     for &(ts, val) in series {
-                        let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
-                        if px_x < 0.0 || px_x > chart_w || val.is_nan() { continue; }
+                        let Some(&px_x) = ts_to_x.get(&ts) else {
+                            continue;
+                        };
+                        if px_x < 0.0 || px_x > chart_w || val.is_nan() {
+                            continue;
+                        }
                         let y_abs = origin.y.as_f32() + scale_y(val);
                         let x_abs = origin.x.as_f32() + px_x;
                         if !started {
@@ -1324,19 +1164,28 @@ where
                     let bar_w = (slot_w * self.body_width_ratio).clamp(1.0, 10.0);
 
                     for &(ts, val) in series {
-                        let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
-                        if px_x < 0.0 || px_x > chart_w || val.is_nan() { continue; }
+                        let Some(&px_x) = ts_to_x.get(&ts) else {
+                            continue;
+                        };
+                        if px_x < 0.0 || px_x > chart_w || val.is_nan() {
+                            continue;
+                        }
                         let y_abs = scale_y(val);
                         let x_abs = origin.x.as_f32() + px_x - bar_w / 2.0;
 
-                        let bar_color = if val >= 0.0 { bullish_color.opacity(0.5) } else { bearish_color.opacity(0.5) };
+                        let bar_color = if val >= 0.0 {
+                            bullish_color.opacity(0.5)
+                        } else {
+                            bearish_color.opacity(0.5)
+                        };
 
                         let y_top = origin.y.as_f32() + y_abs.min(zero_y);
-                        let y_bottom = origin.y.as_f32() + y_abs.max(zero_y).max(y_abs.min(zero_y) + 1.0);
-                        
+                        let y_bottom =
+                            origin.y.as_f32() + y_abs.max(zero_y).max(y_abs.min(zero_y) + 1.0);
+
                         let bounds = gpui::Bounds::from_corners(
                             gpui::point(gpui::px(x_abs), gpui::px(y_top)),
-                            gpui::point(gpui::px(x_abs + bar_w), gpui::px(y_bottom))
+                            gpui::point(gpui::px(x_abs + bar_w), gpui::px(y_bottom)),
                         );
                         window.paint_quad(gpui::fill(bounds, bar_color));
                     }
@@ -1347,21 +1196,32 @@ where
         let mut subpane_bounds: Vec<(f32, f32, f64, f64)> = Vec::new();
         if self.show_candles {
             if let Some(main_lines) = grouped_lines.get(&PaneTarget::Main) {
-                draw_lines(window, 0.0, candle_h, main_lines, y_domain_min, y_domain_max);
+                draw_lines(
+                    window,
+                    0.0,
+                    candle_h,
+                    main_lines,
+                    y_domain_min,
+                    y_domain_max,
+                );
             }
         }
 
         if has_subpanes {
             for i in 0..self.subpane_count {
                 let mut pane_y0 = candle_h + VOLUME_GAP;
-                for j in 0..i { pane_y0 += avail * subpane_ratios[j] + VOLUME_GAP; }
+                for j in 0..i {
+                    pane_y0 += avail * subpane_ratios[j] + VOLUME_GAP;
+                }
                 let pane_h = avail * subpane_ratios[i];
                 if let Some(lines) = grouped_lines.get(&PaneTarget::Subpane(i)) {
                     let mut p_min = f64::INFINITY;
                     let mut p_max = f64::NEG_INFINITY;
                     for (series, _, style, _) in lines {
                         for &(ts, val) in series {
-                            let Some(&px_x) = ts_to_x.get(&ts) else { continue; };
+                            let Some(&px_x) = ts_to_x.get(&ts) else {
+                                continue;
+                            };
                             if px_x >= 0.0 && px_x <= chart_w && !val.is_nan() {
                                 p_min = p_min.min(val);
                                 p_max = p_max.max(val);
@@ -1372,12 +1232,23 @@ where
                             p_max = p_max.max(0.0);
                         }
                     }
-                    if p_min.is_infinite() { p_min = 0.0; p_max = 100.0; }
-                    if (p_max - p_min).abs() < f64::EPSILON { p_min *= 0.9; p_max *= 1.1; }
+                    if p_min.is_infinite() {
+                        p_min = 0.0;
+                        p_max = 100.0;
+                    }
+                    if (p_max - p_min).abs() < f64::EPSILON {
+                        p_min *= 0.9;
+                        p_max *= 1.1;
+                    }
                     let pad = (p_max - p_min) * 0.1;
                     draw_lines(window, pane_y0, pane_h, lines, p_min - pad, p_max + pad);
-                    subpane_bounds.push((origin.y.as_f32() + pane_y0, pane_h, p_min - pad, p_max + pad));
-                    
+                    subpane_bounds.push((
+                        origin.y.as_f32() + pane_y0,
+                        pane_h,
+                        p_min - pad,
+                        p_max + pad,
+                    ));
+
                     // Separator for every subpane
                     let sep_y = origin.y.as_f32() + pane_y0 - VOLUME_GAP / 2.;
                     if let Some(st) = &self.state {
@@ -1385,8 +1256,13 @@ where
                     }
                     let mut sep = gpui::PathBuilder::stroke(gpui::px(1.));
                     sep.move_to(gpui::point(gpui::px(origin.x.as_f32()), gpui::px(sep_y)));
-                    sep.line_to(gpui::point(gpui::px(origin.x.as_f32() + chart_w), gpui::px(sep_y)));
-                    if let Ok(p) = sep.build() { window.paint_path(p, cx.theme().border); }
+                    sep.line_to(gpui::point(
+                        gpui::px(origin.x.as_f32() + chart_w),
+                        gpui::px(sep_y),
+                    ));
+                    if let Ok(p) = sep.build() {
+                        window.paint_path(p, cx.theme().border);
+                    }
                     if i == 0 {
                         if let Some(st) = &self.state {
                             st.separator_ys.borrow_mut().insert(0, sep_y);
@@ -1575,50 +1451,50 @@ where
         if self.show_volume_pane {
             if let Some(ref vol_fn) = self.volume.clone() {
                 let vols: Vec<f64> = visible.iter().map(|d| vol_fn(d)).collect();
-            let max_vol = vols.iter().cloned().fold(0.0_f64, f64::max);
-            if max_vol > 0.0 {
-                // Separator line.
-                let sep_y = origin.y.as_f32() + (candle_h + VOLUME_GAP) - VOLUME_GAP / 2.;
-                
-                // Save it to state if present for hit-testing the resize handle
-                if let Some(st) = &self.state {
-                    st.separator_ys.borrow_mut().insert(0, sep_y);
-                    st.chart_height.set(Some(full_h));
-                }
-                let mut sep = PathBuilder::stroke(px(1.));
-                sep.move_to(gpui::point(px(origin.x.as_f32()), px(sep_y)));
-                sep.line_to(gpui::point(px(origin.x.as_f32() + chart_w), px(sep_y)));
-                if let Ok(p) = sep.build() {
-                    window.paint_path(p, cx.theme().border);
-                }
+                let max_vol = vols.iter().cloned().fold(0.0_f64, f64::max);
+                if max_vol > 0.0 {
+                    // Separator line.
+                    let sep_y = origin.y.as_f32() + (candle_h + VOLUME_GAP) - VOLUME_GAP / 2.;
 
-                for (i, (d, &vol)) in visible.iter().zip(vols.iter()).enumerate() {
-                    let is_bull =
-                        close_fn(d).to_f64().unwrap_or(0.0) >= open_fn(d).to_f64().unwrap_or(0.0);
-                    let color: Hsla = if is_bull {
-                        bullish_color.opacity(0.5)
-                    } else {
-                        bearish_color.opacity(0.5)
-                    };
-                    let center_x = centres_x
-                        .get(i)
-                        .copied()
-                        .unwrap_or((i as f32 + shift_candles + 0.5) * slot_w);
-                    let pane_h = avail * subpane_ratios[0];
-                    let bar_h = ((vol / max_vol) as f32 * pane_h).max(1.0);
-                    let bx = center_x - body_w / 2.;
-                    let pane_h = avail * subpane_ratios[0];
-                let by = (candle_h + VOLUME_GAP) + (pane_h - bar_h);
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            origin_point(px(bx), px(by), origin),
-                            origin_point(px(bx + body_w), px(by + bar_h), origin),
-                        ),
-                        color,
-                    ));
+                    // Save it to state if present for hit-testing the resize handle
+                    if let Some(st) = &self.state {
+                        st.separator_ys.borrow_mut().insert(0, sep_y);
+                        st.chart_height.set(Some(full_h));
+                    }
+                    let mut sep = PathBuilder::stroke(px(1.));
+                    sep.move_to(gpui::point(px(origin.x.as_f32()), px(sep_y)));
+                    sep.line_to(gpui::point(px(origin.x.as_f32() + chart_w), px(sep_y)));
+                    if let Ok(p) = sep.build() {
+                        window.paint_path(p, cx.theme().border);
+                    }
+
+                    for (i, (d, &vol)) in visible.iter().zip(vols.iter()).enumerate() {
+                        let is_bull = close_fn(d).to_f64().unwrap_or(0.0)
+                            >= open_fn(d).to_f64().unwrap_or(0.0);
+                        let color: Hsla = if is_bull {
+                            bullish_color.opacity(0.5)
+                        } else {
+                            bearish_color.opacity(0.5)
+                        };
+                        let center_x = centres_x
+                            .get(i)
+                            .copied()
+                            .unwrap_or((i as f32 + shift_candles + 0.5) * slot_w);
+                        let pane_h = avail * subpane_ratios[0];
+                        let bar_h = ((vol / max_vol) as f32 * pane_h).max(1.0);
+                        let bx = center_x - body_w / 2.;
+                        let pane_h = avail * subpane_ratios[0];
+                        let by = (candle_h + VOLUME_GAP) + (pane_h - bar_h);
+                        window.paint_quad(fill(
+                            Bounds::from_corners(
+                                origin_point(px(bx), px(by), origin),
+                                origin_point(px(bx + body_w), px(by + bar_h), origin),
+                            ),
+                            color,
+                        ));
+                    }
                 }
             }
-        }
         }
 
         // ------------------------------------------------------------------ //
@@ -1760,7 +1636,7 @@ where
                 );
             }
         }
-        
+
         // Subpane Y-axis labels
         if y_axis_w > 0.0 {
             for (pane_abs_y, pane_h, p_min, p_max) in &subpane_bounds {
@@ -1771,7 +1647,15 @@ where
                     let max_ticks = ((*pane_h as f64) / 40.0).max(2.0_f64);
                     let exponent = (s_range / max_ticks).log10().floor();
                     let fraction = (s_range / max_ticks) / 10_f64.powf(exponent);
-                    let tick_spacing = if fraction < 1.5 { 1.0 } else if fraction < 3.0 { 2.0 } else if fraction < 7.0 { 5.0 } else { 10.0 } * 10_f64.powf(exponent);
+                    let tick_spacing = if fraction < 1.5 {
+                        1.0
+                    } else if fraction < 3.0 {
+                        2.0
+                    } else if fraction < 7.0 {
+                        5.0
+                    } else {
+                        10.0
+                    } * 10_f64.powf(exponent);
                     let mut first_tick = (s_min / tick_spacing).ceil() * tick_spacing;
                     while first_tick <= s_max {
                         s_ticks.push(first_tick);
@@ -1801,7 +1685,6 @@ where
                 }
             }
         }
-
 
         // ------------------------------------------------------------------ //
         // 9. Last-price dashed line + Y-axis price label
@@ -2049,7 +1932,11 @@ where
         if self.show_candles {
             // A. Active Positions
             for (pos_idx, pos) in self.position_overlays.iter().enumerate() {
-                let side_color = if pos.is_long { bullish_color } else { bearish_color };
+                let side_color = if pos.is_long {
+                    bullish_color
+                } else {
+                    bearish_color
+                };
                 // Guard against a missing/zero mark so a fresh position never
                 // renders an absurd P&L while waiting for its first tick.
                 let mark_px = if pos.current_price.is_finite() && pos.current_price > 0.0 {
@@ -2112,9 +1999,12 @@ where
 
                     let badge_w = ((badge_text.len() as f32) * 6.5 + 40.0).clamp(180.0, 380.0);
                     let badge_h = 22.0_f32;
-                    let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
-                    let badge_y = (entry_abs_y - badge_h / 2.0)
-                        .clamp(origin.y.as_f32() + 2.0, origin.y.as_f32() + candle_h - badge_h - 2.0);
+                    let badge_x =
+                        (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let badge_y = (entry_abs_y - badge_h / 2.0).clamp(
+                        origin.y.as_f32() + 2.0,
+                        origin.y.as_f32() + candle_h - badge_h - 2.0,
+                    );
 
                     // Badge background
                     let badge_bounds = Bounds::from_corners(
@@ -2148,7 +2038,11 @@ where
                         gpui::point(px(badge_x + 6.0), px(badge_y)),
                         gpui::point(px(badge_x + badge_w - 24.0), px(badge_y + badge_h)),
                     );
-                    let pnl_color = if pnl >= 0.0 { bullish_color } else { bearish_color };
+                    let pnl_color = if pnl >= 0.0 {
+                        bullish_color
+                    } else {
+                        bearish_color
+                    };
                     paint_text_line(
                         badge_text.into(),
                         gpui::point(px(badge_x + 6.0), px(badge_y + 5.0)),
@@ -2167,13 +2061,7 @@ where
                         gpui::point(px(close_x + close_size), px(close_y + close_size)),
                     );
                     window.paint_quad(fill(close_bounds, rgba(0xffffff22)));
-                    paint_text_line_centered(
-                        "×".into(),
-                        gpui::white(),
-                        close_bounds,
-                        window,
-                        cx,
-                    );
+                    paint_text_line_centered("×".into(), gpui::white(), close_bounds, window, cx);
 
                     // Register close hitbox
                     if let Some(ref st) = self.state {
@@ -2216,7 +2104,8 @@ where
                         pnl_str
                     );
                     let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(140.0, 260.0);
-                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let off_x =
+                        (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let off_bounds = Bounds::from_corners(
                         gpui::point(px(off_x), px(off_y)),
                         gpui::point(px(off_x + off_w), px(off_y + 18.0)),
@@ -2284,7 +2173,11 @@ where
 
             // B. Open Orders
             for (ord_idx, ord) in self.order_overlays.iter().enumerate() {
-                let side_color = if ord.is_long { bullish_color } else { bearish_color };
+                let side_color = if ord.is_long {
+                    bullish_color
+                } else {
+                    bearish_color
+                };
                 let ord_px_y = y_scale.scale(ord.price);
                 let ord_abs_y = origin.y.as_f32() + ord_px_y;
 
@@ -2326,9 +2219,12 @@ where
 
                     let badge_w = ((badge_text.len() as f32) * 6.5 + 36.0).clamp(160.0, 340.0);
                     let badge_h = 20.0_f32;
-                    let badge_x = (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
-                    let badge_y = (ord_abs_y - badge_h / 2.0)
-                        .clamp(origin.y.as_f32() + 2.0, origin.y.as_f32() + candle_h - badge_h - 2.0);
+                    let badge_x =
+                        (origin.x.as_f32() + chart_w - badge_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let badge_y = (ord_abs_y - badge_h / 2.0).clamp(
+                        origin.y.as_f32() + 2.0,
+                        origin.y.as_f32() + candle_h - badge_h - 2.0,
+                    );
 
                     // Badge background
                     let badge_bounds = Bounds::from_corners(
@@ -2380,13 +2276,7 @@ where
                         gpui::point(px(cancel_x + cancel_size), px(cancel_y + cancel_size)),
                     );
                     window.paint_quad(fill(cancel_bounds, rgba(0xffffff22)));
-                    paint_text_line_centered(
-                        "×".into(),
-                        gpui::white(),
-                        cancel_bounds,
-                        window,
-                        cx,
-                    );
+                    paint_text_line_centered("×".into(), gpui::white(), cancel_bounds, window, cx);
 
                     // Register cancel hitbox
                     if let Some(ref st) = self.state {
@@ -2430,7 +2320,8 @@ where
                         self.price_str(ord.price)
                     );
                     let off_w = ((off_text.len() as f32) * 6.5 + 16.0).clamp(130.0, 240.0);
-                    let off_x = (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
+                    let off_x =
+                        (origin.x.as_f32() + chart_w - off_w - 8.0).max(origin.x.as_f32() + 4.0);
                     let off_bounds = Bounds::from_corners(
                         gpui::point(px(off_x), px(off_y)),
                         gpui::point(px(off_x + off_w), px(off_y + 16.0)),
@@ -2788,71 +2679,6 @@ where
             window,
             cx,
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Footprint lane geometry
-// ---------------------------------------------------------------------------
-
-/// Horizontal bounds of one footprint cluster: bid lane | candle lane | ask
-/// lane. All values are pixels relative to the chart origin.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FootprintLanes {
-    bid_left: f32,
-    bid_right: f32,
-    candle_left: f32,
-    candle_right: f32,
-    ask_left: f32,
-    ask_right: f32,
-    lane_w: f32,
-    candle_w: f32,
-    cluster_left: f32,
-    cluster_right: f32,
-}
-
-/// Split a candle slot into the three footprint lanes. The cluster keeps 96%
-/// of the slot, the candle gets 20% of that (clamped so it stays visible on
-/// both very dense and very wide zooms), and the two volume lanes split the
-/// remainder around it.
-fn footprint_lanes(center_x: f32, slot_w: f32) -> FootprintLanes {
-    let cluster_w = (slot_w * 0.96).max(1.0);
-    let candle_w = (cluster_w * 0.20).clamp(2.0, 34.0);
-    let gap = 1.0;
-    let lane_w = ((cluster_w - candle_w - 2.0 * gap) / 2.0).max(1.0);
-
-    let cluster_left = center_x - cluster_w / 2.0;
-    let cluster_right = cluster_left + cluster_w;
-    let bid_left = cluster_left;
-    let bid_right = bid_left + lane_w;
-    let candle_left = bid_right + gap;
-    let candle_right = candle_left + candle_w;
-    let ask_left = candle_right + gap;
-    let ask_right = ask_left + lane_w;
-
-    FootprintLanes {
-        bid_left,
-        bid_right,
-        candle_left,
-        candle_right,
-        ask_left,
-        ask_right,
-        lane_w,
-        candle_w,
-        cluster_left,
-        cluster_right,
-    }
-}
-
-/// X offset (relative to the chart origin) of the 2px imbalance stripe.
-///
-/// `+1` is an ask/buy imbalance and marks the right edge of the ask lane;
-/// `-1` is a bid/sell imbalance and marks the left edge of the bid lane.
-fn imbalance_stripe_left(lanes: &FootprintLanes, imbalance: i8) -> f32 {
-    if imbalance > 0 {
-        lanes.ask_right - 2.0
-    } else {
-        lanes.bid_left
     }
 }
 
@@ -3477,61 +3303,6 @@ mod tests {
     #[test]
     fn resolve_price_range_uses_auto_when_manual_is_none() {
         assert_eq!(resolve_price_range(100.0, 200.0, 5.0, None), (95.0, 205.0));
-    }
-
-    #[test]
-    fn footprint_lanes_are_ordered_and_never_overlap() {
-        for slot_w in [20.0_f32, 64.0, 240.0] {
-            let lanes = footprint_lanes(100.0, slot_w);
-
-            assert!(lanes.cluster_left < lanes.bid_right, "slot {slot_w}");
-            assert!(lanes.bid_right < lanes.candle_left, "slot {slot_w}");
-            assert!(lanes.candle_left < lanes.candle_right, "slot {slot_w}");
-            assert!(lanes.candle_right < lanes.ask_left, "slot {slot_w}");
-            assert!(lanes.ask_left < lanes.ask_right, "slot {slot_w}");
-            assert!(lanes.ask_right <= lanes.cluster_right + 1e-3, "slot {slot_w}");
-
-            assert!((lanes.bid_right - lanes.bid_left - lanes.lane_w).abs() < 1e-3);
-            assert!((lanes.ask_right - lanes.ask_left - lanes.lane_w).abs() < 1e-3);
-            assert!((lanes.candle_right - lanes.candle_left - lanes.candle_w).abs() < 1e-3);
-        }
-    }
-
-    #[test]
-    fn footprint_lanes_keep_cluster_near_full_slot() {
-        for slot_w in [20.0_f32, 64.0, 240.0] {
-            let lanes = footprint_lanes(0.0, slot_w);
-            let cluster_w = lanes.cluster_right - lanes.cluster_left;
-            let expected = (slot_w * 0.96).max(1.0);
-            assert!(
-                (cluster_w - expected).abs() < 1e-3,
-                "slot {slot_w}: cluster {cluster_w} vs {expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn footprint_lanes_stay_sane_across_zoom_range() {
-        for slot_w in (20..=400).step_by(7) {
-            let slot_w = slot_w as f32;
-            let lanes = footprint_lanes(500.0, slot_w);
-            assert!(lanes.lane_w >= 1.0);
-            assert!(lanes.candle_w >= 2.0 && lanes.candle_w <= 34.0);
-            assert!(lanes.bid_left < lanes.ask_right);
-            assert!(lanes.candle_left >= lanes.bid_right);
-            assert!(lanes.ask_left >= lanes.candle_right);
-        }
-    }
-
-    #[test]
-    fn imbalance_stripe_maps_sign_to_side() {
-        let lanes = footprint_lanes(100.0, 64.0);
-
-        // +1 = ask/buy imbalance → right edge of the ask lane.
-        assert_eq!(imbalance_stripe_left(&lanes, 1), lanes.ask_right - 2.0);
-        // -1 = bid/sell imbalance → left edge of the bid lane.
-        assert_eq!(imbalance_stripe_left(&lanes, -1), lanes.bid_left);
-        assert!(imbalance_stripe_left(&lanes, 1) > imbalance_stripe_left(&lanes, -1));
     }
 
     #[test]

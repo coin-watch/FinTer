@@ -20,83 +20,6 @@ impl Default for WindowGeometry {
     }
 }
 
-/// Footprint cell rendering mode.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FootprintMode {
-    /// Bid volume on the left, ask volume on the right.
-    #[default]
-    BidAsk,
-    /// Signed delta only.
-    Delta,
-    /// Total volume only.
-    Volume,
-}
-
-impl FootprintMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::BidAsk => "Bid × Ask",
-            Self::Delta => "Delta",
-            Self::Volume => "Volume",
-        }
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_imbalance_ratio() -> f64 {
-    3.0
-}
-
-fn default_min_row_height() -> f32 {
-    12.0
-}
-
-fn default_ticks_per_row() -> u32 {
-    10
-}
-
-/// Footprint display mode and analytics settings.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FootprintSettings {
-    #[serde(default)]
-    pub mode: FootprintMode,
-    #[serde(default = "default_true")]
-    pub show_poc: bool,
-    #[serde(default = "default_true")]
-    pub show_value_area: bool,
-    #[serde(default = "default_true")]
-    pub show_imbalance: bool,
-    #[serde(default = "default_true")]
-    pub show_summary: bool,
-    #[serde(default = "default_imbalance_ratio")]
-    pub imbalance_ratio: f64,
-    /// Minimum pixel height of a footprint row before rows are merged.
-    #[serde(default = "default_min_row_height")]
-    pub min_row_height: f32,
-    /// Price rows per footprint bucket when the instrument tick size is known.
-    #[serde(default = "default_ticks_per_row")]
-    pub ticks_per_row: u32,
-}
-
-impl Default for FootprintSettings {
-    fn default() -> Self {
-        Self {
-            mode: FootprintMode::BidAsk,
-            show_poc: true,
-            show_value_area: true,
-            show_imbalance: true,
-            show_summary: true,
-            imbalance_ratio: default_imbalance_ratio(),
-            min_row_height: default_min_row_height(),
-            ticks_per_row: default_ticks_per_row(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ChartLayout {
     pub schema_version: u32,
@@ -120,12 +43,6 @@ pub struct ChartLayout {
     /// Anchor for percentage labels when `price_scale_mode == "percent"`.
     #[serde(default)]
     pub percent_anchor: Option<f64>,
-    /// Render the chart as a bid × ask footprint.
-    #[serde(default)]
-    pub show_footprint: bool,
-    /// Footprint display mode, analytics and row density.
-    #[serde(default)]
-    pub footprint: FootprintSettings,
 }
 
 fn default_price_scale_mode() -> String {
@@ -153,8 +70,6 @@ impl ChartLayout {
             price_scale_mode: default_price_scale_mode(),
             manual_price_range: None,
             percent_anchor: None,
-            show_footprint: false,
-            footprint: FootprintSettings::default(),
         }
     }
 }
@@ -448,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_with_legacy_orderflow_fields_still_loads() {
+    fn layout_with_removed_chart_overlay_fields_still_loads() {
         // Layouts written while the chart had order-flow overlays must keep
         // loading after the feature was removed: serde ignores unknown fields.
         let layout = ChartLayout::new("binance", "BTC/USDT", "1m");
@@ -470,39 +385,6 @@ mod tests {
         let parsed: ChartLayout = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.schema_version, 2);
         assert_eq!(parsed.price_scale_mode, "linear");
-    }
-
-    #[test]
-    fn layout_without_footprint_keys_uses_defaults() {
-        let layout = ChartLayout::new("binance", "BTC/USDT", "1m");
-        let mut value = serde_json::to_value(&layout).unwrap();
-        let object = value.as_object_mut().unwrap();
-        object.remove("show_footprint");
-        object.remove("footprint");
-        let parsed: ChartLayout = serde_json::from_value(value).unwrap();
-        assert!(!parsed.show_footprint);
-        assert_eq!(parsed.footprint, FootprintSettings::default());
-        assert_eq!(parsed.footprint.mode, FootprintMode::BidAsk);
-        assert_eq!(parsed.footprint.ticks_per_row, 10);
-    }
-
-    #[test]
-    fn footprint_settings_round_trip() {
-        let mut layout = ChartLayout::new("binance", "BTC/USDT", "1m");
-        layout.show_footprint = true;
-        layout.footprint = FootprintSettings {
-            mode: FootprintMode::Delta,
-            show_poc: false,
-            show_value_area: false,
-            show_imbalance: true,
-            show_summary: false,
-            imbalance_ratio: 4.5,
-            min_row_height: 8.0,
-            ticks_per_row: 25,
-        };
-        let encoded = serde_json::to_vec(&layout).unwrap();
-        let parsed: ChartLayout = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(parsed, layout);
     }
 
     #[test]

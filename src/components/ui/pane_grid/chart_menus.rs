@@ -17,7 +17,6 @@ use super::chart_config::{CANDLE_TYPE_GROUPS, candle_type_label};
 use super::renderer::{PaneGridRenderer, update_pane_config};
 use crate::chart::color::hex_to_hsla;
 use crate::chart::drawings::DrawingTool;
-use crate::chart::model::{FootprintMode, FootprintSettings};
 use crate::components::ui::chart_panel::ChartPanel;
 use crate::components::ui::chart_tools::{ChartPaneBinding, ChartToolKind, open_chart_tool_window};
 
@@ -99,11 +98,6 @@ pub(super) fn render_chart_controls(
     let type_button = {
         let pane = pane.clone();
         let current = chart_type.clone();
-        let chart_for_type = chart.cloned();
-        let grid_for_type = grid.clone();
-        let footprint_settings = chart
-            .map(|chart| chart.read(cx).footprint_settings().clone())
-            .unwrap_or_default();
         Button::new(ElementId::Name(SharedString::from(format!(
             "chart-type-{pane_id}"
         ))))
@@ -134,71 +128,6 @@ pub(super) fn render_chart_controls(
                                     cx,
                                 );
                             }),
-                    );
-                }
-            }
-
-            if current == "footprint" {
-                let Some(chart) = chart_for_type.clone() else {
-                    return menu;
-                };
-                let grid = grid_for_type.clone();
-                let apply = move |next: FootprintSettings, cx: &mut App| {
-                    chart.update(cx, |panel, cx| {
-                        panel.set_footprint_settings(next);
-                        cx.notify();
-                    });
-                    grid.update(cx, |_, cx| cx.notify());
-                };
-
-                menu = menu.separator().label("Footprint mode");
-                for mode in [
-                    FootprintMode::BidAsk,
-                    FootprintMode::Delta,
-                    FootprintMode::Volume,
-                ] {
-                    let mut next = footprint_settings.clone();
-                    next.mode = mode;
-                    let apply = apply.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(mode.label())
-                            .checked(footprint_settings.mode == mode)
-                            .on_click(move |_, _window, cx| apply(next.clone(), cx)),
-                    );
-                }
-
-                menu = menu.separator().label("Ticks / row");
-                for ticks in [1u32, 2, 5, 10, 20, 50] {
-                    let mut next = footprint_settings.clone();
-                    next.ticks_per_row = ticks;
-                    let apply = apply.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!("{ticks} ticks"))
-                            .checked(footprint_settings.ticks_per_row == ticks)
-                            .on_click(move |_, _window, cx| apply(next.clone(), cx)),
-                    );
-                }
-
-                menu = menu.separator();
-                let toggles: [(&str, bool); 4] = [
-                    ("Show POC", footprint_settings.show_poc),
-                    ("Show value area", footprint_settings.show_value_area),
-                    ("Show imbalance", footprint_settings.show_imbalance),
-                    ("Show summary", footprint_settings.show_summary),
-                ];
-                for (index, (label, enabled)) in toggles.into_iter().enumerate() {
-                    let mut next = footprint_settings.clone();
-                    match index {
-                        0 => next.show_poc = !next.show_poc,
-                        1 => next.show_value_area = !next.show_value_area,
-                        2 => next.show_imbalance = !next.show_imbalance,
-                        _ => next.show_summary = !next.show_summary,
-                    }
-                    let apply = apply.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(enabled)
-                            .on_click(move |_, _window, cx| apply(next.clone(), cx)),
                     );
                 }
             }
@@ -548,7 +477,6 @@ fn short_type_label(config: &str) -> &'static str {
         "heikin_ashi" => "Heikin",
         "ohlc" => "OHLC",
         "area" => "Area",
-        "footprint" => "FP",
         _ => "Solid",
     }
 }

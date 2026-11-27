@@ -4,6 +4,12 @@ Automatic update checks and downloads are disabled unless `FINTER_VERSION_URL` i
 
 Updates require explicit user action to download and install. Downloads are bounded, require a SHA-256 checksum from metadata, and are reverified before installation. Installation replaces the current executable; restart remains user-controlled. SHA-256 detects corruption but does not authenticate metadata or publishers. Treat the configured HTTPS update host as trusted code distribution infrastructure; consider adding signed metadata before enabling updates for public releases.
 
+## Footprint chart style removed
+
+The chart Type menu is back to seven candle styles: Solid, Stroke, Up Stroke, Down Stroke, Heikin-Ashi, OHLC, and Area. The footprint renderer, its bid × ask/delta/volume lanes, POC/value-area/imbalance/summary footer, ticks-per-row settings, and the `footprint` live feed and history client have been removed from the desktop app.
+
+Existing layouts still load: `show_footprint` and `footprint` are ignored as unknown keys, and a saved `candle_type: "footprint"` falls back to Solid. The shared gateway `Requirement`/message names remain on the wire for other clients, but FinTer no longer subscribes to the footprint feed. The old footprint entries below are retained as history.
+
 ## Locked price scale and chart panning
 
 The legacy chart's Y/price axis pins on first paint: the initial auto-fit is captured and held instead of re-fitting on every tick, so the price range only changes when the right price rail is dragged (which scales it and unlocks the Y axis) or the axis is double-clicked to re-fit and re-lock. The chart body always pans time; after the first price-rail drag it also pans price vertically.

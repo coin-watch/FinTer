@@ -86,13 +86,6 @@ are drawn.
   and price labels are skipped instead of overpainted. Off-screen alert badges
   cap at three per edge with a `+N` summary, and the axis width is measured from
   price labels only so the countdown never widens it.
-- **Footprint candle style.** `CandleType::Footprint` and `FootprintCellSpec`
-  carry pre-computed cells from FinTer's `chart::footprint` module. Each bar is
-  split into bid lane | narrow candle lane | ask lane by `footprint_lanes`; the
-  candle keeps its wick and body, BidAsk mode tint and label the two volume
-  lanes, and Delta/Volume mode keeps one centered cell. POC borders, VAH/VAL
-  lines, and imbalance stripes span the whole cluster. FinTer builds the cells
-  so the vendored crate stays free of market-data and bar-bucketing logic.
 
 Manual checks on desktop where possible:
 

@@ -30,7 +30,6 @@ use tracing::{debug, error, info, warn};
 use crate::data::client::{service_base_url, tokio_runtime};
 use crate::data::models::OhlcvCandle;
 use crate::data::orderbook::{OrderBook, PriceLevel};
-use crate::data::orderflow_feed::FootprintMessage;
 use crate::data::tick::{TradeSide, UnifiedTick};
 
 // ---------------------------------------------------------------------------
@@ -70,7 +69,10 @@ enum TickerCacheState {
 
 static TICKER_REQUEST_CACHE: OnceLock<Mutex<HashMap<String, TickerCacheState>>> = OnceLock::new();
 
-pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Option<serde_json::Value> {
+pub async fn fetch_ticker_snapshot(
+    config: &BridgeConfig,
+    module: &str,
+) -> Option<serde_json::Value> {
     if config.rest_base_url.trim().is_empty() {
         return None;
     }
@@ -92,7 +94,10 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
                 return Some(val.clone());
             }
             Some(TickerCacheState::InFlight(rx)) => {
-                debug!("gateway: awaiting in-flight ticker snapshot for {}", cache_key);
+                debug!(
+                    "gateway: awaiting in-flight ticker snapshot for {}",
+                    cache_key
+                );
                 (None, rx.clone())
             }
             _ => {
@@ -110,7 +115,9 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
             .flatten()
             .map(|s| s.access_token)
             .or_else(|| config.access_token.clone());
-        let mut req = reqwest::Client::new().get(&url).header("Origin", &config.rest_base_url);
+        let mut req = reqwest::Client::new()
+            .get(&url)
+            .header("Origin", &config.rest_base_url);
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
@@ -120,7 +127,10 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
                 let val = resp.json::<serde_json::Value>().await.ok();
                 if let Some(ref v) = val {
                     if v.get("error").and_then(|e| e.as_str()) == Some("insufficient_credits") {
-                        let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("Not enough credits");
+                        let msg = v
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("Not enough credits");
                         let balance = v.get("balance").and_then(|b| b.as_i64()).unwrap_or(0);
                         let required = v.get("required").and_then(|r| r.as_i64()).unwrap_or(0);
                         crate::data::credits::CreditStore::record(
@@ -137,8 +147,13 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
             Ok(resp) => {
                 let status = resp.status();
                 let val: serde_json::Value = resp.json().await.unwrap_or_default();
-                if status.as_u16() == 402 || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-                    let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+                if status.as_u16() == 402
+                    || val.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits")
+                {
+                    let msg = val
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Not enough credits");
                     let balance = val.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
                     let required = val.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
                     crate::data::credits::CreditStore::record(
@@ -148,7 +163,9 @@ pub async fn fetch_ticker_snapshot(config: &BridgeConfig, module: &str) -> Optio
                         required,
                         Some(&config.rest_base_url),
                     );
-                    warn!("gateway: ticker bootstrap returned 402 (insufficient credits) for {module}: {msg}");
+                    warn!(
+                        "gateway: ticker bootstrap returned 402 (insufficient credits) for {module}: {msg}"
+                    );
                 } else {
                     warn!("gateway: ticker bootstrap returned HTTP {}", status);
                 }
@@ -209,8 +226,6 @@ pub struct BridgeConfig {
     pub trades: bool,
     pub orderbook: bool,
     pub kline: bool,
-    /// Subscribe to derived footprint bars for the chart footprint style.
-    pub footprint: bool,
     pub fetch_history: bool,
     /// Trade snapshot size requested at subscribe time.
     pub trade_limit: u32,
@@ -234,7 +249,6 @@ impl BridgeConfig {
             trades: true,
             orderbook: true,
             kline: true,
-            footprint: false,
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
@@ -329,7 +343,6 @@ pub struct Bridge {
     trade_sender: broadcast::Sender<Arc<UnifiedTick>>,
     ob_sender: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_sender: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    footprint_sender: broadcast::Sender<Arc<FootprintMessage>>,
     /// Cached full OHLCV history — replayed to new subscribers immediately.
     last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -354,7 +367,6 @@ impl Bridge {
         let (trade_sender, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (ob_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let (ohlcv_sender, _) = broadcast::channel(OHLCV_BROADCAST_CAPACITY);
-        let (footprint_sender, _) = broadcast::channel(OB_BROADCAST_CAPACITY);
         let cancel_token = CancellationToken::new();
         let last_ohlcv_history: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -367,7 +379,6 @@ impl Bridge {
         let trade_tx = trade_sender.clone();
         let ob_tx = ob_sender.clone();
         let ohlcv_tx = ohlcv_sender.clone();
-        let footprint_tx = footprint_sender.clone();
         let token = cancel_token.clone();
         let history_cache = Arc::clone(&last_ohlcv_history);
         let tick_cache = Arc::clone(&last_tick);
@@ -380,7 +391,6 @@ impl Bridge {
                 trade_tx,
                 ob_tx,
                 ohlcv_tx,
-                footprint_tx,
                 token,
                 history_cache,
                 tick_cache,
@@ -394,7 +404,6 @@ impl Bridge {
             trade_sender,
             ob_sender,
             ohlcv_sender,
-            footprint_sender,
             last_ohlcv_history,
             last_tick,
             last_orderbook,
@@ -462,11 +471,6 @@ impl Bridge {
         rx
     }
 
-    /// Subscribe to derived footprint snapshots for the live in-progress bar.
-    pub fn subscribe_footprint(&self) -> broadcast::Receiver<Arc<FootprintMessage>> {
-        self.footprint_sender.subscribe()
-    }
-
     /// Number of active trade tick subscribers.
     pub fn subscriber_count(&self) -> usize {
         self.tick_sender.receiver_count()
@@ -488,7 +492,6 @@ async fn supervision_loop(
     trade_tx: broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    footprint_tx: broadcast::Sender<Arc<FootprintMessage>>,
     cancel_token: CancellationToken,
     history_cache: Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -513,9 +516,7 @@ async fn supervision_loop(
 
         info!(
             "gateway: connecting to {} ({} {})",
-            ws_url,
-            config.exchange,
-            config.symbol
+            ws_url, config.exchange, config.symbol
         );
 
         match connect_and_stream(
@@ -524,7 +525,6 @@ async fn supervision_loop(
             &trade_tx,
             &ob_tx,
             &ohlcv_tx,
-            &footprint_tx,
             &cancel_token,
             &history_cache,
             &last_tick_cache,
@@ -594,11 +594,6 @@ enum Requirement<'a> {
         timeframe: &'a str,
         lookback: u32,
     },
-    Footprint {
-        exchange: &'a str,
-        symbol: &'a str,
-        timeframe: &'a str,
-    },
 }
 
 #[derive(serde::Serialize)]
@@ -619,7 +614,6 @@ enum StreamChannel {
     Trades,
     Orderbook,
     Ohlcv,
-    Footprint,
 }
 
 impl StreamChannel {
@@ -629,7 +623,6 @@ impl StreamChannel {
             Self::Trades => "trades",
             Self::Orderbook => "orderbook",
             Self::Ohlcv => "kline",
-            Self::Footprint => "footprint",
         }
     }
 
@@ -639,7 +632,6 @@ impl StreamChannel {
             "trades" | "tape" => Some(Self::Trades),
             "orderbook" | "book" => Some(Self::Orderbook),
             "kline" | "ohlcv" | "chart" => Some(Self::Ohlcv),
-            "footprint" => Some(Self::Footprint),
             _ => None,
         }
     }
@@ -654,8 +646,6 @@ fn channel_for_feed(feed: &str) -> Option<StreamChannel> {
         Some(StreamChannel::Orderbook)
     } else if feed.starts_with("ohlcv:") || feed.starts_with("candles:") {
         Some(StreamChannel::Ohlcv)
-    } else if feed.starts_with("footprint:") {
-        Some(StreamChannel::Footprint)
     } else {
         None
     }
@@ -743,16 +733,38 @@ impl<'de> serde::Deserialize<'de> for GatewayMessage {
         };
 
         if let serde_json::Value::Object(map) = value {
-            msg.msg_type = map.get("type").and_then(|v| v.as_str()).map(ToString::to_string);
-            msg.channel = map.get("channel")
+            msg.msg_type = map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            msg.channel = map
+                .get("channel")
                 .or_else(|| map.get("topic"))
                 .or_else(|| map.get("stream"))
                 .and_then(|v| v.as_str())
-                .map(|s| if s == "ohlcv" { "kline".to_string() } else { s.to_string() });
-            msg.exchange = map.get("exchange").and_then(|v| v.as_str()).map(ToString::to_string);
-            msg.symbol = map.get("symbol").and_then(|v| v.as_str()).map(ToString::to_string);
-            msg.timeframe = map.get("timeframe").and_then(|v| v.as_str()).map(ToString::to_string);
-            msg.message = map.get("message").and_then(|v| v.as_str()).map(ToString::to_string);
+                .map(|s| {
+                    if s == "ohlcv" {
+                        "kline".to_string()
+                    } else {
+                        s.to_string()
+                    }
+                });
+            msg.exchange = map
+                .get("exchange")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            msg.symbol = map
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            msg.timeframe = map
+                .get("timeframe")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            msg.message = map
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
 
             // Accept "data" or "payload". If both exist, take whichever is non-null (preferring "data").
             msg.data = match (map.get("data"), map.get("payload")) {
@@ -812,7 +824,6 @@ async fn connect_and_stream(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     cancel_token: &CancellationToken,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
@@ -928,23 +939,9 @@ async fn connect_and_stream(
             .send(Message::Text(serde_json::to_string(&frame)?))
             .await?;
     }
-    if config.footprint {
-        let frame = SubscribeFrame {
-            op: "sub",
-            id: StreamChannel::Footprint.id(),
-            requirement: Requirement::Footprint {
-                exchange: &config.exchange,
-                symbol: &config.symbol,
-                timeframe: &config.timeframe,
-            },
-        };
-        write
-            .send(Message::Text(serde_json::to_string(&frame)?))
-            .await?;
-    }
     debug!(
-        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={}, footprint={})",
-        config.ticker, config.kline, config.orderbook, config.trades, config.footprint
+        "gateway: subscriptions sent (ticker={}, kline={}, orderbook={}, trades={})",
+        config.ticker, config.kline, config.orderbook, config.trades
     );
 
     let mut feed_channels: HashMap<String, StreamChannel> = HashMap::new();
@@ -963,7 +960,6 @@ async fn connect_and_stream(
                     && !config.kline
                     && !config.orderbook
                     && !config.trades
-                    && !config.footprint
                 {
                     continue;
                 }
@@ -991,7 +987,6 @@ async fn connect_and_stream(
                             trade_tx,
                             ob_tx,
                             ohlcv_tx,
-                            footprint_tx,
                             history_cache,
                             last_tick_cache,
                             last_ob_cache,
@@ -1055,7 +1050,6 @@ fn handle_gateway_frame(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
@@ -1109,7 +1103,6 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
-                    footprint_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1154,7 +1147,6 @@ fn handle_gateway_frame(
                     trade_tx,
                     ob_tx,
                     ohlcv_tx,
-                    footprint_tx,
                     history_cache,
                     last_tick_cache,
                     last_ob_cache,
@@ -1167,10 +1159,7 @@ fn handle_gateway_frame(
                 warn!(
                     "gateway: feed {} is stale{}",
                     frame.feed.as_deref().unwrap_or("?"),
-                    frame
-                        .message
-                        .map(|m| format!(": {m}"))
-                        .unwrap_or_default()
+                    frame.message.map(|m| format!(": {m}")).unwrap_or_default()
                 );
             }
             None
@@ -1213,18 +1202,10 @@ fn dispatch_new_data(
     trade_tx: &broadcast::Sender<Arc<UnifiedTick>>,
     ob_tx: &broadcast::Sender<Arc<OrderBook>>,
     ohlcv_tx: &broadcast::Sender<Arc<Vec<OhlcvCandle>>>,
-    footprint_tx: &broadcast::Sender<Arc<FootprintMessage>>,
     history_cache: &Arc<std::sync::Mutex<Option<Arc<Vec<OhlcvCandle>>>>>,
     last_tick_cache: &Arc<std::sync::Mutex<Option<Arc<UnifiedTick>>>>,
     last_ob_cache: &Arc<std::sync::Mutex<Option<Arc<OrderBook>>>>,
 ) {
-    if channel == StreamChannel::Footprint {
-        for message in FootprintMessage::parse_items(&data) {
-            let _ = footprint_tx.send(Arc::new(message));
-        }
-        return;
-    }
-
     let envelope = serde_json::json!({
         "type": "data",
         "channel": channel.id(),
@@ -1323,7 +1304,10 @@ fn handle_message(
                 .or_else(|| target.get("c"))
                 .or_else(|| target.get("price"))
                 .or_else(|| target.get("p"))
-                .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                });
 
             if let Some(price) = price_opt {
                 let raw_ts = target
@@ -1331,14 +1315,21 @@ fn handle_message(
                     .or_else(|| target.get("exchange_ts"))
                     .or_else(|| target.get("t"))
                     .or_else(|| target.get("time"))
-                    .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .unwrap_or_else(|| {
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0)
                     });
-                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
+                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 {
+                    raw_ts * 1000
+                } else {
+                    raw_ts
+                };
                 // Note: ticker push carries 24-hour cumulative market volume,
                 // not an individual trade amount or candle volume.
                 // UnifiedTick.amount represents individual traded amount, so set 0.0 here.
@@ -1353,22 +1344,31 @@ fn handle_message(
                 let open_24h = target
                     .get("open")
                     .or_else(|| target.get("o"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
                 let high_24h = target
                     .get("high")
                     .or_else(|| target.get("h"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
-                let low_24h = target
-                    .get("low")
-                    .or_else(|| target.get("l"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
+                let low_24h = target.get("low").or_else(|| target.get("l")).and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                });
 
                 let change_24h = target
                     .get("changePercent")
                     .or_else(|| target.get("percentage"))
                     .or_else(|| target.get("P"))
                     .or_else(|| target.get("change_24h"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .or_else(|| {
                         let open = open_24h?;
                         if open > 0.0 && price > 0.0 {
@@ -1384,7 +1384,10 @@ fn handle_message(
                     .or_else(|| target.get("volume"))
                     .or_else(|| target.get("base_volume"))
                     .or_else(|| target.get("v"))
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
 
                 tick.change_24h_percent = change_24h;
                 tick.quote_volume_24h = volume_24h;
@@ -1403,10 +1406,18 @@ fn handle_message(
         }
 
         Some("trades") => {
-            let trades_list: Vec<GatewayTrade> = if let Ok(trades) = serde_json::from_value::<Vec<GatewayTrade>>(data.clone()) {
+            let trades_list: Vec<GatewayTrade> = if let Ok(trades) =
+                serde_json::from_value::<Vec<GatewayTrade>>(data.clone())
+            {
                 trades
-            } else if let Some(arr) = data.get("trades").or_else(|| data.get("data")).and_then(|v| v.as_array()) {
-                arr.iter().filter_map(|item| serde_json::from_value::<GatewayTrade>(item.clone()).ok()).collect()
+            } else if let Some(arr) = data
+                .get("trades")
+                .or_else(|| data.get("data"))
+                .and_then(|v| v.as_array())
+            {
+                arr.iter()
+                    .filter_map(|item| serde_json::from_value::<GatewayTrade>(item.clone()).ok())
+                    .collect()
             } else if let Ok(single) = serde_json::from_value::<GatewayTrade>(data.clone()) {
                 vec![single]
             } else {
@@ -1432,7 +1443,11 @@ fn handle_message(
                 };
 
                 let raw_ts = trade.timestamp;
-                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 { raw_ts * 1000 } else { raw_ts };
+                let ts = if raw_ts > 0 && raw_ts < 10_000_000_000 {
+                    raw_ts * 1000
+                } else {
+                    raw_ts
+                };
 
                 let mut tick = UnifiedTick::new(
                     msg.exchange.as_deref().unwrap_or(&config.exchange),
@@ -1458,47 +1473,45 @@ fn handle_message(
             }
         }
 
-        Some("orderbook") => {
-            match serde_json::from_value::<GatewayOrderBook>(data) {
-                Ok(raw) => {
-                    let bids = raw
-                        .bids
-                        .into_iter()
-                        .map(|[p, q]| PriceLevel::new(p, q))
-                        .collect();
-                    let asks = raw
-                        .asks
-                        .into_iter()
-                        .map(|[p, q]| PriceLevel::new(p, q))
-                        .collect();
-                    let ts = raw.timestamp.or(raw.exchange_ts).unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0)
-                    });
-                    let exchange = msg.exchange.unwrap_or_else(|| config.exchange.clone());
-                    let symbol = msg.symbol.unwrap_or_else(|| config.symbol.clone());
-                    let mut book = OrderBook::new(exchange, symbol, bids, asks, ts);
-                    book.nonce = raw.nonce;
-                    let book = Arc::new(book);
-                    if let Ok(mut cache) = last_ob_cache.lock() {
-                        *cache = Some(Arc::clone(&book));
-                    }
-                    if let Some(mid) = book.mid_price() {
-                        if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
-                            if store.get_mark_price(&book.symbol).is_none() {
-                                store.set_mark_price(&book.symbol, mid);
-                            }
+        Some("orderbook") => match serde_json::from_value::<GatewayOrderBook>(data) {
+            Ok(raw) => {
+                let bids = raw
+                    .bids
+                    .into_iter()
+                    .map(|[p, q]| PriceLevel::new(p, q))
+                    .collect();
+                let asks = raw
+                    .asks
+                    .into_iter()
+                    .map(|[p, q]| PriceLevel::new(p, q))
+                    .collect();
+                let ts = raw.timestamp.or(raw.exchange_ts).unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                });
+                let exchange = msg.exchange.unwrap_or_else(|| config.exchange.clone());
+                let symbol = msg.symbol.unwrap_or_else(|| config.symbol.clone());
+                let mut book = OrderBook::new(exchange, symbol, bids, asks, ts);
+                book.nonce = raw.nonce;
+                let book = Arc::new(book);
+                if let Ok(mut cache) = last_ob_cache.lock() {
+                    *cache = Some(Arc::clone(&book));
+                }
+                if let Some(mid) = book.mid_price() {
+                    if let Ok(mut store) = crate::data::trade_store::TradeStore::global().lock() {
+                        if store.get_mark_price(&book.symbol).is_none() {
+                            store.set_mark_price(&book.symbol, mid);
                         }
                     }
-                    if ob_tx.receiver_count() > 0 {
-                        let _ = ob_tx.send(book);
-                    }
                 }
-                Err(e) => warn!("gateway: orderbook data parse error: {e}"),
+                if ob_tx.receiver_count() > 0 {
+                    let _ = ob_tx.send(book);
+                }
             }
-        }
+            Err(e) => warn!("gateway: orderbook data parse error: {e}"),
+        },
 
         Some("kline") | Some("ohlcv") => {
             let candles = parse_kline_payload(&data);
@@ -1511,7 +1524,10 @@ fn handle_message(
                 let arc = Arc::new(candles);
                 let _ = ohlcv_tx.send(arc);
             } else {
-                warn!("gateway: kline data parse produced 0 candles from: {:?}", data);
+                warn!(
+                    "gateway: kline data parse produced 0 candles from: {:?}",
+                    data
+                );
             }
         }
 
@@ -1563,19 +1579,47 @@ fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
 
     if let Some(arr) = val.as_array() {
         if arr.len() >= 5 {
-            let t = arr[0].as_i64().or_else(|| arr[0].as_str().and_then(|s| s.parse().ok()))?;
-            let o = arr[1].as_f64().or_else(|| arr[1].as_str().and_then(|s| s.parse().ok()))?;
-            let h = arr[2].as_f64().or_else(|| arr[2].as_str().and_then(|s| s.parse().ok()))?;
-            let l = arr[3].as_f64().or_else(|| arr[3].as_str().and_then(|s| s.parse().ok()))?;
-            let c = arr[4].as_f64().or_else(|| arr[4].as_str().and_then(|s| s.parse().ok()))?;
-            let v = arr.get(5).and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0);
-            let timestamp = if t > 0 && t < 10_000_000_000 { t * 1000 } else { t };
-            return Some(OhlcvCandle { timestamp, open: o, high: h, low: l, close: c, volume: v });
+            let t = arr[0]
+                .as_i64()
+                .or_else(|| arr[0].as_str().and_then(|s| s.parse().ok()))?;
+            let o = arr[1]
+                .as_f64()
+                .or_else(|| arr[1].as_str().and_then(|s| s.parse().ok()))?;
+            let h = arr[2]
+                .as_f64()
+                .or_else(|| arr[2].as_str().and_then(|s| s.parse().ok()))?;
+            let l = arr[3]
+                .as_f64()
+                .or_else(|| arr[3].as_str().and_then(|s| s.parse().ok()))?;
+            let c = arr[4]
+                .as_f64()
+                .or_else(|| arr[4].as_str().and_then(|s| s.parse().ok()))?;
+            let v = arr
+                .get(5)
+                .and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0.0);
+            let timestamp = if t > 0 && t < 10_000_000_000 {
+                t * 1000
+            } else {
+                t
+            };
+            return Some(OhlcvCandle {
+                timestamp,
+                open: o,
+                high: h,
+                low: l,
+                close: c,
+                volume: v,
+            });
         }
     }
 
     if let Some(obj) = val.as_object() {
-        let t_val = obj.get("open_time")
+        let t_val = obj
+            .get("open_time")
             .or_else(|| obj.get("t"))
             .or_else(|| obj.get("timestamp"))
             .or_else(|| obj.get("time"))?;
@@ -1584,18 +1628,43 @@ fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
         let l_val = obj.get("l").or_else(|| obj.get("low"))?;
         let c_val = obj.get("c").or_else(|| obj.get("close"))?;
 
-        let t = t_val.as_i64().or_else(|| t_val.as_str().and_then(|s| s.parse().ok()))?;
-        let o = o_val.as_f64().or_else(|| o_val.as_str().and_then(|s| s.parse().ok()))?;
-        let h = h_val.as_f64().or_else(|| h_val.as_str().and_then(|s| s.parse().ok()))?;
-        let l = l_val.as_f64().or_else(|| l_val.as_str().and_then(|s| s.parse().ok()))?;
-        let c = c_val.as_f64().or_else(|| c_val.as_str().and_then(|s| s.parse().ok()))?;
-        let v = obj.get("v")
+        let t = t_val
+            .as_i64()
+            .or_else(|| t_val.as_str().and_then(|s| s.parse().ok()))?;
+        let o = o_val
+            .as_f64()
+            .or_else(|| o_val.as_str().and_then(|s| s.parse().ok()))?;
+        let h = h_val
+            .as_f64()
+            .or_else(|| h_val.as_str().and_then(|s| s.parse().ok()))?;
+        let l = l_val
+            .as_f64()
+            .or_else(|| l_val.as_str().and_then(|s| s.parse().ok()))?;
+        let c = c_val
+            .as_f64()
+            .or_else(|| c_val.as_str().and_then(|s| s.parse().ok()))?;
+        let v = obj
+            .get("v")
             .or_else(|| obj.get("volume"))
-            .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|x| {
+                x.as_f64()
+                    .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0.0);
 
-        let timestamp = if t > 0 && t < 10_000_000_000 { t * 1000 } else { t };
-        return Some(OhlcvCandle { timestamp, open: o, high: h, low: l, close: c, volume: v });
+        let timestamp = if t > 0 && t < 10_000_000_000 {
+            t * 1000
+        } else {
+            t
+        };
+        return Some(OhlcvCandle {
+            timestamp,
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: v,
+        });
     }
 
     None
@@ -1604,7 +1673,11 @@ fn parse_single_candle(val: &serde_json::Value) -> Option<OhlcvCandle> {
 fn parse_kline_payload(data: &serde_json::Value) -> Vec<OhlcvCandle> {
     let mut out = Vec::new();
 
-    if let Some(arr) = data.get("ohlcv").or_else(|| data.get("klines")).and_then(|v| v.as_array()) {
+    if let Some(arr) = data
+        .get("ohlcv")
+        .or_else(|| data.get("klines"))
+        .and_then(|v| v.as_array())
+    {
         for item in arr {
             if let Some(candle) = parse_single_candle(item) {
                 out.push(candle);
@@ -1736,7 +1809,10 @@ async fn refresh_session_token(config: &BridgeConfig) -> Option<String> {
     Some(access_token)
 }
 
-pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> anyhow::Result<Vec<OhlcvCandle>> {
+pub async fn fetch_ohlcv_history(
+    config: &BridgeConfig,
+    until: Option<i64>,
+) -> anyhow::Result<Vec<OhlcvCandle>> {
     if config.rest_base_url.trim().is_empty() {
         anyhow::bail!("No API service URL configured");
     }
@@ -1750,10 +1826,13 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
         .flatten()
         .map(|session| session.access_token)
         .or_else(|| config.access_token.clone());
-    let token_digest = token.as_deref().map(|value| {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(value.as_bytes()))
-    }).unwrap_or_else(|| "anonymous".to_string());
+    let token_digest = token
+        .as_deref()
+        .map(|value| {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(value.as_bytes()))
+        })
+        .unwrap_or_else(|| "anonymous".to_string());
     let cache_key = format!("{token_digest}:{url}");
     if let Ok(mut cache) = history_request_cache().lock() {
         cache.retain(|_, entry| entry.expires_at > Instant::now());
@@ -1786,8 +1865,13 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
     if !response.status().is_success() {
         let status = response.status();
         let error: serde_json::Value = response.json().await.unwrap_or_default();
-        let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("Market data request failed");
-        if status.as_u16() == 402 || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Market data request failed");
+        if status.as_u16() == 402
+            || error.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits")
+        {
             let balance = error.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
             let required = error.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
             crate::data::credits::CreditStore::record(
@@ -1797,15 +1881,23 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
                 required,
                 Some(&config.rest_base_url),
             );
-            anyhow::bail!("Insufficient credits: {} (balance {}, required {}). Manage credits at {}/account/credits", message,
-                balance, required, config.rest_base_url);
+            anyhow::bail!(
+                "Insufficient credits: {} (balance {}, required {}). Manage credits at {}/account/credits",
+                message,
+                balance,
+                required,
+                config.rest_base_url
+            );
         }
         anyhow::bail!("OHLCV history fetch failed: HTTP {}: {}", status, message);
     }
 
     let value: serde_json::Value = response.json().await?;
     if value.get("error").and_then(|v| v.as_str()) == Some("insufficient_credits") {
-        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("Not enough credits");
+        let message = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Not enough credits");
         let balance = value.get("balance").and_then(|v| v.as_i64()).unwrap_or(0);
         let required = value.get("required").and_then(|v| v.as_i64()).unwrap_or(0);
         crate::data::credits::CreditStore::record(
@@ -1824,13 +1916,31 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
         for k in klines {
             if let (Some(t_val), Some(o), Some(h), Some(l), Some(c), Some(v)) = (
                 k.get("t"),
-                k.get("o").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))),
-                k.get("h").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))),
-                k.get("l").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))),
-                k.get("c").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))),
-                k.get("v").and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))),
+                k.get("o").and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                }),
+                k.get("h").and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                }),
+                k.get("l").and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                }),
+                k.get("c").and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                }),
+                k.get("v").and_then(|x| {
+                    x.as_f64()
+                        .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                }),
             ) {
-                let raw_t = t_val.as_i64().or_else(|| t_val.as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
+                let raw_t = t_val
+                    .as_i64()
+                    .or_else(|| t_val.as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0);
                 let timestamp = if raw_t > 0 && raw_t < 10_000_000_000 {
                     raw_t * 1000
                 } else {
@@ -1847,28 +1957,43 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
             }
         }
     } else {
-        let raw = value.get("data").cloned()
+        let raw = value
+            .get("data")
+            .cloned()
             .or_else(|| value.get("candles").cloned())
             .unwrap_or_else(|| value.clone());
         // CoinWatch also returns compact tuple candles: [timestamp, open, high, low, close, volume].
         if let Some(rows) = raw.as_array() {
-            candles = rows.iter().filter_map(|row| {
-                let values = row.as_array()?;
-                if values.len() < 6 { return None; }
-                let number = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
-                let raw_timestamp = values[0].as_i64()
-                    .or_else(|| values[0].as_u64().map(|v| v as i64))
-                    .or_else(|| values[0].as_str().and_then(|s| s.parse().ok()))?;
-                let timestamp = if raw_timestamp > 0 && raw_timestamp < 10_000_000_000 { raw_timestamp * 1000 } else { raw_timestamp };
-                Some(OhlcvCandle {
-                    timestamp,
-                    open: number(&values[1])?,
-                    high: number(&values[2])?,
-                    low: number(&values[3])?,
-                    close: number(&values[4])?,
-                    volume: number(&values[5])?,
+            candles = rows
+                .iter()
+                .filter_map(|row| {
+                    let values = row.as_array()?;
+                    if values.len() < 6 {
+                        return None;
+                    }
+                    let number = |v: &serde_json::Value| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    };
+                    let raw_timestamp = values[0]
+                        .as_i64()
+                        .or_else(|| values[0].as_u64().map(|v| v as i64))
+                        .or_else(|| values[0].as_str().and_then(|s| s.parse().ok()))?;
+                    let timestamp = if raw_timestamp > 0 && raw_timestamp < 10_000_000_000 {
+                        raw_timestamp * 1000
+                    } else {
+                        raw_timestamp
+                    };
+                    Some(OhlcvCandle {
+                        timestamp,
+                        open: number(&values[1])?,
+                        high: number(&values[2])?,
+                        low: number(&values[3])?,
+                        close: number(&values[4])?,
+                        volume: number(&values[5])?,
+                    })
                 })
-            }).collect();
+                .collect();
         }
         if candles.is_empty() {
             if let Ok(parsed) = serde_json::from_value::<Vec<OhlcvCandle>>(raw) {
@@ -1879,14 +2004,28 @@ pub async fn fetch_ohlcv_history(config: &BridgeConfig, until: Option<i64>) -> a
 
     // A normal latest snapshot can be reused for five minutes; time-bounded
     // chart gap-recovery history is intentionally kept for only 15 seconds.
-    let ttl = if until.is_some() { Duration::from_secs(15) } else { Duration::from_secs(300) };
+    let ttl = if until.is_some() {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(300)
+    };
     if let Ok(mut cache) = history_request_cache().lock() {
         if cache.len() >= HISTORY_CACHE_MAX_ENTRIES {
-            if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.expires_at).map(|(key, _)| key.clone()) {
+            if let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+            {
                 cache.remove(&oldest);
             }
         }
-        cache.insert(cache_key, HistoryCacheEntry { candles: candles.clone(), expires_at: Instant::now() + ttl });
+        cache.insert(
+            cache_key,
+            HistoryCacheEntry {
+                candles: candles.clone(),
+                expires_at: Instant::now() + ttl,
+            },
+        );
     }
     Ok(candles)
 }
@@ -1912,7 +2051,6 @@ mod tests {
             trades: true,
             orderbook: true,
             kline: true,
-            footprint: false,
             fetch_history: true,
             trade_limit: 100,
             trade_since_current_bar: false,
@@ -1937,7 +2075,6 @@ mod tests {
         let (trades, mut trade_rx) = broadcast::channel(16);
         let (books, _) = broadcast::channel(16);
         let (candles, mut candle_rx) = broadcast::channel(16);
-        let (footprints, mut footprint_rx) = broadcast::channel(16);
         let history = Arc::new(std::sync::Mutex::new(None));
         let last_tick = Arc::new(std::sync::Mutex::new(None));
         let last_book = Arc::new(std::sync::Mutex::new(None));
@@ -1956,7 +2093,6 @@ mod tests {
                 &trades,
                 &books,
                 &candles,
-                &footprints,
                 &history,
                 &last_tick,
                 &last_book,
@@ -1968,7 +2104,9 @@ mod tests {
             None
         );
         assert_eq!(
-            frame(r#"{"op":"delta","feed":"ticker:binance:BTC/USDT","seq":2,"data":{"last":110,"open":100,"high":120,"low":90,"quote_volume":1234,"percentage":10}}"#),
+            frame(
+                r#"{"op":"delta","feed":"ticker:binance:BTC/USDT","seq":2,"data":{"last":110,"open":100,"high":120,"low":90,"quote_volume":1234,"percentage":10}}"#
+            ),
             None
         );
         let tick = tick_rx.try_recv().expect("ticker tick");
@@ -1981,7 +2119,9 @@ mod tests {
             None
         );
         assert_eq!(
-            frame(r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":4,"first_seq":3,"last_seq":4,"data":[{"trade_id":"t1","exchange_ts":1700000000000,"side":"buy","price":110,"amount":1},{"trade_id":"t2","exchange_ts":1700000000001,"side":null,"price":111,"amount":2}]}"#),
+            frame(
+                r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":4,"first_seq":3,"last_seq":4,"data":[{"trade_id":"t1","exchange_ts":1700000000000,"side":"buy","price":110,"amount":1},{"trade_id":"t2","exchange_ts":1700000000001,"side":null,"price":111,"amount":2}]}"#
+            ),
             None
         );
         let first = trade_rx.try_recv().expect("trade 1");
@@ -1995,33 +2135,20 @@ mod tests {
             None
         );
         assert_eq!(
-            frame(r#"{"op":"delta","feed":"ohlcv:binance:BTC/USDT:1m","seq":5,"data":{"open_time":1700000060000,"open":110,"high":115,"low":109,"close":114,"volume":12,"timeframe":"1m","is_closed":false,"source":"exchange"}}"#),
+            frame(
+                r#"{"op":"delta","feed":"ohlcv:binance:BTC/USDT:1m","seq":5,"data":{"open_time":1700000060000,"open":110,"high":115,"low":109,"close":114,"volume":12,"timeframe":"1m","is_closed":false,"source":"exchange"}}"#
+            ),
             None
         );
         let candle = candle_rx.try_recv().expect("candle");
         assert_eq!(candle[0].timestamp, 1_700_000_060_000);
         assert!((candle[0].close - 114.0).abs() < f64::EPSILON);
 
-        assert_eq!(
-            frame(
-                r#"{"op":"ack","id":"footprint","feed":"footprint:binance:BTC/USDT:1m","seq":5}"#
-            ),
-            None
-        );
-        assert_eq!(
-            frame(
-                r#"{"op":"delta","feed":"footprint:binance:BTC/USDT:1m","seq":6,"data":{"type":"footprint","timeframe":"1m","bar_start":1700000060000,"bar_end":1700000120000,"rows":[{"price_low":100,"price_high":101,"buy":2,"sell":1,"buy_count":2,"sell_count":1}],"poc":100.5,"vah":101,"val":100,"delta":1,"total_volume":3,"row_size":1,"is_closed":false}}"#
-            ),
-            None
-        );
-        let footprint = footprint_rx.try_recv().expect("footprint");
-        assert_eq!(footprint.bar_start, 1_700_000_060_000);
-        assert_eq!(footprint.rows.len(), 1);
-        assert!(!footprint.is_closed);
-
         // A missing sequence returns the pane id that must be resynced.
         assert_eq!(
-            frame(r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":9,"first_seq":9,"last_seq":9,"data":[]}"#),
+            frame(
+                r#"{"op":"delta","feed":"trades:binance:BTC/USDT","seq":9,"first_seq":9,"last_seq":9,"data":[]}"#
+            ),
             Some("trades".to_string())
         );
     }
@@ -2058,7 +2185,10 @@ mod tests {
         assert!(url.contains("/api/v1/ticker?"), "url={url}");
         assert!(url.contains("exchange=binance"), "url={url}");
         assert!(url.contains("symbol=BTC%2FUSDT"), "url={url}");
-        assert!(url.contains("module=Watchlist%20%C2%B7%20BTC%2FUSDT"), "url={url}");
+        assert!(
+            url.contains("module=Watchlist%20%C2%B7%20BTC%2FUSDT"),
+            "url={url}"
+        );
         assert!(url.ends_with("source=native"), "url={url}");
     }
 
@@ -2205,10 +2335,9 @@ mod tests {
 
     #[test]
     fn gateway_error_parses() {
-        let msg: GatewayMessage = serde_json::from_str(
-            r#"{"type":"error","message":"Unsupported exchange"}"#,
-        )
-        .expect("parse");
+        let msg: GatewayMessage =
+            serde_json::from_str(r#"{"type":"error","message":"Unsupported exchange"}"#)
+                .expect("parse");
         assert_eq!(msg.msg_type.as_deref(), Some("error"));
         assert_eq!(msg.message.as_deref(), Some("Unsupported exchange"));
     }
@@ -2221,7 +2350,8 @@ mod tests {
             "data":{"symbol":"BTC-USDT","timestamp":1792380983006,"datetime":"2026-10-19T03:36:23.006Z","open":81844.39,"high":82817.1,"low":81000.0,"close":82500.0,"last":82500.0},
             "data":{"symbol":"BTC-USDT","last":82500.0}
         }"#;
-        let msg: GatewayMessage = serde_json::from_str(json).expect("parse with duplicate data field");
+        let msg: GatewayMessage =
+            serde_json::from_str(json).expect("parse with duplicate data field");
         assert_eq!(msg.channel.as_deref(), Some("ticker"));
         assert!(msg.data.is_some());
     }
@@ -2233,7 +2363,8 @@ mod tests {
             "payload":{"symbol":"BTC-USDT","last":82500.0},
             "data":{"symbol":"BTC-USDT","timestamp":1792380983006,"last":82500.0}
         }"#;
-        let msg: GatewayMessage = serde_json::from_str(json).expect("parse with both data and payload");
+        let msg: GatewayMessage =
+            serde_json::from_str(json).expect("parse with both data and payload");
         assert_eq!(msg.channel.as_deref(), Some("ticker"));
         assert!(msg.data.is_some());
     }
@@ -2244,9 +2375,15 @@ mod tests {
         let (trade_tx, _) = broadcast::channel(16);
         let (ob_tx, _) = broadcast::channel(16);
         let (ohlcv_tx, _) = broadcast::channel(16);
-        let (footprint_tx, _) = broadcast::channel(16);
 
-        let cached_tick = Arc::new(UnifiedTick::new("binance", "BTC/USDT", 68500.0, 1.0, TradeSide::Buy, 1000));
+        let cached_tick = Arc::new(UnifiedTick::new(
+            "binance",
+            "BTC/USDT",
+            68500.0,
+            1.0,
+            TradeSide::Buy,
+            1000,
+        ));
         let cached_book = Arc::new(OrderBook::new(
             "binance".to_string(),
             "BTC/USDT".to_string(),
@@ -2260,7 +2397,6 @@ mod tests {
             trade_sender: trade_tx,
             ob_sender: ob_tx,
             ohlcv_sender: ohlcv_tx,
-            footprint_sender: footprint_tx,
             last_ohlcv_history: Arc::new(std::sync::Mutex::new(None)),
             last_tick: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_tick)))),
             last_orderbook: Arc::new(std::sync::Mutex::new(Some(Arc::clone(&cached_book)))),
@@ -2300,7 +2436,8 @@ mod tests {
                     let body = r#"{"last":69000,"open":68000,"high":70000,"low":67000,"quoteVolume":500000,"percentage":1.47}"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(), body
+                        body.len(),
+                        body
                     );
                     let _ = socket.write_all(resp.as_bytes()).await;
                 }
@@ -2314,12 +2451,8 @@ mod tests {
         let cfg2 = cfg1.clone();
 
         // Spawn two concurrent requests for the same symbol/exchange
-        let handle1 = tokio::spawn(async move {
-            fetch_ticker_snapshot(&cfg1, "Chart").await
-        });
-        let handle2 = tokio::spawn(async move {
-            fetch_ticker_snapshot(&cfg2, "Execution").await
-        });
+        let handle1 = tokio::spawn(async move { fetch_ticker_snapshot(&cfg1, "Chart").await });
+        let handle2 = tokio::spawn(async move { fetch_ticker_snapshot(&cfg2, "Execution").await });
 
         let res1 = handle1.await.unwrap();
         let res2 = handle2.await.unwrap();
