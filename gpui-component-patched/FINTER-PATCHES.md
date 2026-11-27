@@ -81,11 +81,12 @@ are drawn.
   also writes the shared `chart_bounds` cell so `ChartPanel` can hit-test the
   axis rails.
 - **Footprint candle style.** `CandleType::Footprint` and `FootprintCellSpec`
-  carry pre-computed cells from FinTer's `chart::footprint` module. Paint draws
-  the per-row background, POC border, VAH/VAL lines, imbalance stripe, and the
-  left/right/single numeric labels, dropping columns before they overflow a
-  narrow cell. FinTer builds the cells so the vendored crate stays free of
-  market-data and bar-bucketing logic.
+  carry pre-computed cells from FinTer's `chart::footprint` module. Each bar is
+  split into bid lane | narrow candle lane | ask lane by `footprint_lanes`; the
+  candle keeps its wick and body, BidAsk mode tint and label the two volume
+  lanes, and Delta/Volume mode keeps one centered cell. POC borders, VAH/VAL
+  lines, and imbalance stripes span the whole cluster. FinTer builds the cells
+  so the vendored crate stays free of market-data and bar-bucketing logic.
 
 Manual checks on desktop where possible:
 

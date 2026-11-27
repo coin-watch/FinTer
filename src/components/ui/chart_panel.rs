@@ -669,11 +669,10 @@ impl ChartPanel {
         self.candle_type == CandleType::Footprint
     }
 
-    /// Footprint cells need enough horizontal room for two numeric columns.
+    /// Footprint needs room for three lanes (bid | candle | ask), so target a
+    /// slot width wide enough for the numeric columns instead of a fixed count.
     fn ensure_footprint_density(&mut self) {
-        if self.chart_state.visible_count > 20 {
-            self.chart_state.visible_count = 20;
-        }
+        self.chart_state.visible_count = footprint_visible_count(self.pane_width);
     }
 
     /// Attach the historical + live footprint feed for this pane.
@@ -711,6 +710,7 @@ impl ChartPanel {
 
     pub fn set_footprint_settings(&mut self, settings: FootprintSettings) {
         self.footprint_settings = settings;
+        self.ensure_footprint_density();
         self.mark_dirty();
     }
 
@@ -1222,12 +1222,28 @@ impl ChartPanel {
                 .map(|row| row.delta().abs())
                 .fold(0.0, f64::max)
                 .max(1e-9);
+            let max_sell = bar
+                .rows
+                .iter()
+                .map(|row| row.sell.max(0.0))
+                .fold(0.0, f64::max)
+                .max(1e-9);
+            let max_buy = bar
+                .rows
+                .iter()
+                .map(|row| row.buy.max(0.0))
+                .fold(0.0, f64::max)
+                .max(1e-9);
             for row in &bar.rows {
                 let delta = row.delta();
                 let intensity = (delta.abs() / max_abs_delta).clamp(0.0, 1.0) as f32;
                 let base = if delta >= 0.0 { bullish } else { bearish };
                 let alpha = 0.08 + 0.20 * intensity + if bar.is_closed { 0.0 } else { 0.05 };
                 let background = base.opacity(alpha.min(0.45));
+                let bid_intensity = (row.sell / max_sell).clamp(0.0, 1.0) as f32;
+                let ask_intensity = (row.buy / max_buy).clamp(0.0, 1.0) as f32;
+                let bid_background = bearish.opacity(0.10 + 0.55 * bid_intensity);
+                let ask_background = bullish.opacity(0.10 + 0.55 * ask_intensity);
                 let (left_text, right_text, single_text) = match self.footprint_settings.mode {
                     FootprintMode::BidAsk => (
                         compact_flow(row.sell).into(),
@@ -1240,6 +1256,7 @@ impl ChartPanel {
                     }
                 };
                 let single_color = if delta >= 0.0 { bullish } else { bearish };
+                let lane_text = gpui::white().opacity(0.92);
                 cells.push(FootprintCellSpec {
                     timestamp_ms: bar.timestamp,
                     price_low: row.price_low,
@@ -1247,10 +1264,12 @@ impl ChartPanel {
                     left_text,
                     right_text,
                     single_text,
-                    left_color: bearish.opacity(0.95),
-                    right_color: bullish.opacity(0.95),
+                    left_color: lane_text,
+                    right_color: lane_text,
                     single_color,
                     background,
+                    bid_background,
+                    ask_background,
                     is_poc: self.footprint_settings.show_poc && row.is_poc,
                     is_vah: self.footprint_settings.show_value_area && row.is_vah,
                     is_val: self.footprint_settings.show_value_area && row.is_val,
@@ -3401,6 +3420,12 @@ impl Focusable for ChartPanel {
 
 impl EventEmitter<PanelEvent> for ChartPanel {}
 
+/// How many bars fit at a footprint-friendly density. Each bar needs roughly
+/// 140px for the bid lane, candle lane, and ask lane to stay readable.
+fn footprint_visible_count(pane_width: f32) -> usize {
+    ((pane_width / 140.0).floor() as usize).clamp(4, 20)
+}
+
 /// Price span of one footprint row.
 ///
 /// The tick path is exact, so it stays constant across price updates. The
@@ -3511,6 +3536,14 @@ mod tests {
         let candles = candles_with_range(0.000_000_1, 0.000_000_2, 10);
         let step = footprint_row_size_for(None, 1, &candles);
         assert!(step.is_finite() && step > 0.0, "step was {step}");
+    }
+
+    #[test]
+    fn footprint_visible_count_targets_readable_lane_widths() {
+        assert_eq!(footprint_visible_count(900.0), 6);
+        assert_eq!(footprint_visible_count(1400.0), 10);
+        assert_eq!(footprint_visible_count(300.0), 4);
+        assert_eq!(footprint_visible_count(3000.0), 20);
     }
 
     #[test]

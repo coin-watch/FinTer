@@ -130,7 +130,12 @@ pub struct FootprintCellSpec {
     pub left_color: Hsla,
     pub right_color: Hsla,
     pub single_color: Hsla,
+    /// Delta-tinted background for the single-cell Delta/Volume path.
     pub background: Hsla,
+    /// Volume-tinted background for the bid lane (BidAsk mode).
+    pub bid_background: Hsla,
+    /// Volume-tinted background for the ask lane (BidAsk mode).
+    pub ask_background: Hsla,
     pub is_poc: bool,
     pub is_vah: bool,
     pub is_val: bool,
@@ -873,7 +878,33 @@ where
                     // Area chart draws a line + fill after the loop; skip per-candle rendering.
                 }
                 CandleType::Footprint => {
-                    // Footprint cells are painted below, after the candle loop.
+                    // Footprint layout is bid lane | candle lane | ask lane.
+                    // The wick stays centered on the slot; the body is inset
+                    // into the narrow middle lane.
+                    let lanes = footprint_lanes(center_x, slot_w);
+
+                    let mut wick = PathBuilder::stroke(px(1.));
+                    wick.move_to(origin_point(px(center_x), px(high_y), origin));
+                    wick.line_to(origin_point(px(center_x), px(low_y), origin));
+                    if let Ok(path) = wick.build() {
+                        window.paint_path(path, color);
+                    }
+
+                    let (top, bottom) = if is_bullish {
+                        (close_y, open_y)
+                    } else {
+                        (open_y, close_y)
+                    };
+                    let bottom = bottom.max(top + 1.0); // ensure doji is visible
+                    let lane_left = lanes.candle_left + 1.0;
+                    let lane_right = (lanes.candle_right - 1.0).max(lane_left + 1.0);
+                    window.paint_quad(fill(
+                        Bounds::from_corners(
+                            origin_point(px(lane_left), px(top), origin),
+                            origin_point(px(lane_right), px(bottom), origin),
+                        ),
+                        color,
+                    ));
                 }
                 CandleType::HeikinAshi => {
                     // Same as Solid, but data is transformed externally.
@@ -1037,10 +1068,10 @@ where
             }
         }
 
-        // Bid × ask footprint cells. Numeric columns are dropped before the
-        // text can overflow; narrow cells fall back to a single delta/volume.
+        // Bid × ask footprint cells. BidAsk mode paints one volume-tinted lane
+        // on each side of the narrow candle lane; Delta/Volume modes fall back
+        // to a single centered cell across the whole cluster.
         if !self.footprint_cells.is_empty() {
-            let cell_w = (slot_w * 0.96).max(1.0);
             let poc_color: Hsla = gpui::rgb(0xf0b90b).into();
             for cell in &self.footprint_cells {
                 if !cell.price_low.is_finite() || !cell.price_high.is_finite() {
@@ -1056,26 +1087,77 @@ where
                 let y_bottom = origin.y + px(y_scale.scale(cell.price_low));
                 let top = y_top.min(y_bottom);
                 let bottom = y_top.max(y_bottom);
-                let x_left = origin.x + px(center_x - cell_w / 2.0);
-                let x_right = origin.x + px(center_x + cell_w / 2.0);
-                let bounds =
-                    Bounds::from_corners(gpui::point(x_left, top), gpui::point(x_right, bottom));
-                window.paint_quad(fill(bounds, cell.background));
+
+                let lanes = footprint_lanes(center_x, slot_w);
+                let cluster_left = origin.x + px(lanes.cluster_left);
+                let cluster_right = origin.x + px(lanes.cluster_right);
+                let cluster_bounds = Bounds::from_corners(
+                    gpui::point(cluster_left, top),
+                    gpui::point(cluster_right, bottom),
+                );
+
+                if !cell.left_text.is_empty() || !cell.right_text.is_empty() {
+                    // Two tinted volume lanes around the candle lane.
+                    let bid_bounds = Bounds::from_corners(
+                        gpui::point(origin.x + px(lanes.bid_left), top),
+                        gpui::point(origin.x + px(lanes.bid_right), bottom),
+                    );
+                    let ask_bounds = Bounds::from_corners(
+                        gpui::point(origin.x + px(lanes.ask_left), top),
+                        gpui::point(origin.x + px(lanes.ask_right), bottom),
+                    );
+                    window.paint_quad(fill(bid_bounds, cell.bid_background));
+                    window.paint_quad(fill(ask_bounds, cell.ask_background));
+
+                    let left_w = cell.left_text.len() as f32 * CHAR_WIDTH_EST;
+                    let right_w = cell.right_text.len() as f32 * CHAR_WIDTH_EST;
+                    if !cell.left_text.is_empty() && left_w + 4.0 <= lanes.lane_w {
+                        paint_text_line_centered(
+                            cell.left_text.clone(),
+                            cell.left_color,
+                            bid_bounds,
+                            window,
+                            cx,
+                        );
+                    }
+                    if !cell.right_text.is_empty() && right_w + 4.0 <= lanes.lane_w {
+                        paint_text_line_centered(
+                            cell.right_text.clone(),
+                            cell.right_color,
+                            ask_bounds,
+                            window,
+                            cx,
+                        );
+                    }
+                } else {
+                    // Delta/Volume: one cell across the cluster.
+                    window.paint_quad(fill(cluster_bounds, cell.background));
+                    let single_w = cell.single_text.len() as f32 * CHAR_WIDTH_EST;
+                    if !cell.single_text.is_empty()
+                        && single_w + 4.0 <= (lanes.cluster_right - lanes.cluster_left)
+                    {
+                        paint_text_line_centered(
+                            cell.single_text.clone(),
+                            cell.single_color,
+                            cluster_bounds,
+                            window,
+                            cx,
+                        );
+                    }
+                }
 
                 if cell.is_poc {
+                    // One border around the whole cluster, not per lane.
                     let mut border = PathBuilder::stroke(px(1.0));
-                    border.move_to(bounds.origin);
+                    border.move_to(cluster_bounds.origin);
+                    border.line_to(gpui::point(cluster_right, cluster_bounds.origin.y));
                     border.line_to(gpui::point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y,
+                        cluster_right,
+                        cluster_bounds.origin.y + cluster_bounds.size.height,
                     ));
                     border.line_to(gpui::point(
-                        bounds.origin.x + bounds.size.width,
-                        bounds.origin.y + bounds.size.height,
-                    ));
-                    border.line_to(gpui::point(
-                        bounds.origin.x,
-                        bounds.origin.y + bounds.size.height,
+                        cluster_left,
+                        cluster_bounds.origin.y + cluster_bounds.size.height,
                     ));
                     border.close();
                     if let Ok(path) = border.build() {
@@ -1085,13 +1167,13 @@ where
 
                 if cell.is_vah || cell.is_val {
                     let y = if cell.is_vah {
-                        bounds.origin.y
+                        top
                     } else {
-                        bounds.origin.y + bounds.size.height - px(1.0)
+                        bottom - px(1.0)
                     };
                     let mut line = PathBuilder::stroke(px(1.0));
-                    line.move_to(gpui::point(x_left, y));
-                    line.line_to(gpui::point(x_right, y));
+                    line.move_to(gpui::point(cluster_left, y));
+                    line.line_to(gpui::point(cluster_right, y));
                     if let Ok(path) = line.build() {
                         window.paint_path(path, cx.theme().muted_foreground.opacity(0.8));
                     }
@@ -1099,11 +1181,12 @@ where
 
                 if cell.imbalance != 0 {
                     let stripe_w = px(2.0);
-                    let stripe_x = if cell.imbalance > 0 {
-                        x_left
-                    } else {
-                        x_right - stripe_w
-                    };
+                    let stripe_x = origin.x
+                        + px(if cell.imbalance > 0 {
+                            lanes.bid_left
+                        } else {
+                            lanes.ask_right - 2.0
+                        });
                     let stripe = Bounds::from_corners(
                         gpui::point(stripe_x, top),
                         gpui::point(stripe_x + stripe_w, bottom),
@@ -1114,43 +1197,6 @@ where
                         bearish_color
                     };
                     window.paint_quad(fill(stripe, color.opacity(0.9)));
-                }
-
-                let cell_h = (bottom - top).as_f32();
-                let text_y = top + px((cell_h - TIP_FONT).max(0.0) * 0.5);
-                let left_w = cell.left_text.len() as f32 * CHAR_WIDTH_EST;
-                let right_w = cell.right_text.len() as f32 * CHAR_WIDTH_EST;
-                let single_w = cell.single_text.len() as f32 * CHAR_WIDTH_EST;
-                let gap = 4.0;
-                let show_two = !cell.left_text.is_empty()
-                    && !cell.right_text.is_empty()
-                    && left_w + right_w + gap <= cell_w;
-
-                if show_two {
-                    paint_text_line(
-                        cell.left_text.clone(),
-                        gpui::point(x_left + px(2.0), text_y),
-                        cell.left_color,
-                        bounds,
-                        window,
-                        cx,
-                    );
-                    paint_text_line(
-                        cell.right_text.clone(),
-                        gpui::point(x_right - px(right_w + 2.0), text_y),
-                        cell.right_color,
-                        bounds,
-                        window,
-                        cx,
-                    );
-                } else if !cell.single_text.is_empty() && single_w + gap <= cell_w {
-                    paint_text_line_centered(
-                        cell.single_text.clone(),
-                        cell.single_color,
-                        bounds,
-                        window,
-                        cx,
-                    );
                 }
             }
         }
@@ -2494,6 +2540,59 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Footprint lane geometry
+// ---------------------------------------------------------------------------
+
+/// Horizontal bounds of one footprint cluster: bid lane | candle lane | ask
+/// lane. All values are pixels relative to the chart origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FootprintLanes {
+    bid_left: f32,
+    bid_right: f32,
+    candle_left: f32,
+    candle_right: f32,
+    ask_left: f32,
+    ask_right: f32,
+    lane_w: f32,
+    candle_w: f32,
+    cluster_left: f32,
+    cluster_right: f32,
+}
+
+/// Split a candle slot into the three footprint lanes. The cluster keeps 96%
+/// of the slot, the candle gets 20% of that (clamped so it stays visible on
+/// both very dense and very wide zooms), and the two volume lanes split the
+/// remainder around it.
+fn footprint_lanes(center_x: f32, slot_w: f32) -> FootprintLanes {
+    let cluster_w = (slot_w * 0.96).max(1.0);
+    let candle_w = (cluster_w * 0.20).clamp(2.0, 34.0);
+    let gap = 1.0;
+    let lane_w = ((cluster_w - candle_w - 2.0 * gap) / 2.0).max(1.0);
+
+    let cluster_left = center_x - cluster_w / 2.0;
+    let cluster_right = cluster_left + cluster_w;
+    let bid_left = cluster_left;
+    let bid_right = bid_left + lane_w;
+    let candle_left = bid_right + gap;
+    let candle_right = candle_left + candle_w;
+    let ask_left = candle_right + gap;
+    let ask_right = ask_left + lane_w;
+
+    FootprintLanes {
+        bid_left,
+        bid_right,
+        candle_left,
+        candle_right,
+        ask_left,
+        ask_right,
+        lane_w,
+        candle_w,
+        cluster_left,
+        cluster_right,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
 
@@ -3074,5 +3173,49 @@ mod tests {
     #[test]
     fn resolve_price_range_uses_auto_when_manual_is_none() {
         assert_eq!(resolve_price_range(100.0, 200.0, 5.0, None), (95.0, 205.0));
+    }
+
+    #[test]
+    fn footprint_lanes_are_ordered_and_never_overlap() {
+        for slot_w in [20.0_f32, 64.0, 240.0] {
+            let lanes = footprint_lanes(100.0, slot_w);
+
+            assert!(lanes.cluster_left < lanes.bid_right, "slot {slot_w}");
+            assert!(lanes.bid_right < lanes.candle_left, "slot {slot_w}");
+            assert!(lanes.candle_left < lanes.candle_right, "slot {slot_w}");
+            assert!(lanes.candle_right < lanes.ask_left, "slot {slot_w}");
+            assert!(lanes.ask_left < lanes.ask_right, "slot {slot_w}");
+            assert!(lanes.ask_right <= lanes.cluster_right + 1e-3, "slot {slot_w}");
+
+            assert!((lanes.bid_right - lanes.bid_left - lanes.lane_w).abs() < 1e-3);
+            assert!((lanes.ask_right - lanes.ask_left - lanes.lane_w).abs() < 1e-3);
+            assert!((lanes.candle_right - lanes.candle_left - lanes.candle_w).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn footprint_lanes_keep_cluster_near_full_slot() {
+        for slot_w in [20.0_f32, 64.0, 240.0] {
+            let lanes = footprint_lanes(0.0, slot_w);
+            let cluster_w = lanes.cluster_right - lanes.cluster_left;
+            let expected = (slot_w * 0.96).max(1.0);
+            assert!(
+                (cluster_w - expected).abs() < 1e-3,
+                "slot {slot_w}: cluster {cluster_w} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn footprint_lanes_stay_sane_across_zoom_range() {
+        for slot_w in (20..=400).step_by(7) {
+            let slot_w = slot_w as f32;
+            let lanes = footprint_lanes(500.0, slot_w);
+            assert!(lanes.lane_w >= 1.0);
+            assert!(lanes.candle_w >= 2.0 && lanes.candle_w <= 34.0);
+            assert!(lanes.bid_left < lanes.ask_right);
+            assert!(lanes.candle_left >= lanes.bid_right);
+            assert!(lanes.ask_left >= lanes.candle_right);
+        }
     }
 }
