@@ -1297,6 +1297,11 @@ impl ChartPanel {
         if let Some(note) = snapshot.status.note() {
             return Some(note.to_string());
         }
+        if snapshot.queued {
+            // Cached/live bars stay visible while the server backfills the
+            // rest of the window from CryptoHFTData.
+            return Some("Fetching footprint history from CryptoHFTData…".to_string());
+        }
         if snapshot.partial {
             return Some(
                 "Footprint history is partial: only the persisted 14-day trade window is available."

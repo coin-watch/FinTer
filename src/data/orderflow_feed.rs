@@ -34,6 +34,20 @@ const HISTORY_DEBOUNCE: Duration = Duration::from_millis(250);
 const UNAUTHORIZED_COOLDOWN: Duration = Duration::from_secs(60);
 const CREDITS_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Delays before retrying a window the server is still backfilling. The first
+/// retry waits 3 s, which is already longer than a render frame and safely
+/// inside CoinWatch's 15 s charge-dedupe window, so retrying never shortens it.
+const HISTORY_RETRY_DELAYS: [u64; 10] = [3, 5, 8, 12, 15, 20, 20, 20, 20, 20];
+
+/// Delay before the next history retry while CryptoHFTData catches up.
+/// `attempt` is zero-based; `None` once the retry budget is exhausted.
+pub fn next_history_retry(attempt: u32) -> Option<Duration> {
+    HISTORY_RETRY_DELAYS
+        .get(attempt as usize)
+        .copied()
+        .map(Duration::from_secs)
+}
+
 /// Aggregated volume at one price row within a bar.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PriceFlow {
@@ -242,6 +256,8 @@ pub enum FootprintStatus {
     UnsupportedTimeframe,
     /// Set when a history request fails with `until` in the future.
     Error(String),
+    /// The server was still backfilling when the retry budget ran out.
+    BackfillTimeout,
 }
 
 impl FootprintStatus {
@@ -255,6 +271,9 @@ impl FootprintStatus {
                 Some("Footprint does not support weekly or monthly timeframes.")
             }
             Self::Error(message) => Some(message.as_str()),
+            Self::BackfillTimeout => Some(
+                "Footprint history is still backfilling from CryptoHFTData. Pan the chart to retry.",
+            ),
             _ => None,
         }
     }
@@ -268,6 +287,8 @@ pub struct FootprintSnapshot {
     pub status: FootprintStatus,
     /// True when the history window touched the retention/lag edge.
     pub partial: bool,
+    /// True while the server is backfilling this window from CryptoHFTData.
+    pub queued: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +303,7 @@ struct State {
     /// Bars that have received a live snapshot. History must not mix rows in.
     live: HashSet<i64>,
     partial: bool,
+    queued: bool,
     status: FootprintStatus,
     request_key: Option<String>,
     generation: u64,
@@ -331,10 +353,30 @@ impl State {
             }
         }
         // One active viewport request is applied at a time (stale responses are
-        // discarded by generation), so the newest window's partial flag wins.
+        // discarded by generation), so the newest window's flags win. A later
+        // non-queued response therefore clears both `queued` and `partial` from
+        // the server's assignment once coverage completes.
         self.partial = history.partial;
+        self.queued = history.queued;
         self.status = FootprintStatus::Ready;
         self.evict();
+    }
+
+    /// Apply a response and cache it only when it is a complete window.
+    /// Queued (server backfill in progress) and partial (retention edge)
+    /// responses are transient and must not suppress the retry.
+    fn accept_history(&mut self, key: &str, history: &FootprintHistory) {
+        self.apply_history(history);
+        if history.queued || history.partial {
+            return;
+        }
+        let now = Instant::now();
+        self.cache
+            .insert(key.to_string(), (now + HISTORY_CACHE_TTL, history.clone()));
+        // Keep the cache bounded; viewport keys churn while panning.
+        if self.cache.len() > 64 {
+            self.cache.retain(|_, (expires, _)| *expires > now);
+        }
     }
 
     fn evict(&mut self) {
@@ -353,6 +395,7 @@ impl State {
             bars: self.bars.values().cloned().collect(),
             status: self.status.clone(),
             partial: self.partial,
+            queued: self.queued,
         }
     }
 }
@@ -617,6 +660,11 @@ impl FootprintFeed {
             if state.retry_after.is_some_and(|at| at > now) {
                 return;
             }
+            // A different viewport supersedes any in-flight fetch, including a
+            // queued-window retry loop still sleeping between attempts.
+            if let Some(abort) = state.abort.take() {
+                abort.abort();
+            }
             if let Some(entry) = state.cache.get(&key) {
                 if entry.0 > now {
                     let history = entry.1.clone();
@@ -626,9 +674,6 @@ impl FootprintFeed {
                     self.version.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
-            }
-            if let Some(abort) = state.abort.take() {
-                abort.abort();
             }
             state.request_key = Some(key.clone());
             state.generation = state.generation.wrapping_add(1);
@@ -649,40 +694,38 @@ impl FootprintFeed {
                 return;
             }
 
-            let outcome =
-                fetch_footprint_history(&config, &timeframe, since, until, row_size, limit).await;
+            let mut attempt: u32 = 0;
+            loop {
+                let outcome =
+                    fetch_footprint_history(&config, &timeframe, since, until, row_size, limit)
+                        .await;
 
-            let Ok(mut state) = inner.lock() else {
-                return;
-            };
-            if state.generation != generation || state.request_key.as_deref() != Some(&request_key)
-            {
-                return;
-            }
-            match outcome {
-                Ok(history) => {
-                    state.cache.insert(
-                        request_key,
-                        (Instant::now() + HISTORY_CACHE_TTL, history.clone()),
-                    );
-                    state.apply_history(&history);
-                    state.retry_after = None;
-                    // Keep the cache bounded; viewport keys churn while panning.
-                    if state.cache.len() > 64 {
-                        let now = Instant::now();
-                        state.cache.retain(|_, (expires, _)| *expires > now);
+                let retry = {
+                    let Ok(mut state) = inner.lock() else {
+                        return;
+                    };
+                    if state.generation != generation
+                        || state.request_key.as_deref() != Some(&request_key)
+                    {
+                        return;
                     }
-                }
-                Err(error) => {
-                    state.status = error.status;
-                    match error.cooldown {
-                        Some(cooldown) => state.retry_after = Some(Instant::now() + cooldown),
-                        None => state.retry_after = None,
-                    }
-                    debug!("footprint: history request failed: {}", error.message);
+                    let retry = apply_history_outcome(&mut state, &request_key, attempt, outcome);
+                    drop(state);
+                    version.fetch_add(1, Ordering::Relaxed);
+                    retry
+                };
+
+                let Some(delay) = retry else {
+                    return;
+                };
+                attempt = attempt.saturating_add(1);
+                // Sleep without holding the state lock so live ingest and
+                // render snapshots keep flowing during a server backfill.
+                tokio::time::sleep(delay).await;
+                if !generation_matches(&inner, generation) {
+                    return;
                 }
             }
-            version.fetch_add(1, Ordering::Relaxed);
         });
         if let Ok(mut state) = self.inner.lock() {
             state.abort = Some(handle.abort_handle());
@@ -708,6 +751,46 @@ fn generation_matches(inner: &Arc<Mutex<State>>, generation: u64) -> bool {
         .lock()
         .map(|state| state.generation == generation)
         .unwrap_or(false)
+}
+
+/// Apply one history fetch result. Returns the delay before retrying a queued
+/// (server-side backfill) window, or `None` when this request is finished.
+///
+/// A queued response still applies its bars so the live/lag portion is
+/// visible. Errors never loop, so 401/402 cooldowns cannot turn into a retry
+/// storm.
+fn apply_history_outcome(
+    state: &mut State,
+    request_key: &str,
+    attempt: u32,
+    outcome: Result<FootprintHistory, FootprintFetchError>,
+) -> Option<Duration> {
+    match outcome {
+        Ok(history) => {
+            let queued = history.queued;
+            state.accept_history(request_key, &history);
+            state.retry_after = None;
+            if !queued {
+                return None;
+            }
+            match next_history_retry(attempt) {
+                Some(delay) => Some(delay),
+                None => {
+                    // The backfill outlived the retry budget. Stop polling and
+                    // leave a note; panning to a new window starts fresh.
+                    state.queued = false;
+                    state.status = FootprintStatus::BackfillTimeout;
+                    None
+                }
+            }
+        }
+        Err(error) => {
+            state.status = error.status;
+            state.retry_after = error.cooldown.map(|cooldown| Instant::now() + cooldown);
+            debug!("footprint: history request failed: {}", error.message);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +1018,24 @@ mod tests {
         FootprintFeed::new(rx, config)
     }
 
+    fn queued_history(partial: bool) -> FootprintHistory {
+        FootprintHistory {
+            queued: true,
+            partial,
+            data: vec![history_bar(60_000, false)],
+            ..FootprintHistory::default()
+        }
+    }
+
+    fn complete_history(partial: bool) -> FootprintHistory {
+        FootprintHistory {
+            queued: false,
+            partial,
+            data: vec![history_bar(60_000, true)],
+            ..FootprintHistory::default()
+        }
+    }
+
     fn config() -> BridgeConfig {
         BridgeConfig {
             rest_base_url: String::new(),
@@ -1080,6 +1181,135 @@ mod tests {
         assert!(url.contains("symbol=BTC/USDT"), "{url}");
         assert!(url.contains("type=spot"), "{url}");
         assert!(!url.contains("type=swap"), "{url}");
+    }
+
+    #[test]
+    fn history_retry_schedule_backs_off_then_stops() {
+        let delays: Vec<u64> = (0..HISTORY_RETRY_DELAYS.len() as u32)
+            .filter_map(|attempt| next_history_retry(attempt).map(|delay| delay.as_secs()))
+            .collect();
+        assert_eq!(delays, vec![3, 5, 8, 12, 15, 20, 20, 20, 20, 20]);
+        assert_eq!(next_history_retry(0), Some(Duration::from_secs(3)));
+        assert_eq!(next_history_retry(9), Some(Duration::from_secs(20)));
+        assert_eq!(next_history_retry(10), None);
+    }
+
+    #[test]
+    fn queued_history_is_applied_but_not_cached() {
+        let feed = empty(config());
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.accept_history("window", &queued_history(true));
+            assert!(
+                state.cache.is_empty(),
+                "queued responses must not be cached"
+            );
+        }
+
+        let snapshot = feed.snapshot();
+        assert!(snapshot.queued);
+        assert!(snapshot.partial);
+        assert_eq!(snapshot.status, FootprintStatus::Ready);
+        assert_eq!(snapshot.bars.len(), 1, "the live/lag portion still renders");
+    }
+
+    #[test]
+    fn partial_history_is_not_cached() {
+        let feed = empty(config());
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.accept_history("window", &complete_history(true));
+            assert!(
+                state.cache.is_empty(),
+                "a partial window must be retried on the next viewport"
+            );
+        }
+        let snapshot = feed.snapshot();
+        assert!(snapshot.partial);
+        assert!(!snapshot.queued);
+    }
+
+    #[test]
+    fn complete_history_is_cached() {
+        let feed = empty(config());
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.accept_history("window", &complete_history(false));
+            let (expires, cached) = state.cache.get("window").expect("complete window cached");
+            assert!(*expires > Instant::now());
+            assert!(!cached.queued);
+            assert!(!cached.partial);
+        }
+        assert!(!feed.snapshot().partial);
+        assert!(!feed.snapshot().queued);
+    }
+
+    #[test]
+    fn queued_fetch_schedules_retries_and_credits_errors_stop() {
+        let mut state = State {
+            generation: 1,
+            request_key: Some("window".into()),
+            ..State::default()
+        };
+
+        let retry = apply_history_outcome(&mut state, "window", 0, Ok(queued_history(false)));
+        assert_eq!(retry, Some(Duration::from_secs(3)));
+        assert!(state.queued);
+
+        // 401/402 style errors set the cooldown and end the retry loop.
+        let error = FootprintFetchError::new(FootprintStatus::Credits, "no credits")
+            .with_cooldown(CREDITS_COOLDOWN);
+        let retry = apply_history_outcome(&mut state, "window", 1, Err(error));
+        assert_eq!(retry, None);
+        assert_eq!(state.status, FootprintStatus::Credits);
+        assert!(state.retry_after.is_some());
+    }
+
+    #[test]
+    fn exhausted_queued_retries_leave_a_note() {
+        let mut state = State {
+            generation: 1,
+            request_key: Some("window".into()),
+            ..State::default()
+        };
+
+        let retry = apply_history_outcome(&mut state, "window", 9, Ok(queued_history(true)));
+        assert_eq!(retry, Some(Duration::from_secs(20)));
+
+        let retry = apply_history_outcome(&mut state, "window", 10, Ok(queued_history(true)));
+        assert_eq!(retry, None);
+        assert_eq!(state.status, FootprintStatus::BackfillTimeout);
+        assert!(
+            !state.queued,
+            "polling stopped, so the queued note is cleared"
+        );
+        assert!(state.status.note().is_some());
+    }
+
+    #[test]
+    fn a_complete_window_clears_previous_queued_and_partial_flags() {
+        let feed = empty(config());
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.accept_history("window", &queued_history(true));
+        }
+        let snapshot = feed.snapshot();
+        assert!(snapshot.queued);
+        assert!(snapshot.partial);
+
+        {
+            let mut state = feed.inner.lock().unwrap();
+            state.accept_history("window", &complete_history(false));
+        }
+        let snapshot = feed.snapshot();
+        assert!(
+            !snapshot.queued,
+            "the final response clears the queued note"
+        );
+        assert!(
+            !snapshot.partial,
+            "the final response clears the partial note"
+        );
     }
 
     #[test]
