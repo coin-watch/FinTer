@@ -842,8 +842,14 @@ impl ChartPanel {
     }
 
     pub fn with_precision(mut self, precision: PrecisionInfo) -> Self {
-        self.precision = Some(precision);
+        self.set_precision(Some(precision));
         self
+    }
+
+    /// Attach or clear the exchange precision for a pane created before its
+    /// symbol context was known.
+    pub fn set_precision(&mut self, precision: Option<PrecisionInfo>) {
+        self.precision = precision;
     }
 
     pub fn with_show_horizontal_grid(mut self, show: bool) -> Self {
@@ -1126,31 +1132,13 @@ impl ChartPanel {
 
     /// Price span of one footprint row. When the exchange tick is known this
     /// is `tick_size * ticks_per_row`; otherwise derive a readable fallback
-    /// from the visible candle range.
+    /// from the whole candle buffer instead of the live visible range.
     fn footprint_row_size(&self, candles: &[OhlcvCandle]) -> f64 {
-        let ticks_per_row = self.footprint_settings.ticks_per_row.max(1) as f64;
-        if let Some(tick) = self
-            .precision
-            .as_ref()
-            .and_then(|precision| precision.tick_size)
-            .filter(|tick| tick.is_finite() && *tick > 0.0)
-        {
-            return tick * ticks_per_row;
-        }
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        for candle in candles {
-            if candle.low.is_finite() && candle.high.is_finite() {
-                min = min.min(candle.low);
-                max = max.max(candle.high);
-            }
-        }
-        if !min.is_finite() || !max.is_finite() || max <= min {
-            return 0.0;
-        }
-        // Aim for roughly 60 rows at the current zoom, scaled by the density
-        // preference (more ticks per row -> fewer, wider rows).
-        ((max - min) / (60.0 / ticks_per_row).max(1.0)).max(f64::MIN_POSITIVE)
+        footprint_row_size_for(
+            self.precision.as_ref(),
+            self.footprint_settings.ticks_per_row,
+            candles,
+        )
     }
 
     fn compute_footprint_cells(
@@ -1639,7 +1627,10 @@ impl Render for ChartPanel {
                     let last_end = visible.last().map(|candle| candle.timestamp).unwrap_or(0);
                     let interval = timeframe_interval_ms(&self.timeframe).unwrap_or(60_000);
                     let until = last_end.saturating_add(interval);
-                    let row_size = self.footprint_row_size(visible);
+                    // Use the full buffer so the fallback row size does not
+                    // change with every live ticker update to the visible
+                    // window's min/max.
+                    let row_size = self.footprint_row_size(&candles);
                     feed.request_visible(since, until, range.len().saturating_add(8), row_size);
                 }
             }
@@ -3410,6 +3401,52 @@ impl Focusable for ChartPanel {
 
 impl EventEmitter<PanelEvent> for ChartPanel {}
 
+/// Price span of one footprint row.
+///
+/// The tick path is exact, so it stays constant across price updates. The
+/// fallback derives its step from the whole candle buffer (not the live
+/// visible min/max) and quantizes it to three significant digits so small
+/// range changes keep the same history request key.
+fn footprint_row_size_for(
+    precision: Option<&PrecisionInfo>,
+    ticks_per_row: u32,
+    candles: &[OhlcvCandle],
+) -> f64 {
+    let ticks_per_row = ticks_per_row.max(1) as f64;
+    if let Some(tick) = precision
+        .and_then(|precision| precision.tick_size)
+        .filter(|tick| tick.is_finite() && *tick > 0.0)
+    {
+        return tick * ticks_per_row;
+    }
+
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for candle in candles {
+        if candle.low.is_finite() && candle.high.is_finite() {
+            min = min.min(candle.low);
+            max = max.max(candle.high);
+        }
+    }
+    if !min.is_finite() || !max.is_finite() || max <= min {
+        return 0.0;
+    }
+    // Aim for roughly 60 rows over the loaded range, scaled by the density
+    // preference (more ticks per row -> fewer, wider rows).
+    let step = ((max - min) / (60.0 / ticks_per_row).max(1.0)).max(f64::MIN_POSITIVE);
+    quantize_significant(step, 3)
+}
+
+/// Round `value` to `digits` significant digits.
+fn quantize_significant(value: f64, digits: u32) -> f64 {
+    if !value.is_finite() || value <= 0.0 || digits == 0 {
+        return 0.0;
+    }
+    let magnitude = 10f64.powf(value.log10().floor());
+    let unit = magnitude / 10f64.powi(digits.saturating_sub(1) as i32);
+    (value / unit).round() * unit
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -3417,6 +3454,64 @@ impl EventEmitter<PanelEvent> for ChartPanel {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::orderflow_feed::row_size_key;
+
+    fn candles_with_range(low: f64, high: f64, count: usize) -> Vec<OhlcvCandle> {
+        (0..count)
+            .map(|index| OhlcvCandle {
+                timestamp: index as i64 * 60_000,
+                open: low,
+                high,
+                low,
+                close: high,
+                volume: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn footprint_row_size_uses_tick_and_is_stable_across_prices() {
+        let precision = PrecisionInfo {
+            price: None,
+            amount: None,
+            tick_size: Some(0.5),
+        };
+        let quiet = candles_with_range(100.0, 101.0, 40);
+        let volatile = candles_with_range(100.0, 120.0, 40);
+
+        assert_eq!(footprint_row_size_for(Some(&precision), 2, &quiet), 1.0);
+        assert_eq!(footprint_row_size_for(Some(&precision), 2, &volatile), 1.0);
+    }
+
+    #[test]
+    fn adaptive_footprint_row_size_is_stable_across_small_range_changes() {
+        let base = candles_with_range(100.0, 101.0, 40);
+        let mut nudged = base.clone();
+        for candle in &mut nudged {
+            candle.low *= 1.004;
+            candle.high *= 1.004;
+            candle.open *= 1.004;
+            candle.close *= 1.004;
+        }
+
+        let step = footprint_row_size_for(None, 1, &base);
+        let nudged_step = footprint_row_size_for(None, 1, &nudged);
+
+        assert!(step > 0.0);
+        assert_eq!(nudged_step, step, "a <0.5% price change keeps the step");
+        assert_eq!(
+            row_size_key(nudged_step),
+            row_size_key(step),
+            "the history key stays stable for the same step"
+        );
+    }
+
+    #[test]
+    fn adaptive_footprint_row_size_stays_positive_for_a_small_range() {
+        let candles = candles_with_range(0.000_000_1, 0.000_000_2, 10);
+        let step = footprint_row_size_for(None, 1, &candles);
+        assert!(step.is_finite() && step > 0.0, "step was {step}");
+    }
 
     #[test]
     fn format_time_works() {

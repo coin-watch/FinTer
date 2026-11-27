@@ -48,6 +48,16 @@ pub fn next_history_retry(attempt: u32) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// Six-significant-digit representation of a row size for the history request
+/// key. The adaptive fallback already quantizes its step; this strips the
+/// remaining float noise without merging genuinely different row sizes.
+pub(crate) fn row_size_key(row_size: f64) -> String {
+    if !row_size.is_finite() || row_size <= 0.0 {
+        return "0".to_string();
+    }
+    format!("{row_size:.5e}")
+}
+
 /// Aggregated volume at one price row within a bar.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PriceFlow {
@@ -641,7 +651,7 @@ impl FootprintFeed {
         }
 
         let limit = limit.clamp(1, 2_000);
-        let row_key = (row_size * 100_000_000.0).round() as i64;
+        let row_key = row_size_key(row_size);
         let key = format!(
             "{}:{}:{}:{since}:{until}:{row_key}:{limit}",
             self.config.exchange.to_lowercase(),
@@ -1192,6 +1202,19 @@ mod tests {
         assert_eq!(next_history_retry(0), Some(Duration::from_secs(3)));
         assert_eq!(next_history_retry(9), Some(Duration::from_secs(20)));
         assert_eq!(next_history_retry(10), None);
+    }
+
+    #[test]
+    fn history_row_key_rounds_to_six_significant_digits() {
+        // Float noise at the tail of the same row size must not churn the key.
+        assert_eq!(
+            row_size_key(16.666_666_666_667),
+            row_size_key(16.666_666_666_668)
+        );
+        assert_eq!(row_size_key(16.666_666_666_667), "1.66667e1");
+        // Genuinely different row sizes still produce different keys.
+        assert_ne!(row_size_key(16.6), row_size_key(16.7));
+        assert_eq!(row_size_key(0.0), "0");
     }
 
     #[test]

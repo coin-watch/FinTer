@@ -14,6 +14,8 @@ use crate::components::ui::pane_grid::chart_config::{
     CANDLE_TYPES, candle_type_from_config,
 };
 use crate::components::ui::pane_grid::chart_menus::render_chart_controls;
+use crate::data::gateway_registry::GatewayRegistry;
+use crate::data::models::{PrecisionInfo, SymbolInfo};
 
 
 
@@ -29,6 +31,43 @@ pub struct ChartViewState {
     pub footprint: bool,
     pub entity: Entity<crate::components::ui::chart_panel::ChartPanel>,
     pub _bridge: std::sync::Arc<crate::data::bridge::Bridge>,
+}
+
+/// Exchange precision for a chart pane from the gateway symbol catalog.
+///
+/// The catalog may not be loaded yet; returning `None` keeps the chart's
+/// existing formatting defaults until a pane is recreated.
+fn chart_precision_for(exchange: &str, symbol: &str) -> Option<PrecisionInfo> {
+    let infos = GatewayRegistry::global().symbol_infos(exchange);
+    chart_precision_from_infos(&infos, symbol)
+}
+
+fn chart_precision_from_infos(infos: &[SymbolInfo], symbol: &str) -> Option<PrecisionInfo> {
+    let info = infos
+        .iter()
+        .find(|info| info.symbol == symbol)
+        .or_else(|| infos.iter().find(|info| info.symbol.eq_ignore_ascii_case(symbol)))?;
+    // Prefer the nested precision payload but fill any gaps from the flat
+    // catalog fields (some exchanges only send one shape).
+    let precision = PrecisionInfo {
+        price: info
+            .precision
+            .as_ref()
+            .and_then(|precision| precision.price)
+            .or(info.price_precision),
+        amount: info
+            .precision
+            .as_ref()
+            .and_then(|precision| precision.amount)
+            .or(info.amount_precision),
+        tick_size: info
+            .precision
+            .as_ref()
+            .and_then(|precision| precision.tick_size)
+            .or(info.tick_size),
+    };
+    (precision.price.is_some() || precision.amount.is_some() || precision.tick_size.is_some())
+        .then_some(precision)
 }
 
 pub struct TickerViewState {
@@ -2077,8 +2116,10 @@ impl PaneGridRenderer {
                                                     });
                                                 });
 
+                                                let precision = chart_precision_for(&exchange, &symbol);
                                                 let chart_panel = cx.new(|cx| {
                                                     let mut panel = crate::components::ui::chart_panel::ChartPanel::new(feed, title, tf, cx);
+                                                    panel.set_precision(precision);
                                                     panel.on_load_more = Some(load_more);
                                                     panel.on_refresh_latest = Some(refresh_latest);
                                                     let grid = grid_entity.downgrade();
@@ -2821,5 +2862,48 @@ impl Render for PaneGridRenderer {
 impl Default for PaneGridRenderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import explicitly rather than `use super::*`: the parent pulls in
+    // `gpui::test`, which would shadow the built-in `#[test]` attribute.
+    use super::{PrecisionInfo, SymbolInfo, chart_precision_from_infos};
+
+    #[test]
+    fn precision_falls_back_to_flat_catalog_fields() {
+        let mut info = SymbolInfo::from_symbol("BTC/USDT");
+        info.tick_size = Some(0.1);
+        info.price_precision = Some(1);
+        info.amount_precision = Some(3);
+
+        let precision = chart_precision_from_infos(&[info], "BTC/USDT").expect("precision");
+        assert_eq!(precision.price, Some(1));
+        assert_eq!(precision.amount, Some(3));
+        assert_eq!(precision.tick_size, Some(0.1));
+    }
+
+    #[test]
+    fn precision_prefers_nested_values_and_matches_case_insensitively() {
+        let mut info = SymbolInfo::from_symbol("BTC/USDT");
+        info.precision = Some(PrecisionInfo {
+            price: Some(2),
+            amount: None,
+            tick_size: Some(0.5),
+        });
+        info.tick_size = Some(9.0);
+        info.amount_precision = Some(4);
+
+        let precision = chart_precision_from_infos(&[info], "btc/usdt").expect("precision");
+        assert_eq!(precision.price, Some(2));
+        assert_eq!(precision.amount, Some(4));
+        assert_eq!(precision.tick_size, Some(0.5));
+    }
+
+    #[test]
+    fn missing_symbol_has_no_precision() {
+        let info = SymbolInfo::from_symbol("ETH/USDT");
+        assert!(chart_precision_from_infos(&[info], "BTC/USDT").is_none());
     }
 }

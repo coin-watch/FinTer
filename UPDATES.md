@@ -10,6 +10,8 @@ The chart Type menu now includes **Footprint**. It renders the restored bid × a
 
 History comes from CoinWatch's metered `GET /api/v1/orderflow/footprint` route for the visible bar range. Requests are debounced, cancelled when the viewport moves, and cached for 60 seconds; live `footprint` snapshots from the gateway overwrite the in-progress bar and are ignored once a bar is closed. When the first request for an uncovered window returns `queued` (and usually `partial`), FinTer renders the bars the response already contains and polls the same window while the server backfills CryptoHFTData trades (3 s, 5 s, 8 s, 12 s, 15 s, then 20 s, up to 10 attempts) instead of caching the transient response. Queued and partial responses are never cached, so history fills in automatically; after the final attempt the chart leaves a note and a viewport change starts a fresh request. Guest sessions, missing API origins, and HTTP 401/402 degrade to candles with a note instead of retrying. Weekly and monthly timeframes are rejected by the backend, so FinTer shows a note and keeps candles. Under `FINTER_CHART_V2` the footprint style falls back to the v2 candle path with a note.
 
+Footprint row size is taken from the pane's exchange tick when available and otherwise falls back to a quantized full-buffer step, and the history key rounds it to six significant digits, so live ticker updates no longer abort and refetch the visible window.
+
 Unknown-aggressor volume is counted in totals but excluded from delta. **Limitation:** historical footprint depth equals CoinWatch's persisted trade window (14 days); older ranges return a partial window, which the chart notes.
 
 ## Chart order flow removed
