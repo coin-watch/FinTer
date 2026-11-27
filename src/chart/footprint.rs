@@ -29,7 +29,7 @@ pub struct FootprintRowView {
     pub is_poc: bool,
     pub is_vah: bool,
     pub is_val: bool,
-    /// `1` = bid imbalance, `-1` = ask imbalance, `0` = none.
+    /// `1` = ask/buy imbalance, `-1` = bid/sell imbalance, `0` = none.
     pub imbalance: i8,
 }
 
@@ -409,6 +409,48 @@ mod tests {
         let view = build_footprint_grid(&spec);
 
         assert_eq!(view.bars[0].rows[0].imbalance, 1);
+    }
+
+    fn bucket(buy: f64, sell: f64) -> Bucket {
+        Bucket {
+            buy,
+            sell,
+            ..Bucket::default()
+        }
+    }
+
+    #[test]
+    fn buy_dominance_over_next_sell_is_ask_side_imbalance() {
+        // Row 0 buys 9 against row 1's 3 sells with ratio 3 → +1 (ask/buy).
+        let buckets = [bucket(9.0, 0.0), bucket(0.0, 3.0)];
+        assert_eq!(classify_imbalances(&buckets, 3.0), vec![1, 0]);
+    }
+
+    #[test]
+    fn sell_dominance_over_previous_buy_is_bid_side_imbalance() {
+        // Row 1 sells 9 against row 0's 2 buys with ratio 3 → -1 (bid/sell).
+        let buckets = [bucket(2.0, 0.0), bucket(0.0, 9.0)];
+        assert_eq!(classify_imbalances(&buckets, 3.0), vec![0, -1]);
+    }
+
+    #[test]
+    fn balanced_rows_have_no_imbalance() {
+        let buckets = [bucket(5.0, 5.0), bucket(5.0, 5.0)];
+        assert_eq!(classify_imbalances(&buckets, 3.0), vec![0, 0]);
+    }
+
+    #[test]
+    fn disabled_imbalance_classification_returns_all_zeros() {
+        let bars = vec![bar(1, vec![row(100.0, 6.0, 0.0), row(101.0, 0.0, 9.0)])];
+        let ts = timestamps(&[1]);
+        let mut spec = input(&bars, &ts, Some(1.0), 1);
+        spec.price_max = 102.0;
+        spec.max_rows = 2;
+        spec.show_value_area = false;
+        spec.show_imbalance = false;
+        let view = build_footprint_grid(&spec);
+
+        assert!(view.bars[0].rows.iter().all(|row| row.imbalance == 0));
     }
 
     #[test]

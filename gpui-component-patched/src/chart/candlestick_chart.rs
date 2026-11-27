@@ -139,7 +139,7 @@ pub struct FootprintCellSpec {
     pub is_poc: bool,
     pub is_vah: bool,
     pub is_val: bool,
-    /// `1` = bid imbalance, `-1` = ask imbalance, `0` = none.
+    /// `1` = ask/buy imbalance, `-1` = bid/sell imbalance, `0` = none.
     pub imbalance: i8,
     pub is_live: bool,
 }
@@ -1181,12 +1181,7 @@ where
 
                 if cell.imbalance != 0 {
                     let stripe_w = px(2.0);
-                    let stripe_x = origin.x
-                        + px(if cell.imbalance > 0 {
-                            lanes.bid_left
-                        } else {
-                            lanes.ask_right - 2.0
-                        });
+                    let stripe_x = origin.x + px(imbalance_stripe_left(&lanes, cell.imbalance));
                     let stripe = Bounds::from_corners(
                         gpui::point(stripe_x, top),
                         gpui::point(stripe_x + stripe_w, bottom),
@@ -2592,6 +2587,18 @@ fn footprint_lanes(center_x: f32, slot_w: f32) -> FootprintLanes {
     }
 }
 
+/// X offset (relative to the chart origin) of the 2px imbalance stripe.
+///
+/// `+1` is an ask/buy imbalance and marks the right edge of the ask lane;
+/// `-1` is a bid/sell imbalance and marks the left edge of the bid lane.
+fn imbalance_stripe_left(lanes: &FootprintLanes, imbalance: i8) -> f32 {
+    if imbalance > 0 {
+        lanes.ask_right - 2.0
+    } else {
+        lanes.bid_left
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
@@ -3217,5 +3224,16 @@ mod tests {
             assert!(lanes.candle_left >= lanes.bid_right);
             assert!(lanes.ask_left >= lanes.candle_right);
         }
+    }
+
+    #[test]
+    fn imbalance_stripe_maps_sign_to_side() {
+        let lanes = footprint_lanes(100.0, 64.0);
+
+        // +1 = ask/buy imbalance → right edge of the ask lane.
+        assert_eq!(imbalance_stripe_left(&lanes, 1), lanes.ask_right - 2.0);
+        // -1 = bid/sell imbalance → left edge of the bid lane.
+        assert_eq!(imbalance_stripe_left(&lanes, -1), lanes.bid_left);
+        assert!(imbalance_stripe_left(&lanes, 1) > imbalance_stripe_left(&lanes, -1));
     }
 }
